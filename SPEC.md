@@ -51,7 +51,7 @@ PsiCode is layered like a modem, because it is one:
 └────────────────────────────────────────────────────────┘
 ```
 
-Plus one out-of-band element: the **calibration profile** — a 40-character
+Plus one out-of-band element: the **calibration profile** — a 32-character
 code displayed by the receiver and typed once by a human into the transmitter
 (§7). This replaces the feedback channel with a single manual round-trip.
 
@@ -185,8 +185,16 @@ containing:
    (rolling-shutter tearing) ⇒ `torn_frames_q` ⇒ recommended
    `frame_hold_periods`.
 
-The receiver then displays the 40-character profile code (§7). The human
+The receiver then displays the 32-character profile code (§7). The human
 types it into the transmitter. Done.
+
+**Recalibration** (informative): the profile code MAY be issued again later.
+In particular, if a streaming transfer ends with a failing payload checksum
+(§6.2), the receiver SHOULD display a fresh profile code whose telemetry was
+measured over the entire failed transfer — the whole session becomes the
+test pattern. The human types the new code, the transmitter re-adjusts
+(larger cells, longer frame hold, fewer bits per cell) and retransmits. This
+manual round-trip is the only feedback path in PsiCode.
 
 ---
 
@@ -335,10 +343,10 @@ Implemented in `psicode-core`; frozen.
 
 ### 7.1 Outer format
 
-40 symbols, Base32 — 200 bits total (25 bytes), displayed in 8 groups of 5:
+32 symbols, Base32 — 160 bits total (20 bytes), displayed in 8 groups of 4:
 
 ```
-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
 ```
 
 **Alphabet** (values 0…31, excludes I, O, S, Z):
@@ -352,31 +360,31 @@ Input normalization (receiver-of-typing side MUST apply): case-insensitive;
 
 ### 7.2 Error correction
 
-Two interleaved Reed–Solomon codewords, each RS(20, 12) over GF(32). (An RS
-codeword over GF(32) cannot exceed 31 symbols; the 40-symbol code is
-therefore built from two.)
+Two interleaved Reed–Solomon codewords, each RS(16, 8) over GF(32) — rate
+exactly 1/2. (An RS codeword over GF(32) cannot exceed 31 symbols; the
+32-symbol code is therefore built from two.)
 
 * Field: GF(2⁵), primitive polynomial `x⁵ + x² + 1` (0b100101).
 * Generator roots: α⁰ … α⁷ (fcr = 0), systematic encoding; each codeword =
-  12 payload symbols ∥ 8 parity symbols (RS(31, 23) shortened by 11).
+  8 payload symbols ∥ 8 parity symbols (RS(31, 23) shortened by 15).
   Polynomial convention: highest-degree coefficient first; within a
-  codeword, index i ↔ term x^(19−i).
+  codeword, index i ↔ term x^(15−i).
 * Interleaving: displayed symbol 2i is codeword A symbol i; displayed
-  symbol 2i+1 is codeword B symbol i (i = 0…19). Codeword A carries
-  payload symbols 0–11, codeword B carries payload symbols 12–23.
+  symbol 2i+1 is codeword B symbol i (i = 0…15). Codeword A carries
+  payload symbols 0–7, codeword B carries payload symbols 8–15.
 * Each codeword corrects ≤ 4 symbol errors ⇒ the full code corrects **any**
   ≤ 4 errors, up to 8 when they split evenly between A and B, and any
-  contiguous run of ≤ 8 mistyped symbols (interleaving splits a run 4/4;
-  a fully garbled 5-symbol group is recoverable with margin).
+  contiguous run of ≤ 8 mistyped symbols (interleaving splits a run 4/4 —
+  two adjacent fully garbled 4-symbol groups are recoverable).
 * Decoders MUST verify zero syndromes after correction in both codewords
   and MUST verify the payload CRC-8 (§7.3); on either failure the code is
   rejected (no silent miscorrection).
 
-### 7.3 Payload — 120 bits
+### 7.3 Payload — 80 bits
 
-24 five-bit symbols, big-endian bit order (first symbol = most significant
-bits). Bits 0–111 are fields; bits 112–119 are CRC-8 (poly 0x07, init 0x00,
-no reflection) computed over the 14 field bytes (big-endian).
+16 five-bit symbols, big-endian bit order (first symbol = most significant
+bits). Bits 0–71 are fields; bits 72–79 are CRC-8 (poly 0x07, init 0x00,
+no reflection) computed over the 9 field bytes (big-endian).
 
 | # | field | bits | encoding → physical value |
 |---|---|---|---|
@@ -397,7 +405,7 @@ no reflection) computed over the 14 field bytes (big-endian).
 | 15 | `crosstalk_gb_q` | 4 | 2q % |
 | 16 | `quiet_zone` | 2 | §3.1 table |
 | 17 | `fec_overhead` | 3 | §6.1 table |
-| 18 | `reserved` | 44 | MUST be zero in v1; receivers MUST ignore |
+| 18 | `reserved` | 4 | MUST be zero in v1; receivers MUST ignore |
 | 19 | `crc8` | 8 | §7.3 |
 
 Fields 6–15 are **telemetry** (receiver measurements); 2–5, 16–17 are
@@ -411,12 +419,12 @@ profile: version=1, cell=16, hold=6, luma_bits=3, chroma=Chroma2,
          gamma_g_q=28 (γ=2.200), r_delta=8, b_delta=10, white_q=15 (100%),
          black_q=2, noise_q=12, mtf=6, torn_q=5, xtalk_rg=3, xtalk_gb=4,
          quiet=1, fec=2
-code:    2HE8B-040V0-H0B0R-06020-M76R9-P41BE-HFY7C-YU7LF
+code:    26E2-BM46-VHH8-B6R3-8XP4-HBNK-PJCD-GHF7
 ```
 
-A decoder MUST accept `2he8b 040v0 h0b0r 06020 m76r9 p41be hfy7c yu7lf`
-(case, spaces) and MUST recover the profile from any 4-symbol corruption of
-the code, including one fully garbled 5-symbol group.
+A decoder MUST accept `26e2 bm46 vhh8 b6r3 8xp4 hbnk pjcd ghf7` (case,
+spaces) and MUST recover the profile from any 4-symbol corruption of the
+code, including two adjacent fully garbled 4-symbol groups.
 
 ---
 
@@ -424,7 +432,7 @@ the code, including one fully garbled 5-symbol group.
 
 | crate | contents | status |
 |---|---|---|
-| `psicode-core` | §7 complete: GF(32), 2 × RS(20,12) interleaved, Base32, bit packing, `CalibProfile` | done, 18 tests |
+| `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile` | done, 18 tests |
 | `psicode-core` (next) | §3 ZC frame gen/detect, §5.1 color map, §5.2 Mode A, simulators | — |
 | `psicode-tx` | Windows 11 transmitter: minifb → winit/softbuffer, calibrate & stream modes | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |

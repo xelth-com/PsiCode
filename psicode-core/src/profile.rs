@@ -1,20 +1,19 @@
 //! Калибровочный профиль канала «монитор -> камера».
 //!
 //! Телефон измеряет канал по одному тестовому кадру, упаковывает результат в
-//! 120-битный payload (112 бит полей + CRC-8), кодирует двумя перемежёнными
-//! RS(20,12) над GF(32) и показывает человеку 40 символов Crockford Base32
-//! (200 бит, 8 групп по 5):
+//! 80-битный payload (72 бита полей + CRC-8), кодирует двумя перемежёнными
+//! RS(16,8) над GF(32) и показывает человеку 32 символа Crockford Base32
+//! (160 бит, 8 групп по 4):
 //!
 //! ```text
-//! XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+//! XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX
 //! ```
 //!
 //! Человек вводит их на передатчике. RS гарантированно исправляет любые
-//! 4 опечатки, а благодаря перемежению — и до 8 подряд идущих (целая
-//! испорченная группа из 5 — с запасом); CRC-8 страхует от мискоррекции при
-//! большем числе ошибок.
+//! 4 опечатки, а благодаря перемежению — и до 8 подряд идущих (две соседние
+//! группы целиком); CRC-8 страхует от мискоррекции при большем числе ошибок.
 //!
-//! Раскладка 112 бит (по порядку записи, старшие биты первыми):
+//! Раскладка 72 бит (по порядку записи, старшие биты первыми):
 //!
 //! | поле                | бит | физический смысл                                  |
 //! |---------------------|-----|---------------------------------------------------|
@@ -35,16 +34,16 @@
 //! | crosstalk_gb_q      |  4  | утечка G<->B, q * 2 %                             |
 //! | quiet_zone          |  2  | пресет тихой зоны                                 |
 //! | fec_overhead        |  3  | пресет избыточности RaptorQ                       |
-//! | reserved            | 44  | нули; поле для будущих версий                     |
-//! | ----- итого         | 112 |                                                   |
-//! | crc8                |  8  | CRC-8 (poly 0x07) по 14 байтам полей              |
+//! | reserved            |  4  | нули; поле для будущих версий                     |
+//! | ----- итого         |  72 |                                                   |
+//! | crc8                |  8  | CRC-8 (poly 0x07) по 9 байтам полей               |
 
 use crate::base32;
 use crate::bits::{BitReader, BitWriter};
 use crate::rs;
 
-pub const CODE_SYMBOLS: usize = rs::CODE_LEN; // 40
-pub const CODE_CHARS_GROUPED: usize = CODE_SYMBOLS + CODE_SYMBOLS / base32::GROUP - 1; // 47 с дефисами
+pub const CODE_SYMBOLS: usize = rs::CODE_LEN; // 32
+pub const CODE_CHARS_GROUPED: usize = CODE_SYMBOLS + CODE_SYMBOLS / base32::GROUP - 1; // 39 с дефисами
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromaMode {
@@ -98,7 +97,7 @@ pub struct CalibProfile {
 pub enum ProfileError {
     /// недопустимый символ во вводе (позиция в строке)
     BadChar(usize),
-    /// длина не равна 40 символам
+    /// длина не равна 32 символам
     BadLength(usize),
     /// RS не смог исправить
     Uncorrectable,
@@ -215,7 +214,7 @@ impl CalibProfile {
         w.write(self.crosstalk_gb_q as u32, 4);
         w.write(self.quiet_zone as u32, 2);
         w.write(self.fec_overhead as u32, 3);
-        w.write(0, 44); // reserved
+        w.write(0, 4); // reserved
         w.write(0, 8); // место CRC, заполним ниже
         w.finish()
     }
@@ -259,7 +258,7 @@ impl CalibProfile {
         let crosstalk_gb_q = r.read(4) as u8;
         let quiet_zone = r.read(2) as u8;
         let fec_overhead = r.read(3) as u8;
-        let _reserved = r.read(32) as u64 | ((r.read(12) as u64) << 32); // 44 бита, игнорируем
+        let _reserved = r.read(4); // 4 бита, игнорируем
 
         let p = Self {
             version,
@@ -284,7 +283,7 @@ impl CalibProfile {
         Ok(p)
     }
 
-    /// Профиль -> "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
+    /// Профиль -> "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
     pub fn encode_string(&self) -> Result<String, ProfileError> {
         self.validate()?;
         let payload = self.to_payload();
@@ -309,11 +308,12 @@ impl CalibProfile {
     }
 }
 
-/// 112 старших бит u128 -> 14 байт big-endian (для CRC)
-fn fields_to_bytes(fields: u128) -> [u8; 14] {
-    let mut out = [0u8; 14];
+/// 72 старших бита payload -> 9 байт big-endian (для CRC)
+fn fields_to_bytes(fields: u128) -> [u8; 9] {
+    let v = fields >> 8; // отбрасываем байт CRC
+    let mut out = [0u8; 9];
     for (i, b) in out.iter_mut().enumerate() {
-        *b = ((fields >> (112 - 8 * (i + 1) + 8)) & 0xFF) as u8;
+        *b = ((v >> (72 - 8 * (i + 1))) & 0xFF) as u8;
     }
     out
 }
@@ -371,7 +371,7 @@ mod tests {
         // другим значением с учётом подстановок парсера
         let mut chars: Vec<char> = s.chars().collect();
         let mut broken = 0;
-        for i in [0usize, 13, 27, 43] {
+        for i in [0usize, 6, 21, 38] {
             let orig = chars[i];
             assert_ne!(orig, '-');
             let orig_val = crate::base32::char_to_symbol(orig).unwrap();
@@ -390,13 +390,13 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_fully_garbled_group() {
-        // вторая группа (символы 6..=10 в строке) испорчена целиком: 5 подряд
-        // опечаток делятся перемежением 3/2 между словами A и B
+    fn tolerates_two_fully_garbled_groups() {
+        // вторая и третья группы (символы 5..=8 и 10..=13 в строке) испорчены
+        // целиком: 8 подряд опечаток делятся перемежением 4/4 между A и B
         let p = sample();
         let s = p.encode_string().unwrap();
         let mut chars: Vec<char> = s.chars().collect();
-        for i in 6..=10usize {
+        for i in (5..=13usize).filter(|&i| i != 9) {
             let orig = chars[i];
             assert_ne!(orig, '-');
             let orig_val = crate::base32::char_to_symbol(orig).unwrap();
@@ -404,7 +404,7 @@ mod tests {
         }
         let garbled: String = chars.into_iter().collect();
         let (q, fixed) = CalibProfile::decode_string(&garbled).unwrap();
-        assert_eq!(fixed, 5);
+        assert_eq!(fixed, 8);
         assert_eq!(p, q);
     }
 
@@ -415,7 +415,7 @@ mod tests {
             Err(ProfileError::BadLength(5))
         ));
         assert!(matches!(
-            CalibProfile::decode_string("ABCDE-ABCDE-ABCDE-ABCDE-ABCDE-ABCDE-ABCDE-ABCD*"),
+            CalibProfile::decode_string("ABCD-ABCD-ABCD-ABCD-ABCD-ABCD-ABCD-ABC*"),
             Err(ProfileError::BadChar(_))
         ));
     }

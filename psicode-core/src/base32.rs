@@ -37,9 +37,9 @@ pub fn parse(input: &str) -> Result<Vec<u8>, usize> {
 }
 
 /// Размер группы при отображении человеку.
-pub const GROUP: usize = 5;
+pub const GROUP: usize = 4;
 
-/// Символы -> строка группами по 5 через дефис: XXXXX-XXXXX-...
+/// Символы -> строка группами по 4 через дефис: XXXX-XXXX-...
 pub fn format_grouped(symbols: &[u8]) -> String {
     let mut s = String::with_capacity(symbols.len() + symbols.len() / GROUP);
     for (i, &sym) in symbols.iter().enumerate() {
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn roundtrip_and_grouping() {
-        let syms: Vec<u8> = (0..40).map(|i| (i * 7 % 32) as u8).collect();
+        let syms: Vec<u8> = (0..32).map(|i| (i * 7 % 32) as u8).collect();
         let s = format_grouped(&syms);
         assert_eq!(s.split('-').count(), 8);
         assert!(s.split('-').all(|g| g.len() == GROUP));

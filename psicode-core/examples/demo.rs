@@ -25,7 +25,7 @@ fn main() {
 
     // человек вводит с четырьмя опечатками, в нижнем регистре, с пробелами
     let mut chars: Vec<char> = code.chars().collect();
-    for i in [2usize, 9, 20, 33] {
+    for i in [2usize, 6, 21, 33] {
         let v = base32::char_to_symbol(chars[i]).unwrap();
         chars[i] = base32::symbol_to_char((v + 16) % 32);
     }

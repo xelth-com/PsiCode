@@ -1,7 +1,7 @@
-//! Упаковка полей в 120-битный payload поверх u128.
+//! Упаковка полей в 80-битный payload поверх u128.
 //! Порядок: big-endian по битам — первое записанное поле занимает старшие биты.
 
-pub const PAYLOAD_BITS: usize = 120;
+pub const PAYLOAD_BITS: usize = 80;
 
 pub struct BitWriter {
     acc: u128,
@@ -49,9 +49,9 @@ impl BitReader {
     }
 }
 
-/// u128 (120 бит) <-> 24 пятибитных символа, старшие биты — первый символ.
-pub fn payload_to_symbols(p: u128) -> [u8; 24] {
-    let mut out = [0u8; 24];
+/// u128 (80 бит) <-> 16 пятибитных символов, старшие биты — первый символ.
+pub fn payload_to_symbols(p: u128) -> [u8; 16] {
+    let mut out = [0u8; 16];
     for (i, s) in out.iter_mut().enumerate() {
         let shift = PAYLOAD_BITS - 5 * (i + 1);
         *s = ((p >> shift) & 0x1F) as u8;
@@ -59,7 +59,7 @@ pub fn payload_to_symbols(p: u128) -> [u8; 24] {
     out
 }
 
-pub fn symbols_to_payload(symbols: &[u8; 24]) -> u128 {
+pub fn symbols_to_payload(symbols: &[u8; 16]) -> u128 {
     let mut p: u128 = 0;
     for &s in symbols.iter() {
         debug_assert!(s < 32);
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn symbols_roundtrip() {
-        let p: u128 = 0x0123_4567_89AB_CDEF_0123_4567_89AB_u128 & ((1u128 << 120) - 1);
+        let p: u128 = 0x0123_4567_89AB_CDEF_0123_4567_89AB_u128 & ((1u128 << 80) - 1);
         assert_eq!(symbols_to_payload(&payload_to_symbols(p)), p);
     }
 
@@ -86,7 +86,7 @@ mod tests {
         w.write(0, 2);
         w.write(0x1FFFF, 17);
         w.write(1, 1);
-        w.write(0, 90);
+        w.write(0, 50);
         let p = w.finish();
         let mut r = BitReader::new(p);
         assert_eq!(r.read(4), 0xA);
@@ -94,6 +94,6 @@ mod tests {
         assert_eq!(r.read(2), 0);
         assert_eq!(r.read(17), 0x1FFFF);
         assert_eq!(r.read(1), 1);
-        assert_eq!(r.read(90), 0);
+        assert_eq!(r.read(50), 0);
     }
 }

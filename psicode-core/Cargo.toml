@@ -2,7 +2,7 @@
 name = "psicode-core"
 version = "0.1.0"
 edition = "2021"
-description = "PsiCode: screen-to-camera optical link. Core codec: calibration profile, 2 x interleaved RS(20,12) over GF(32), eck Base32."
+description = "PsiCode: screen-to-camera optical link. Core codec: calibration profile, 2 x interleaved RS(16,8) over GF(32), eck Base32."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xelth-com/PsiCode"
 
