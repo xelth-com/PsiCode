@@ -1,2 +1,5 @@
 target/
 *.zip
+
+# Added by eck-snapshot to ignore metadata directory
+.eck/
