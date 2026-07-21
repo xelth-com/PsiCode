@@ -15,6 +15,7 @@
 //! Корни порождающего полинома: alpha^0 .. alpha^7 (fcr = 0).
 
 use crate::gf32 as gf;
+use alloc::{vec, vec::Vec};
 
 pub const N: usize = 16; // длина одного кодового слова (максимум для GF(32): 31)
 pub const K: usize = 8; // информационные символы одного слова
@@ -30,15 +31,43 @@ pub enum RsError {
     TooManyErrors,
 }
 
-/// Полиномы храним старшим коэффициентом вперёд: p[0]*x^(len-1) + ... + p[len-1].
-fn poly_mul(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; a.len() + b.len() - 1];
-    for (i, &ai) in a.iter().enumerate() {
-        for (j, &bj) in b.iter().enumerate() {
-            out[i + j] = gf::add(out[i + j], gf::mul(ai, bj));
+impl core::fmt::Display for RsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RsError::TooManyErrors => f.write_str("too many errors to correct"),
         }
     }
-    out
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RsError {}
+
+/// Порождающий полином g(x) = prod_{i=0}^{NSYM-1} (x + alpha^i), старшим
+/// коэффициентом вперёд (NSYM+1 коэффициентов). Считается в compile-time,
+/// в рантайме кодер только читает эту константу.
+const GEN: [u8; NSYM + 1] = build_generator();
+
+const fn build_generator() -> [u8; NSYM + 1] {
+    // g стартует как полином «1» (один коэффициент), домножаем на (x + alpha^i).
+    let mut g = [0u8; NSYM + 1];
+    g[0] = 1;
+    let mut len = 1usize; // текущее число коэффициентов
+    let mut i = 0;
+    while i < NSYM {
+        let root = gf::exp(i);
+        // out = g * (x + root); старшим коэффициентом вперёд, длина len+1
+        let mut out = [0u8; NSYM + 1];
+        let mut a = 0;
+        while a < len {
+            out[a] = gf::add(out[a], g[a]); // g[a] * 1 (член x)
+            out[a + 1] = gf::add(out[a + 1], gf::mul(g[a], root)); // g[a] * root
+            a += 1;
+        }
+        g = out;
+        len += 1;
+        i += 1;
+    }
+    g
 }
 
 fn poly_eval(p: &[u8], x: u8) -> u8 {
@@ -49,26 +78,18 @@ fn poly_eval(p: &[u8], x: u8) -> u8 {
     y
 }
 
-fn generator() -> Vec<u8> {
-    let mut g = vec![1u8];
-    for i in 0..NSYM {
-        g = poly_mul(&g, &[1, gf::exp(i)]);
-    }
-    g
-}
-
 /// Кодирует 8 символов (значения 0..31) в одно слово из 16 символов.
+/// Без аллокаций: работает на массивах фиксированного размера.
 pub fn encode(msg: &[u8; K]) -> [u8; N] {
     debug_assert!(msg.iter().all(|&s| s < 32));
-    let gen = generator();
     // деление msg * x^NSYM на g(x), остаток -> проверочные символы
-    let mut rem = vec![0u8; N];
+    let mut rem = [0u8; N];
     rem[..K].copy_from_slice(msg);
     for i in 0..K {
         let coef = rem[i];
         if coef != 0 {
-            for (j, &gj) in gen.iter().enumerate().skip(1) {
-                rem[i + j] = gf::add(rem[i + j], gf::mul(gj, coef));
+            for j in 1..GEN.len() {
+                rem[i + j] = gf::add(rem[i + j], gf::mul(GEN[j], coef));
             }
         }
     }

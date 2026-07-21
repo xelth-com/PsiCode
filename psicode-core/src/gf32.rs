@@ -33,12 +33,12 @@ const fn build_tables() -> ([u8; 62], [u8; 32]) {
 const TABLES: ([u8; 62], [u8; 32]) = build_tables();
 
 #[inline]
-pub fn add(a: u8, b: u8) -> u8 {
+pub const fn add(a: u8, b: u8) -> u8 {
     a ^ b
 }
 
 #[inline]
-pub fn mul(a: u8, b: u8) -> u8 {
+pub const fn mul(a: u8, b: u8) -> u8 {
     if a == 0 || b == 0 {
         0
     } else {
@@ -65,7 +65,7 @@ pub fn inv(a: u8) -> u8 {
 
 /// alpha^p (p может быть любым неотрицательным)
 #[inline]
-pub fn exp(p: usize) -> u8 {
+pub const fn exp(p: usize) -> u8 {
     TABLES.0[p % 31]
 }
 

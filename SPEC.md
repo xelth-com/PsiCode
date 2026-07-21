@@ -1,6 +1,6 @@
 # PsiCode Specification
 
-**Version 0.1.0-draft · 2026-07-21**
+**Version 0.1.1-draft · 2026-07-22**
 
 PsiCode (ΨCode) is an open, royalty-free visual code and one-way optical data
 link. It transmits data from any display to any camera with **no feedback
@@ -252,30 +252,16 @@ MUST be used when `cell_size_px ≥ 8` camera pixels.
 
 ### 5.3 Mode B — Hermite–Gauss modes **[EXPERIMENTAL]**
 
-The payload region (or designated blocks of it) carries a superposition of
-2-D Hermite–Gauss functions:
-
-```
-ψ_{m,n}(x, y) = H_m(x/w) · H_n(y/w) · exp(−(x²+y²)/(2w²)) / √(2^{m+n} m! n! π w²)
-```
-
-* Block size: 64×64 px v0; envelope width `w` = block/8.
-* Mode set v0: `m + n ≤ 4` → 15 modes.
-* `ψ_{0,0}` is a **pilot** (fixed amplitude 1+0j).
-* `ψ_{2,0}` and `ψ_{0,2}` are **channel probes** (fixed amplitude): the
-  received ratio ‖a₂₀‖/‖a₀₀‖ estimates blur per block; the receiver derives
-  the effective basis width w′ and per-order gain equalization from it.
-* Remaining 12 modes carry data as complex coefficients (QPSK on the
-  Re/Im color axes v0 ⇒ 24 bits/block raw).
-* Decoding: inner product of the corrected complex image with each ψ_{m,n}
-  of width w′; orthogonality separates coefficients.
-* **Progressive property** (the point of Mode B): under increasing blur,
-  coefficient SNR falls monotonically with m+n. A receiver MAY decode only
-  the mode subset whose measured SNR clears threshold; the transmitter
-  assigns data to modes in significance order.
-
-Mode B parameters will be frozen (→ DRAFT → STABLE) only after live
-measurements of coefficient SNR vs. blur σ on real display/camera pairs.
+The payload region (or blocks of it) carries data as complex coefficients
+of 2-D Hermite–Gauss functions ψ_{m,n} — eigenfunctions of the Fourier
+transform, so defocus attenuates coefficients monotonically in mode order
+m+n instead of mixing them. Low modes survive; the receiver decodes the
+mode subset whose measured SNR clears threshold, and the transmitter
+assigns data to modes in significance order. The full construction (block
+geometry, pilot and probe modes, equalization, coefficient mapping) and the
+research directions built on it live in [RESEARCH.md](RESEARCH.md);
+parameters enter this spec (→ DRAFT → STABLE) only after live measurements
+of coefficient SNR vs. blur σ on real display/camera pairs.
 
 ### 5.4 Static PsiCode symbol **[EXPERIMENTAL]**
 
@@ -306,12 +292,13 @@ Each displayed frame's payload region carries, in raster order:
 
 ```
 FrameHeader {
-  magic:    u16   // 0x03A8 ("Ψ" codepoint 0x03A8)
-  version:  u8
-  flags:    u8
-  esi:      u24   // encoding symbol ID of first symbol in frame
-  count:    u8    // symbols in this frame
-}
+  magic:      u16   // 0x03A8 ("Ψ" codepoint 0x03A8)
+  version:    u8
+  flags:      u8
+  session_id: u32   // random per transfer, constant within it
+  esi:        u24   // encoding symbol ID of first symbol in frame
+  count:      u8    // symbols in this frame
+}                   // 12 bytes
 TransferInfo (in every 8th frame) {
   transfer_length: u40, symbol_size: u16, K: u24, checksum: u32 (CRC-32C)
 }
@@ -320,20 +307,45 @@ symbols…  // each stripe of H/8 cell-rows ends with CRC-16/CCITT
 
 Per-stripe CRC lets a torn capture (§6.3) salvage its intact stripes.
 
+`session_id` is drawn at random by the transmitter for each transfer and
+never changes within it. The receiver MUST discard symbols whose
+`session_id` differs from the current session's; a new `session_id`
+observed in ≥ 3 consecutively decoded frames starts a new transfer context.
+Rationale (informative): without it, stopping transfer A and starting
+transfer B mid-capture feeds mixed symbols to the fountain decoder, which
+can converge to garbage that passes size checks.
+
 ### 6.3 Timing
 
 * Frame hold time = `frame_hold_periods` × display refresh period.
 * Transmitter SHOULD hold each frame ≥ 2 receiver exposure periods
   (calibration measures this; default 6 periods ⇒ 10 fps at 60 Hz).
 * The frame-counter strip (§3.3) carries the low 8 bits of the frame
-  sequence number, duplicated at strip start and end; a mismatch marks the
-  capture torn.
+  sequence number, duplicated at strip start and end. A counter mismatch
+  means the capture is torn: it is **two partial frames** — frame N above
+  the tear, frame N+1 below it — and the two counter copies identify both
+  numbers.
+* A torn capture is not discarded. Per-stripe CRC-16 (§6.2) localizes the
+  intact stripes; the receiver SHOULD attribute intact stripes above the
+  tear to frame N and below it to frame N+1 and feed both partial symbol
+  sets to transport. (The ESI range of frame N+1 is predictable from frame
+  N's header, since the transmitter emits ESIs in the deterministic §6.1
+  order.) Expected gain under heavy tearing: +20–30 % goodput (informative).
 
 ### 6.4 Capacity (informative, v0 targets)
 
 1080p, cell 16 px, Mode A, 3 bits luma + 2 bits chroma, 10 fps:
 ≈ 100×56 cells × 5 bit × 10/s ≈ 280 kbit/s raw; ≈ 100–150 kbit/s goodput
-after framing, FEC and loss. Numbers to be replaced by measurements.
+after framing, FEC and loss. Numbers to be replaced by measurements
+(→ [BENCHMARKS.md](BENCHMARKS.md)).
+
+### 6.5 Receiver requirements **[DRAFT]**
+
+Demodulators SHOULD hand soft observations upward — per-symbol level
+likelihoods, or at minimum value + confidence — rather than hard bytes;
+hard slicing is a lossy compatibility shim. Receivers SHOULD log per frame
+the diagnostic vector `FrameQuality {detection, geometry, color,
+modulation, integrity}`, each component in [0, 1].
 
 ---
 
@@ -379,6 +391,9 @@ exactly 1/2. (An RS codeword over GF(32) cannot exceed 31 symbols; the
 * Decoders MUST verify zero syndromes after correction in both codewords
   and MUST verify the payload CRC-8 (§7.3); on either failure the code is
   rejected (no silent miscorrection).
+* Decoders MUST NOT crash on arbitrary input: every failure path (wrong
+  length, invalid character, uncorrectable errors, CRC mismatch) maps to a
+  defined error.
 
 ### 7.3 Payload — 80 bits
 
@@ -432,8 +447,9 @@ code, including two adjacent fully garbled 4-symbol groups.
 
 | crate | contents | status |
 |---|---|---|
-| `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile` | done, 18 tests |
-| `psicode-core` (next) | §3 ZC frame gen/detect, §5.1 color map, §5.2 Mode A, simulators | — |
+| `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile`; no_std + alloc, fuzz-tested no-panic decode | done, 24 tests |
+| `psicode-core` (next) | §3 ZC frame gen/detect, §5.1 color map, §5.2 Mode A | — |
+| `psicode-sim` | channel simulator: blur, noise, gamma, crosstalk, tearing, homography distortion; Monte Carlo SER/FER sweeps → BENCHMARKS.md | — |
 | `psicode-tx` | Windows 11 transmitter: minifb → winit/softbuffer, calibrate & stream modes | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |
@@ -445,12 +461,20 @@ multi-source-block transfers, printed streaming.
 
 ## 9. Roadmap to freezing
 
-1. Live channel bring-up: ZC frame + Mode A + RaptorQ end-to-end.
-2. Measure: SER vs distance/angle/blur; torn-frame statistics; color
-   crosstalk on ≥ 3 display/phone pairs.
-3. Freeze §3, §5.1, §5.2, §6 (→ STABLE), bump to 0.2.
-4. Mode B measurement campaign: coefficient SNR vs blur σ, grid vs modes.
-5. Freeze §5.3/§5.4, publish 1.0.
+1. `psicode-sim`: channel simulator (blur, noise, gamma, crosstalk,
+   tearing, homography distortion); Monte Carlo SER/FER sweeps fill
+   [BENCHMARKS.md](BENCHMARKS.md). The simulator is the iteration loop; the
+   live channel is the validation gate.
+2. Live channel bring-up: ZC frame + Mode A end-to-end. RaptorQ stays
+   deferred until a single-frame Mode A decode works end-to-end in sim;
+   interim transport MAY be a simple XOR-fountain, marked EXPERIMENTAL and
+   replaced by RaptorQ (§6.1) before any freeze.
+3. Measure live: SER vs distance/angle/blur; torn-frame statistics; color
+   crosstalk on ≥ 3 display/phone pairs (→ BENCHMARKS.md).
+4. Freeze §3, §5.1, §5.2, §6 (→ STABLE), bump to 0.2.
+5. Mode B measurement campaign: coefficient SNR vs blur σ, grid vs modes
+   (→ [RESEARCH.md](RESEARCH.md)).
+6. Freeze §5.3/§5.4, publish 1.0.
 
 ---
 

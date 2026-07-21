@@ -6,5 +6,12 @@ description = "PsiCode: screen-to-camera optical link. Core codec: calibration p
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xelth-com/PsiCode"
 
+[features]
+# По умолчанию тянем std (impl std::error::Error для типов ошибок). Отключение
+# (`--no-default-features`) переводит crate в no_std + alloc: остаётся кодек,
+# но пропадают телеметрийные помощники на трансцендентной математике (§7).
+default = ["std"]
+std = []
+
 [dependencies]
 # намеренно пусто: crate должен собираться под Windows, Android NDK и хост без внешних зависимостей

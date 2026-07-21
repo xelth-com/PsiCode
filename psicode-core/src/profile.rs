@@ -41,6 +41,7 @@
 use crate::base32;
 use crate::bits::{BitReader, BitWriter};
 use crate::rs;
+use alloc::string::String;
 
 pub const CODE_SYMBOLS: usize = rs::CODE_LEN; // 32
 pub const CODE_CHARS_GROUPED: usize = CODE_SYMBOLS + CODE_SYMBOLS / base32::GROUP - 1; // 39 с дефисами
@@ -109,6 +110,22 @@ pub enum ProfileError {
     BadField(&'static str),
 }
 
+impl core::fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ProfileError::BadChar(i) => write!(f, "invalid character at position {i}"),
+            ProfileError::BadLength(n) => write!(f, "expected 32 symbols, got {n}"),
+            ProfileError::Uncorrectable => f.write_str("too many errors: RS could not correct"),
+            ProfileError::CrcMismatch => f.write_str("CRC mismatch after RS decode (miscorrection)"),
+            ProfileError::BadVersion(v) => write!(f, "unsupported format version {v}"),
+            ProfileError::BadField(name) => write!(f, "field out of range: {name}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ProfileError {}
+
 fn crc8(bytes: &[u8]) -> u8 {
     // CRC-8, poly 0x07, init 0x00
     let mut crc = 0u8;
@@ -142,10 +159,18 @@ impl CalibProfile {
         self.black_level_q
     }
     /// сигма шума в градациях серого (0..255): 0.25 * 2^(q/4), т.е. 0.25..~54
+    ///
+    /// Требует трансцендентной математики (`powf`), поэтому доступно только с
+    /// фичей `std`. В no_std пользуйтесь сырым полем `noise_sigma_q`.
+    #[cfg(feature = "std")]
     pub fn noise_sigma(&self) -> f32 {
         0.25 * (2f32).powf(self.noise_sigma_q as f32 / 4.0)
     }
     /// доля рваных кадров, %: 0 -> 0%, иначе 0.1 * 2^(q-1) %, потолок 100
+    ///
+    /// Требует трансцендентной математики (`powi`/`min`), поэтому доступно
+    /// только с фичей `std`. В no_std пользуйтесь сырым полем `torn_frames_q`.
+    #[cfg(feature = "std")]
     pub fn torn_pct(&self) -> f32 {
         if self.torn_frames_q == 0 {
             0.0
@@ -160,11 +185,47 @@ impl CalibProfile {
         self.crosstalk_gb_q * 2
     }
     /// эффективный FPS полезных кадров при мониторе 60 Гц
+    /// (обёртка над [`effective_fps_at`](Self::effective_fps_at) для 60 Гц).
     pub fn effective_fps(&self) -> f32 {
-        60.0 / self.frame_hold_periods as f32
+        self.effective_fps_at(60)
+    }
+    /// эффективный FPS полезных кадров при мониторе `hz` Гц:
+    /// каждый кадр держится `frame_hold_periods` периодов обновления.
+    pub fn effective_fps_at(&self, hz: u32) -> f32 {
+        hz as f32 / self.frame_hold_periods as f32
+    }
+    /// ширина тихой зоны в ячейках (§3.1): пресеты 0..3 -> 2,4,6,8 ячеек.
+    pub fn quiet_zone_cells(&self) -> u8 {
+        2 * (self.quiet_zone + 1)
+    }
+    /// число бит хромы на ячейку для текущего `chroma_mode` (§5.1):
+    /// Mono и GreenOnly несут 0 бит хромы, Chroma1..3 — 1..3 бита.
+    pub fn chroma_bits(&self) -> u8 {
+        match self.chroma_mode {
+            ChromaMode::Mono | ChromaMode::GreenOnly => 0,
+            ChromaMode::Chroma1 => 1,
+            ChromaMode::Chroma2 => 2,
+            ChromaMode::Chroma3 => 3,
+        }
+    }
+    /// Период вставки repair-символов в источник, в исходных символах (§6.1).
+    ///
+    /// Поле `fec_overhead` задаёт поведение потока RaptorQ:
+    /// * `0` — источник ×1, затем бесконечный repair; регулярного интервала
+    ///   вставки нет -> `None`.
+    /// * `1..=7` — repair подмешивается каждые `2^fec_overhead` исходных
+    ///   символов -> `Some(2^fec_overhead)`.
+    pub fn repair_interval_source_symbols(&self) -> Option<u32> {
+        match self.fec_overhead {
+            0 => None,
+            v => Some(1u32 << v),
+        }
     }
 
     fn validate(&self) -> Result<(), ProfileError> {
+        if self.version != Self::VERSION {
+            return Err(ProfileError::BadVersion(self.version));
+        }
         if !(2..=65).contains(&self.cell_size_px) {
             return Err(ProfileError::BadField("cell_size_px"));
         }
@@ -194,7 +255,7 @@ impl CalibProfile {
         Ok(())
     }
 
-    /// 112 бит полей (без CRC), в старших битах u128
+    /// 72 бита полей + пустое место под CRC, в старших битах u128
     fn pack_fields(&self) -> u128 {
         let mut w = BitWriter::new();
         w.write(self.version as u32, 4);
@@ -219,8 +280,8 @@ impl CalibProfile {
         w.finish()
     }
 
-    /// payload = 112 бит полей + CRC-8 в младшем байте
-    fn to_payload(&self) -> u128 {
+    /// payload = 72 бита полей + CRC-8 в младшем байте (итого 80 бит)
+    fn to_payload(self) -> u128 {
         let fields = self.pack_fields();
         let field_bytes = fields_to_bytes(fields);
         let crc = crc8(&field_bytes);
@@ -285,21 +346,39 @@ impl CalibProfile {
 
     /// Профиль -> "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
     pub fn encode_string(&self) -> Result<String, ProfileError> {
+        let mut buf = [0u8; CODE_CHARS_GROUPED];
+        self.encode_into(&mut buf)?;
+        // buf гарантированно ASCII (алфавит + дефисы)
+        Ok(String::from(
+            core::str::from_utf8(&buf).expect("Base32 output is ASCII"),
+        ))
+    }
+
+    /// Кодирование без аллокаций: пишет 39 ASCII-байт "XXXX-...-XXXX" в буфер.
+    pub fn encode_into(&self, out: &mut [u8; CODE_CHARS_GROUPED]) -> Result<(), ProfileError> {
         self.validate()?;
         let payload = self.to_payload();
         let msg = crate::bits::payload_to_symbols(payload);
         let code = rs::encode_pair(&msg);
-        Ok(base32::format_grouped(&code))
+        let n = base32::format_grouped_into(&code, out);
+        debug_assert_eq!(n, CODE_CHARS_GROUPED);
+        Ok(())
     }
 
     /// Строка от человека -> профиль. Возвращает (профиль, число исправленных опечаток).
+    ///
+    /// Разбор входа идёт без аллокаций (в буфер фиксированного размера); память
+    /// выделяет только внутренний RS-декодер.
     pub fn decode_string(input: &str) -> Result<(Self, usize), ProfileError> {
-        let symbols = base32::parse(input).map_err(ProfileError::BadChar)?;
-        if symbols.len() != CODE_SYMBOLS {
-            return Err(ProfileError::BadLength(symbols.len()));
-        }
         let mut code = [0u8; rs::CODE_LEN];
-        code.copy_from_slice(&symbols);
+        let n = base32::parse_into(input, &mut code).map_err(|e| match e {
+            base32::ParseError::BadChar(i) => ProfileError::BadChar(i),
+            // символов больше буфера (>32): длина заведомо неверна
+            base32::ParseError::TooLong => ProfileError::BadLength(CODE_SYMBOLS + 1),
+        })?;
+        if n != CODE_SYMBOLS {
+            return Err(ProfileError::BadLength(n));
+        }
         let fixed = rs::decode_pair(&mut code).map_err(|_| ProfileError::Uncorrectable)?;
         let msg = rs::extract_message(&code);
         let payload = crate::bits::symbols_to_payload(&msg);
@@ -364,6 +443,125 @@ mod tests {
     }
 
     #[test]
+    fn helper_fields() {
+        let p = sample();
+        // 60 Гц -> 10 fps (hold 6); произвольная частота обобщается
+        assert!((p.effective_fps_at(120) - 20.0).abs() < 1e-6);
+        assert!((p.effective_fps_at(60) - p.effective_fps()).abs() < 1e-6);
+        // quiet_zone=1 -> 4 ячейки (§3.1)
+        assert_eq!(p.quiet_zone_cells(), 4);
+        // Chroma2 -> 2 бита хромы (§5.1)
+        assert_eq!(p.chroma_bits(), 2);
+        // fec_overhead=2 -> repair каждые 4 исходных символа (§6.1)
+        assert_eq!(p.repair_interval_source_symbols(), Some(4));
+        // граничные пресеты хромы/тихой зоны/fec
+        let mut q = p;
+        q.chroma_mode = ChromaMode::GreenOnly;
+        assert_eq!(q.chroma_bits(), 0);
+        q.chroma_mode = ChromaMode::Mono;
+        assert_eq!(q.chroma_bits(), 0);
+        q.chroma_mode = ChromaMode::Chroma3;
+        assert_eq!(q.chroma_bits(), 3);
+        q.quiet_zone = 3;
+        assert_eq!(q.quiet_zone_cells(), 8);
+        q.fec_overhead = 0;
+        assert_eq!(q.repair_interval_source_symbols(), None);
+        q.fec_overhead = 7;
+        assert_eq!(q.repair_interval_source_symbols(), Some(128));
+    }
+
+    /// Замороженный формат: точная эталонная строка из §7.4 SPEC. Падение этого
+    /// теста означает, что проводной формат изменился (несовместимость).
+    const REFERENCE_CODE: &str = "26E2-BM46-VHH8-B6R3-8XP4-HBNK-PJCD-GHF7";
+
+    #[test]
+    fn frozen_wire_format() {
+        let p = sample();
+        // 1. кодирование эталонного профиля даёт точную эталонную строку
+        assert_eq!(p.encode_string().unwrap(), REFERENCE_CODE);
+        // 2. канонический декод возвращает тот же профиль без исправлений
+        let (q, fixed) = CalibProfile::decode_string(REFERENCE_CODE).unwrap();
+        assert_eq!(fixed, 0);
+        assert_eq!(p, q);
+        // 3. нижний регистр + мусорные пробелы (таб, перевод строки, NBSP,
+        //    ведущие/хвостовые) декодируются в тот же профиль
+        let mangled = "  26e2 bm46\tvhh8\nb6r3\u{00A0}8xp4-hbnk pjcd ghf7  ";
+        let (r, fixed2) = CalibProfile::decode_string(mangled).unwrap();
+        assert_eq!(fixed2, 0);
+        assert_eq!(p, r);
+    }
+
+    #[test]
+    fn encode_into_matches_encode_string() {
+        let p = sample();
+        let mut buf = [0u8; CODE_CHARS_GROUPED];
+        p.encode_into(&mut buf).unwrap();
+        assert_eq!(&buf, REFERENCE_CODE.as_bytes());
+    }
+
+    #[test]
+    fn encode_rejects_wrong_version() {
+        let mut p = sample();
+        p.version = 2;
+        assert_eq!(p.encode_string(), Err(ProfileError::BadVersion(2)));
+        let mut buf = [0u8; CODE_CHARS_GROUPED];
+        assert_eq!(p.encode_into(&mut buf), Err(ProfileError::BadVersion(2)));
+    }
+
+    /// xorshift64: детерминированный ГПСЧ без внешних зависимостей.
+    struct XorShift64(u64);
+    impl XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Широкий пул символов: алфавит, конфузаблы, разделители, юникод-пробелы,
+    /// мусор и управляющие — всё, чем человек может «промахнуться».
+    const FUZZ_POOL: &[char] = &[
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
+        'J', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'T', 'U', 'V', 'W', 'X', 'Y', 'a', 'o', 'i', 's',
+        'z', 'O', 'I', 'S', 'Z', '-', '\u{2013}', '\u{2014}', ' ', '\t', '\n', '\r', '\u{00A0}',
+        '\u{2003}', '\u{3000}', '*', '#', '@', '.', '/', '+', '=', '?', 'é', 'ß', 'ψ', '中', '\0',
+    ];
+
+    fn fuzz_decode(iterations: usize) {
+        let mut rng = XorShift64(0x1234_5678_9ABC_DEF0);
+        for _ in 0..iterations {
+            let len = (rng.next() % 65) as usize; // 0..=64
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push(FUZZ_POOL[(rng.next() as usize) % FUZZ_POOL.len()]);
+            }
+            // Контракт: путь декодирования НИКОГДА не паникует; любой исход —
+            // строго Ok или Err (определённая ошибка). При случайном Ok профиль
+            // обязан быть самосогласованным (перекодируется в валидную строку).
+            if let Ok((profile, _)) = CalibProfile::decode_string(&s) {
+                let re = profile.encode_string().expect("decoded profile must re-encode");
+                let (again, _) = CalibProfile::decode_string(&re).expect("re-decode");
+                assert_eq!(profile, again);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_never_panics_on_random_input() {
+        // держим быстрым для обычного `cargo test`
+        fuzz_decode(100_000);
+    }
+
+    #[test]
+    #[ignore = "тяжёлый прогон; запускать через `cargo test -- --ignored`"]
+    fn decode_never_panics_on_random_input_heavy() {
+        fuzz_decode(2_000_000);
+    }
+
+    #[test]
     fn tolerates_four_typos_and_sloppy_input() {
         let p = sample();
         let s = p.encode_string().unwrap();
@@ -390,22 +588,28 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_two_fully_garbled_groups() {
-        // вторая и третья группы (символы 5..=8 и 10..=13 в строке) испорчены
-        // целиком: 8 подряд опечаток делятся перемежением 4/4 между A и B
+    fn recovers_every_adjacent_group_pair() {
+        // Для каждой соседней пары групп (0-1, 1-2, ..., 6-7) целиком портим
+        // обе группы (8 символов подряд): перемежение 4/4 делит серию между
+        // словами A и B, и код обязан восстановиться, исправив ровно 8 символов.
         let p = sample();
         let s = p.encode_string().unwrap();
-        let mut chars: Vec<char> = s.chars().collect();
-        for i in (5..=13usize).filter(|&i| i != 9) {
-            let orig = chars[i];
-            assert_ne!(orig, '-');
-            let orig_val = crate::base32::char_to_symbol(orig).unwrap();
-            chars[i] = crate::base32::symbol_to_char((orig_val + 16) % 32);
+        for g in 0..7usize {
+            let mut chars: Vec<char> = s.chars().collect();
+            for grp in [g, g + 1] {
+                for k in 0..base32::GROUP {
+                    let idx = grp * (base32::GROUP + 1) + k; // +1 на дефис между группами
+                    let orig = chars[idx];
+                    assert_ne!(orig, '-', "pair {g}: idx {idx}");
+                    let v = base32::char_to_symbol(orig).unwrap();
+                    chars[idx] = base32::symbol_to_char((v + 16) % 32);
+                }
+            }
+            let garbled: String = chars.into_iter().collect();
+            let (q, fixed) = CalibProfile::decode_string(&garbled).unwrap();
+            assert_eq!(fixed, 8, "pair {g},{}", g + 1);
+            assert_eq!(p, q, "pair {g},{}", g + 1);
         }
-        let garbled: String = chars.into_iter().collect();
-        let (q, fixed) = CalibProfile::decode_string(&garbled).unwrap();
-        assert_eq!(fixed, 8);
-        assert_eq!(p, q);
     }
 
     #[test]
