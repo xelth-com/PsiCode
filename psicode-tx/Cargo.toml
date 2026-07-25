@@ -1,0 +1,14 @@
+[package]
+name = "psicode-tx"
+version = "0.1.0"
+edition = "2021"
+description = "PsiCode Windows transmitter (SPEC §8): calibration pattern + streaming Mode A frames over the optical channel."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xelth-com/PsiCode"
+
+[dependencies]
+# psicode-core — весь кодек формата (§3/§5/§6/§7). Единственный «свой» крейт.
+psicode-core = { path = "../psicode-core" }
+# Ровно две внешние зависимости (окно + программный блит), больше не добавлять:
+winit = "0.30"       # кроссплатформенное окно и цикл событий
+softbuffer = "0.4"   # программный RGB-буфер в окно (без GPU)
