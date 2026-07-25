@@ -30,6 +30,9 @@ const MID: f64 = 128.0;
 const REF_PERIOD: usize = 16;
 /// Число ступеней серой лесенки в референсном паттерне (§3.4).
 const REF_GRAY_STEPS: usize = 6;
+/// Бит счётчика кадров в строке счётчика (§3.3/§6.3): младшие 8 бит номера
+/// кадра, продублированные в начале и в конце строки счётчика.
+pub const COUNTER_BITS: usize = 8;
 
 /// [EXPERIMENTAL] Доля `usable` под яркость в хромо-режимах v0 (§5.1).
 /// Заморозится после канальных измерений; см. RESEARCH/BENCHMARKS.
@@ -65,10 +68,23 @@ pub struct Frame {
 }
 
 /// Собирает полный символ v0: тихая зона, двойное ЗЧ-кольцо, референсная
-/// строка, Mode A payload-сетка, строка счётчика (v0: средне-серая).
+/// строка, Mode A payload-сетка, строка счётчика (v0: средне-серая, counter=0).
 /// `cells` — ровно PAYLOAD_COLS·PAYLOAD_ROWS символов клеток в растровом
 /// порядке (в каждом байте значимы младшие bits_per_cell бит, Грей-код).
+///
+/// Обёртка над [`render_symbol_counter`] с `counter = 0` — публичный API v0
+/// не меняется; счётчик кадров задаётся явным вызовом render_symbol_counter.
 pub fn render_symbol(p: &CalibProfile, cells: &[u8]) -> Frame {
+    render_symbol_counter(p, cells, 0)
+}
+
+/// Как [`render_symbol`], но строка счётчика кадров (§3.3/§6.3) несёт младшие
+/// 8 бит `counter`: 8 чёрно-белых клеток в НАЧАЛЕ строки счётчика И их дубль
+/// в КОНЦЕ (white = бит 1), середина строки остаётся средне-серой. Порядок бит
+/// — старшим вперёд (клетка в позиции 0 = бит 7, позиция 7 = бит 0). Дубль
+/// нужен рваному снимку (§6.3): tear выше строки счётчика оставляет копию
+/// кадра N+1, ниже — копию кадра N; две копии считываются приёмником отдельно.
+pub fn render_symbol_counter(p: &CalibProfile, cells: &[u8], counter: u8) -> Frame {
     assert_eq!(
         cells.len(),
         PAYLOAD_COLS * PAYLOAD_ROWS,
@@ -83,7 +99,7 @@ pub fn render_symbol(p: &CalibProfile, cells: &[u8]) -> Frame {
     let size_px = total_cells * cell;
 
     // 1. клеточная решётка символа GRID×GRID в drive-RGB.
-    let sym = build_symbol_cells(p, cells);
+    let sym = build_symbol_cells(p, cells, counter);
 
     // 2. композиция полотна: тихая зона (средне-серая), затем «раздутие»
     //    каждой клетки символа в сплошной квадрат cell×cell (§5.2).
@@ -305,8 +321,9 @@ fn encode_cell(
     encode_field(re, im, a_l, a_c, greenonly)
 }
 
-/// Сборка клеточной решётки символа GRID×GRID в drive-RGB.
-fn build_symbol_cells(p: &CalibProfile, cells: &[u8]) -> Vec<[u8; 3]> {
+/// Сборка клеточной решётки символа GRID×GRID в drive-RGB. `counter` — младшие
+/// 8 бит номера кадра для строки счётчика (§3.3/§6.3).
+fn build_symbol_cells(p: &CalibProfile, cells: &[u8], counter: u8) -> Vec<[u8; 3]> {
     let (black_255, white_255) = levels(p);
     let white = [white_255; 3];
     let black = [black_255; 3];
@@ -376,14 +393,52 @@ fn build_symbol_cells(p: &CalibProfile, cells: &[u8]) -> Vec<[u8; 3]> {
             sym[y * GRID + x] = encode_cell(s, chroma_bits, l_levels, c_levels, a_l, a_c, greenonly);
         }
     }
-    // строка ir=56 (y=58): строка счётчика кадров, v0 — средне-серая (§3.3)
+    // строка ir=56 (y=58): строка счётчика кадров (§3.3/§6.3). Середина
+    // средне-серая; младшие 8 бит `counter` — 8 клеток в начале строки И их
+    // дубль в конце (white = бит 1, MSB-first). Дубль позволяет рваному снимку
+    // прочитать номер кадра как выше, так и ниже разрыва.
     let gray = [MID as u8; 3];
+    let crow = (RING + INTERIOR - 1) * GRID;
     for ic in 0..INTERIOR {
-        let x = RING + ic;
-        sym[(RING + INTERIOR - 1) * GRID + x] = gray;
+        sym[crow + RING + ic] = gray;
+    }
+    for k in 0..COUNTER_BITS {
+        let bit = (counter >> (COUNTER_BITS - 1 - k)) & 1 == 1;
+        let color = pick(bit, white, black);
+        sym[crow + RING + k] = color; // копия в начале строки
+        sym[crow + RING + (INTERIOR - COUNTER_BITS + k)] = color; // копия в конце
     }
 
     sym
+}
+
+/// Считывает обе копии счётчика кадров из строки счётчика снимка (§3.3/§6.3):
+/// (копия из начала строки, копия из конца строки). `map`/`sample` — те же
+/// соглашения, что у [`demod_symbol`]. Порог — яркость (канал G) средне-серой
+/// клетки из середины строки счётчика: она строго между чёрным и белым по
+/// яркости при монотонной гамме, поэтому white ⇔ G_клетки > G_серого. Обе
+/// копии обычно совпадают; в рваном снимке они относятся к разным кадрам.
+pub fn read_counters(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+) -> (u8, u8) {
+    let quiet = p.quiet_zone_cells() as usize;
+    let cell = p.cell_size_px as usize;
+    let cy = RING + INTERIOR - 1; // строка счётчика в координатах GRID
+    // серый эталон из середины строки счётчика (заведомо gray-регион).
+    let g_ref = sample_cell(quiet, cell, RING + INTERIOR / 2, cy, map, sample)[1];
+    let mut start = 0u8;
+    let mut end = 0u8;
+    for k in 0..COUNTER_BITS {
+        let cx_s = RING + k;
+        let cx_e = RING + (INTERIOR - COUNTER_BITS + k);
+        let g_s = sample_cell(quiet, cell, cx_s, cy, map, sample)[1];
+        let g_e = sample_cell(quiet, cell, cx_e, cy, map, sample)[1];
+        start = (start << 1) | (g_s > g_ref) as u8;
+        end = (end << 1) | (g_e > g_ref) as u8;
+    }
+    (start, end)
 }
 
 /// Сэмплирует клетку (cx, cy) символа: центр, либо среднее 2×2 субсэмплов
@@ -625,6 +680,36 @@ mod tests {
                 let p = prof(luma, mode, cell, 0);
                 assert_roundtrip(&p, 1.0, 0.0, 0x1234_5678_9ABC_DEF0 ^ cell as u64);
             }
+        }
+    }
+
+    /// Счётчик кадров (§3.3/§6.3): render_symbol_counter -> read_counters через
+    /// идеальный дисплей+линейный сенсор возвращает ОБЕ копии для всех 256 значений.
+    #[test]
+    fn frame_counter_roundtrip_all_values() {
+        let p = prof(3, ChromaMode::Chroma2, 16, 1);
+        let cells = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+        let gr = p.gamma_r() as f64;
+        let gg = p.gamma_g() as f64;
+        let gb = p.gamma_b() as f64;
+        for counter in 0u8..=255 {
+            let frame = render_symbol_counter(&p, &cells, counter);
+            let size = frame.size_px;
+            let rgb = frame.rgb.clone();
+            let sample = move |x: f64, y: f64| -> [f32; 3] {
+                let xi = (x as usize).min(size - 1);
+                let yi = (y as usize).min(size - 1);
+                let d = rgb[yi * size + xi];
+                [
+                    (d[0] as f64 / 255.0).powf(gr) as f32,
+                    (d[1] as f64 / 255.0).powf(gg) as f32,
+                    (d[2] as f64 / 255.0).powf(gb) as f32,
+                ]
+            };
+            let map = |u: f64, v: f64| (u, v);
+            let (start, end) = read_counters(&p, &map, &sample);
+            assert_eq!(start, counter, "start-копия для counter={counter}");
+            assert_eq!(end, counter, "end-копия для counter={counter}");
         }
     }
 

@@ -13,6 +13,7 @@
 //!                  конфигураций (luma_bits × chroma × blur σ)
 
 mod channel;
+mod framed;
 mod image;
 mod pipeline;
 mod report;
@@ -599,10 +600,127 @@ fn cmd_goodput() {
     println!("\nвсего {:.2} c", t0.elapsed().as_secs_f64());
 }
 
+// --- framed: L3-фрейминг сквозь канал, FER (§2/§6.3) и torn-goodput (§4/§6.3) ---
+
+const FER_TRIALS: usize = 15;
+/// Попыток на среднее байт-салваджа (чистые кадры / рваные кадры).
+const CLEAN_TRIALS: usize = 15;
+const TORN_TRIALS: usize = 40;
+/// goodput = байты · 8 · fps(10) · FEC_keep(0.8) / 1000. Заголовок исключён
+/// естественно (реальные байты l3), а не плоской скидкой 1.5% — поэтому p=0
+/// сходится к ~148 kbit/s строки «clean channel» §4.
+const TORN_GP_K: f64 = 8.0 * 10.0 * 0.8 / 1000.0;
+
+/// FER по FER_TRIALS попыткам: доля потерянных кадров (страйп-заголовок мёртв
+/// ИЛИ все страйпы мертвы), без разрыва.
+fn mean_fer(p: &CalibProfile, ch: &ChannelParams, point: usize) -> f64 {
+    let mut lost = 0usize;
+    for t in 0..FER_TRIALS {
+        if framed::run_framed_trial(p, ch, 0.0, point, t).frame_lost {
+            lost += 1;
+        }
+    }
+    lost as f64 / FER_TRIALS as f64
+}
+
+/// Среднее число полезных байт (off, on) по `trials` попыткам при фиксированной
+/// вероятности разрыва `torn_prob` (0 = всегда чисто, 1 = всегда рвём).
+fn mean_useful(
+    p: &CalibProfile,
+    ch: &ChannelParams,
+    torn_prob: f64,
+    point: usize,
+    trials: usize,
+) -> (f64, f64) {
+    let mut off = 0usize;
+    let mut on = 0usize;
+    for t in 0..trials {
+        let r = framed::run_framed_trial(p, ch, torn_prob, point, t);
+        off += r.useful_off;
+        on += r.useful_on;
+    }
+    (off as f64 / trials as f64, on as f64 / trials as f64)
+}
+
+fn cmd_framed() {
+    let t0 = Instant::now();
+    println!("# psicode-sim framed (L3 §6.2–6.3: FER + torn-frame partial decode)");
+
+    // --- BENCHMARKS §2: FER vs px/cell (σ=1, genie, без разрыва) ---
+    // тот же эталонный профиль (luma3+Chroma2, 5 бит), что строка SER §2.
+    let p_ref = reference_profile();
+    let base = ChannelParams::from_profile(&p_ref);
+    let ppcs = [8.0, 6.0, 4.0, 3.0, 2.0, 1.5];
+    println!("\n## BENCHMARKS §2 — FER vs px/cell (blur σ=1, эталон {}b/клетку)", symbol::bits_per_cell(&p_ref));
+    println!("FER: кадр потерян = страйп-заголовок (0) мёртв ИЛИ все 8 страйпов мертвы.");
+    println!("| source | px/cell → | 8 | 6 | 4 | 3 | 2 | 1.5 |");
+    println!("|---|---|---|---|---|---|---|---|");
+    let mut cells = Vec::new();
+    for (i, &ppc) in ppcs.iter().enumerate() {
+        let mut ch = base.clone();
+        ch.px_per_cell = ppc;
+        ch.set_blur(1.0);
+        cells.push(report::sig4(mean_fer(&p_ref, &ch, 500 + i)));
+    }
+    println!("{}", report::table_row("sim | FER", &cells));
+
+    // --- BENCHMARKS §4: torn-frame goodput (partial decode OFF vs ON) ---
+    // конфиг luma4+Chroma2 (6 бит) на ЧИСТОМ канале — изолируем разрыв и держим
+    // сопоставимость с baseline-строкой «clean channel» (§4). На σ=1 этот 6-бит
+    // конфиг даёт SER≈0.07 -> все страйпы гибнут (обрыв §6), поэтому демонстрация
+    // выигрыша от разрыва идёт на чистом канале (blur покрыт другими строками §4).
+    let mut p_gp = reference_profile();
+    p_gp.luma_bits = 4;
+    p_gp.chroma_mode = ChromaMode::Chroma2;
+    let ch_clean = ChannelParams::clean(&p_gp);
+    let bpc = symbol::bits_per_cell(&p_gp);
+    println!("\n## BENCHMARKS §4 — torn-frame goodput (luma4+Chroma2 = {bpc}b, чистый канал)");
+    println!(
+        "goodput = сред_салвадж_байт · 8 · fps(10) · FEC_keep(0.8) / 1000. p_torn — известный\n\
+         параметр, входит аналитически; Monte-Carlo усредняет только ПОЛОЖЕНИЕ разрыва\n\
+         ({CLEAN_TRIALS} чистых + {TORN_TRIALS} рваных попыток)."
+    );
+    // средние: чистый кадр (=полный салвадж) и рваный кадр (частичный салвадж).
+    let (clean_off, _clean_on) = mean_useful(&p_gp, &ch_clean, 0.0, 600, CLEAN_TRIALS);
+    let (_torn_off, torn_on) = mean_useful(&p_gp, &ch_clean, 1.0, 610, TORN_TRIALS);
+    println!(
+        "// сред. салвадж: чистый кадр {clean_off:.0} байт, рваный кадр ON {torn_on:.0} байт (OFF 0)"
+    );
+    println!("| p_torn | goodput OFF | goodput ON | gain ON/OFF |");
+    println!("|---|---|---|---|");
+    let mut rows = Vec::new();
+    for &pt in &[0.0f64, 0.20, 0.50] {
+        // OFF: рваный кадр теряется целиком -> вклад только чистых кадров.
+        let off = (1.0 - pt) * clean_off * TORN_GP_K;
+        // ON: чистые кадры полностью + рваные частично.
+        let on = ((1.0 - pt) * clean_off + pt * torn_on) * TORN_GP_K;
+        let gain = if off > 0.0 { (on / off - 1.0) * 100.0 } else { 0.0 };
+        println!(
+            "| {:.0}% | {:.1} | {:.1} | {:+.1}% |",
+            pt * 100.0,
+            off,
+            on,
+            gain
+        );
+        rows.push((pt, off, on, gain));
+    }
+
+    // сводка для вердикта против §6.3 «+20–30%».
+    println!("\n### verdict vs SPEC §6.3 «+20–30% goodput под тяжёлым разрывом»");
+    for &(pt, off, on, gain) in &rows {
+        if pt > 0.0 {
+            println!("- p_torn {:.0}%: ON/OFF = {:+.1}% ({:.1} -> {:.1} kbit/s)", pt * 100.0, gain, off, on);
+        }
+    }
+
+    println!("\nвсего {:.2} c", t0.elapsed().as_secs_f64());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("sweep") => cmd_sweep(),
+        Some("framed") => cmd_framed(),
         Some("dump") => {
             let dir = args.get(2).map(String::as_str).unwrap_or(DUMP_DIR_DEFAULT);
             cmd_dump(Path::new(dir));
@@ -613,7 +731,7 @@ fn main() {
         }
         Some("goodput") => cmd_goodput(),
         _ => {
-            eprintln!("usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput>");
+            eprintln!("usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed>");
             std::process::exit(2);
         }
     }

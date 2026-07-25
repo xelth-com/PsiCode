@@ -34,18 +34,20 @@ SER counts as 1.0.
 | metric \ blur σ (px) | 0.5 | 1 | 2 | 4 | 6 | 8 |
 |---|---|---|---|---|---|---|
 | genie SER | 0.0034 | 0.070 | 0.710 | 0.933 | 0.960 | 0.965 |
-| detected SER | 0.0008 | 0.284 | 0.735 | 0.931 | 0.959 | 0.998 |
-| detect success | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.07 |
-| mean score | 1.00 | 1.00 | 0.995 | 0.908 | 0.710 | 0.631 |
+| detected SER | 0.0003 | 0.098 | 0.768 | 0.942 | 0.962 | 0.995 |
+| detect success | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 0.13 |
+| mean score | 1.000 | 1.000 | 0.999 | 0.935 | 0.763 | 0.576 |
 
-> sim v0 (2026-07-25): G-plane luma into `detect_symbol`, px/cell = 8, 15
-> frames/point, deterministic seeds; detect failure ⇒ frame lost (SER = 1.0).
-> Detection is **robust** — it recovers frame + orientation through σ ≤ 6 and
-> every px/cell tested down to 1.5, collapsing only at σ = 8 (7 % success). But
-> its estimated geometry costs SER: at the σ = 1 operating point detected SER
-> ≈ 4× genie (0.284 vs 0.070), and mild perspective (§8) gives detected 0.478
-> vs genie 0.250 (detection 100 %). The genie tables (§1–2) overstate the real
-> detected-geometry operating envelope.
+> sim v0 (2026-07-25, after sub-cell ring fine-alignment): G-plane luma into
+> `detect_symbol`, px/cell = 8, 15 frames/point, deterministic seeds; detect
+> failure ⇒ frame lost (SER = 1.0). Detection recovers frame + orientation
+> 100 % through σ ≤ 6 and every px/cell down to 1.5, collapsing only at σ = 8.
+> Geometry cost after fine-alignment: **1.4× genie at σ = 1** (0.098 vs 0.070;
+> was 4× before), *better* than genie at σ = 0.5 and px/cell = 6, and mild
+> perspective (§8) 0.303 vs genie 0.250. History: the pre-refinement penalty
+> came from per-side 1-D lags saturating under blur; fixed by full-ring 2-D
+> Pearson alignment sampled near cell edges (±0.35), where blur creates
+> gradient. Cost ≈ +3.7 ms/frame.
 
 ## 2. SER / FER vs. distance
 
@@ -54,9 +56,18 @@ Distance normalized as camera pixels per display cell.
 | source | px/cell → | 8 | 6 | 4 | 3 | 2 | 1.5 |
 |---|---|---|---|---|---|---|---|
 | sim | SER | 0.0688 | 0.4718 | 0.7204 | 0.8632 | 0.9389 | 0.9256 |
-| sim | FER | | | | | | |
+| sim | FER | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
 | live | SER | | | | | | |
 | live | FER | | | | | | |
+
+> sim v0 (2026-07-25), `psicode-sim framed`: **FER** = fraction of frames lost,
+> where a frame is lost iff the header stripe (stripe 0) fails its CRC-16 **or**
+> all 8 stripes fail (§6.2 per-stripe CRC; L3 `parse_frame`). Reference profile
+> (luma 3 + Chroma2, 5 bit/cell), genie geometry, σ = 1, no tearing, 15
+> frames/point. FER = 1.000 at **every** px/cell: at σ = 1 the reference config's
+> raw SER ≈ 0.07 shreds every 399-cell stripe (the §6 stripe cliff), so even at
+> px/cell 8 no whole stripe — hence no header — survives. FER < 1 needs the
+> robust low-bit configs of §6 (raw SER ≲ 1e−3), not the 5-bit reference config.
 
 ## 3. SER / FER vs. viewing angle
 
@@ -74,10 +85,10 @@ condition; includes torn-frame partial decoding (SPEC §6.3) on/off.
 
 | source | condition | goodput, partial decode OFF | goodput, partial decode ON |
 |---|---|---|---|
-| sim | clean channel | 148.2 | |
-| sim | blur σ = 2 px | 24.7 | |
-| sim | 20 % torn frames | | |
-| sim | 50 % torn frames | | |
+| sim | clean channel | 148.2 | 148.2 |
+| sim | blur σ = 2 px | 24.7 | 24.7 |
+| sim | 20 % torn frames | 118.7 | 142.6 |
+| sim | 50 % torn frames | 74.2 | 133.7 |
 | live | best display/phone pair | | |
 | live | worst display/phone pair | | |
 
@@ -86,8 +97,35 @@ condition; includes torn-frame partial decoding (SPEC §6.3) on/off.
 > the **optimum (luma_bits × chroma) config for that condition** (clean →
 > luma 4 + Chroma2, 6 bit/cell; blur σ = 2 → luma 1 + Mono, 1 bit/cell — see §6
 > for the full config sweep and the argmax per σ). Channel = telemetry truth of
-> the §7.4 profile, px/cell = 8, 15 frames/point. Partial-decode (torn-frame,
-> §6.3) model not built yet ⇒ the ON column is empty.
+> the §7.4 profile, px/cell = 8, 15 frames/point. On the clean / blur rows there
+> are **no torn frames**, so partial-decode is a no-op ⇒ ON = OFF.
+>
+> **Torn-frame rows** (`psicode-sim framed`, 2026-07-25): real L3 framing —
+> `build_frame` lays FrameHeader [+ TransferInfo] + encoding-symbol bytes across
+> the 8 stripes, each closed by CRC-16/CCITT; `parse_frame` recovers per-stripe
+> validity. A rolling-shutter tear (§6.3) is composed **before** the channel:
+> rows [0, t) from rendered frame N, rows [t, H) from frame N+1, tear row t drawn
+> inside a random payload cell-row so the straddling stripe always fails CRC and
+> marks the seam. Config = luma 4 + Chroma2 (6 bit/cell) on a **clean channel**
+> (isolates tearing, matching the clean-channel baseline; on a σ = 1 channel the
+> 6-bit config's stripe cliff would zero both columns, so blur is left to the
+> rows above). Goodput = mean salvaged **symbol** bytes (header excluded via real
+> L3) × 8 × 10 fps × 0.8 FEC / 1000; p_torn is a known parameter entering
+> analytically, Monte-Carlo averages only the tear **position** (15 clean + 40
+> torn draws). Attribution v0: top CRC-valid run → frame N (stripe-0 header),
+> bottom run → frame N+1 (ESI predicted from N per §6.1), detected by counter-row
+> ≠ header; OFF discards any torn capture, ON salvages both runs. If the header
+> stripe (0) lands on the seam the capture is unattributable ⇒ 0 in both (real
+> ~13 % of torn captures — the honest cap on ON's gain).
+>
+> **Verdict vs §6.3 "+20–30 % goodput under heavy tearing":** measured ON/OFF
+> gain = **+20.1 %** at 20 % torn (148.4 → clean; 118.7 → 142.6) and **+80.2 %**
+> at 50 % torn (74.2 → 133.7). So the spec's +20–30 % band is accurate for
+> *mild-to-moderate* tearing (~20 %) but **understates** the payoff under *heavy*
+> tearing: at 50 % torn the salvage nearly **doubles** goodput (OFF loses half of
+> all captures; ON keeps ~7/8 of each torn frame from two frames at once). p = 0
+> reproduces the 148.2 clean baseline, confirming the real-header accounting is
+> consistent with the flat-1.5 % header model of the rows above.
 
 ## 5. Device matrix (live)
 

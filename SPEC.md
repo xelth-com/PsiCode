@@ -188,6 +188,18 @@ containing:
 The receiver then displays the 32-character profile code (§7). The human
 types it into the transmitter. Done.
 
+Reference pattern layout v0 (DRAFT): a 61×61-cell canvas (cell = size/61) —
+double ZC ring (§3.2); interior 57×57 cells stacked top-to-bottom as:
+frequency wedge, 11 bands × 3 cell-rows (pitches in **absolute display px**,
+so `mtf_limit_px` is size-independent); 16-step gray, R-only and B-only
+staircases (4 cell-rows each, drive = round(255·i/15)); white patch,
+12 cell-rows (≈18 % of area). The animated counter (item 5) runs as a
+separate phase; the static pattern covers items 1–4. Estimator note: the
+γ_G fit SHOULD correct for crosstalk leakage into G (fit γ_R/γ_B from their
+staircases first, then fit G against the leakage basis
+u^γG + x_rg·u^γR + x_gb·u^γB) — an uncorrected single-power fit is biased
+low by several quantization steps.
+
 **Recalibration** (informative): the profile code MAY be issued again later.
 In particular, if a streaming transfer ends with a failing payload checksum
 (§6.2), the receiver SHOULD display a fresh profile code whose telemetry was
@@ -305,6 +317,18 @@ TransferInfo (in every 8th frame) {
 symbols…  // each stripe of H/8 cell-rows ends with CRC-16/CCITT
 ```
 
+Bit packing (v0, normative): the 57×55-cell payload region is split into 8
+row-stripes (7,7,7,7,7,7,7,6 rows). Within a stripe, cells in raster order
+emit `bits_per_cell` bits MSB-first; the **last 16 bits of each stripe** are
+CRC-16/CCITT (poly 0x1021, init 0xFFFF, no reflection, no final XOR) over
+all preceding bits of that stripe. The data region carries whole bytes only
+(⌊(cap−16)/8⌋ bytes MSB-first; leftover bits before the CRC are zero
+padding), so **no byte spans a stripe boundary** — stripe salvage (§6.3)
+never yields torn bytes. The frame byte stream — FrameHeader ∥
+[TransferInfo] ∥ encoding-symbol bytes — fills stripe data regions 0→7
+contiguously. All multi-byte fields big-endian; `flags` bit 0 =
+TransferInfo present.
+
 Per-stripe CRC lets a torn capture (§6.3) salvage its intact stripes.
 
 `session_id` is drawn at random by the transmitter for each transfer and
@@ -321,7 +345,9 @@ can converge to garbage that passes size checks.
 * Transmitter SHOULD hold each frame ≥ 2 receiver exposure periods
   (calibration measures this; default 6 periods ⇒ 10 fps at 60 Hz).
 * The frame-counter strip (§3.3) carries the low 8 bits of the frame
-  sequence number, duplicated at strip start and end. A counter mismatch
+  sequence number, duplicated at strip start and end (v0: 8 black/white
+  cells at each end of the row, MSB-first — first cell = bit 7, white = 1;
+  the middle of the row stays mid-gray). A counter mismatch
   means the capture is torn: it is **two partial frames** — frame N above
   the tear, frame N+1 below it — and the two counter copies identify both
   numbers.
@@ -447,11 +473,13 @@ code, including two adjacent fully garbled 4-symbol groups.
 
 | crate | contents | status |
 |---|---|---|
-| `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile`; no_std + alloc, fuzz-tested no-panic decode | done, 24 tests |
-| `psicode-core` `symbol` | §3 render (ZC gen, ref strip), §5.1 color map, §5.2 Mode A mod/demod | done |
-| `psicode-core` `detect` | §3.2 ZC detection: quad search, per-side correlation with sub-cell lags, orientation, homography | done (core: 36 tests) |
-| `psicode-sim` | channel simulator: gamma, homography, per-channel blur, crosstalk, gain/offset, noise; SER/goodput/calibration-sensitivity sweeps → BENCHMARKS.md | v0 done, 30 tests (incl. detected-geometry path) |
-| next | detected-geometry refinement (≈4× SER cost vs known geometry at σ=1, see BENCHMARKS §1); L3 framing + tearing model in sim → FER & partial-decode goodput | — |
+| `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile`; no_std + alloc, fuzz-tested no-panic decode | done |
+| `psicode-core` `symbol` | §3 render (ZC gen, ref strip, frame counter), §5.1 color map, §5.2 Mode A mod/demod | done |
+| `psicode-core` `detect` | §3.2 ZC detection: quad search, per-side correlation, sub-cell full-ring fine-alignment, orientation, homography | done |
+| `psicode-core` `l3` | §6.2 framing: header/TransferInfo, per-stripe CRC-16, cell bit-packing, salvage parser | done |
+| `psicode-core` `calibrate` | §4 pattern render + channel estimators (γ, MTF, noise, crosstalk, levels) + prescription heuristic | done |
+| `psicode-sim` | channel sim (gamma, homography, per-channel blur, crosstalk, gain/offset, noise, rolling-shutter tearing); SER/FER/goodput/sensitivity/detected-vs-genie sweeps → BENCHMARKS.md | v0 done (workspace: 87 tests) |
+| next | interim XOR-fountain transport → end-to-end file transfer in sim; Mode B prototype (→ RESEARCH.md); `psicode-tx` | — |
 | `psicode-tx` | Windows 11 transmitter: minifb → winit/softbuffer, calibrate & stream modes | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |

@@ -141,6 +141,16 @@ pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, Dete
         h0 = hr;
     }
 
+    // 4b. тонкое выравнивание по ПОЛНОМУ двойному кольцу (§3.2): 2-D корреляция
+    //     всех ~488 известных клеток (внешнее + инвертированное внутреннее,
+    //     четыре стороны) вместо 244 одномерных отсчётов. Координатный спуск по
+    //     углам ловит субклеточный сдвиг, устойчиво к блюру (центры клеток
+    //     дольше краёв сохраняют знак). Уточнение геометрии, не ориентации.
+    let cf = refine_ring(luma, w, h, &c, best_r);
+    if let Some(hf) = build_h(&cf) {
+        h0 = hf;
+    }
+
     // 5. финальный score по уточнённой гомографии.
     let mut fs = 0.0;
     for side in 0..4 {
@@ -395,6 +405,152 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Тонкое выравнивание по полному двойному кольцу (2-D корреляция)
+// ---------------------------------------------------------------------------
+
+/// Центр клетки кольца в наблюдаемых клеточных координатах: `side`
+/// (0=верх,1=право,2=низ,3=лево), `depth` — глубина внутрь от внешнего края
+/// (0 — внешнее кольцо, 1 — внутреннее), `n` — позиция вдоль стороны по часовой
+/// (0..GRID). Согласовано со [`side_point`] при depth=0.
+#[inline]
+fn ring_point(side: usize, depth: f64, n: f64) -> (f64, f64) {
+    let a = HALF + n; // вдоль стороны (по часовой)
+    let d = HALF + depth; // внутрь от внешнего края
+    match side {
+        0 => (a, d),         // верх: слева направо, внутрь = +v
+        1 => (G - d, a),     // право: сверху вниз, внутрь = −u
+        2 => (G - a, G - d), // низ: справа налево, внутрь = −v
+        _ => (d, G - a),     // лево: снизу вверх, внутрь = +u
+    }
+}
+
+/// Тонкое выравнивание гомографии по ПОЛНОМУ двойному ЗЧ-кольцу (§3.2): и
+/// внешнее, и (инвертированное) внутреннее кольцо, все четыре стороны —
+/// 2·4·GRID известных клеток ±1. Координатный спуск по четырём углам (по 2-D
+/// каждый) максимизирует нормированную корреляцию СЫРЫХ (не бинаризованных)
+/// центровых отсчётов с ±1-эталоном. Линейная корреляция мягко деградирует под
+/// блюром (центр клетки дольше края держит знак), поэтому даёт субклеточную
+/// точность там, где пер-сторонний 1-D лаг смещается под сглаживанием.
+/// Возвращает уточнённые углы [tl, tr, br, bl].
+fn refine_ring(
+    luma: &[f32],
+    w: usize,
+    h: usize,
+    corners: &[(f64, f64); 4],
+    best_r: usize,
+) -> [(f64, f64); 4] {
+    // Канонические координаты отсчётов кольца + эталон ±1 (от гомографии не
+    // зависят — считаем один раз). Внутреннее кольцо = инверсия внешнего, так
+    // что эталон почти знако-симметричен (точное Σt=0 нарушают лишь угловые
+    // пропуски внутреннего кольца — поэтому score считает честный Пирсон).
+    // Отсчёты берём НЕ только по центру клетки, а тремя точками вдоль стороны
+    // (−0.35, 0, +0.35 клетки): центр устойчив по знаку, а при-краевые точки
+    // лежат на скате размытого перехода и делают корреляцию ЧУВСТВИТЕЛЬНОЙ к
+    // субклеточному сдвигу (иначе центровая корреляция сатурируется у 1.0 под
+    // блюром и не может вести спуск). t — знак клетки n для всех трёх точек.
+    const TANG: [f64; 3] = [-0.35, 0.0, 0.35];
+    let mut pts: Vec<(f64, f64, f64)> = Vec::with_capacity(2 * 4 * GRID * TANG.len());
+    for side in 0..4 {
+        let ri = (side + 4 - best_r) % 4;
+        let root = ZC_ROOTS[ri];
+        for n in 0..GRID {
+            let t = if zc_binary(root, n) { 1.0 } else { -1.0 };
+            for &off in &TANG {
+                // внешнее кольцо: полная сторона (углы принадлежат стороне по
+                // приоритету §3.2, корень стороны верен во всех позициях).
+                let (ou, ov) = ring_point(side, 0.0, n as f64 + off);
+                pts.push((ou, ov, t));
+                // внутреннее кольцо: инверсия примыкающей внешней клетки, но
+                // КРОМЕ угловых n=0/GRID-1 — там глубина 1 уходит на внешнее
+                // кольцо СОСЕДНЕЙ стороны (иной корень), эталон был бы неверен.
+                if n > 0 && n < GRID - 1 {
+                    let (iu, iv) = ring_point(side, 1.0, n as f64 + off);
+                    pts.push((iu, iv, -t));
+                }
+            }
+        }
+    }
+
+    // Нормированная корреляция Пирсона кольца при углах `c` (общий вид: эталон
+    // почти нулевого среднего, но угловые пропуски делают Σt≠0 — считаем честно).
+    let score = |c: &[(f64, f64); 4]| -> f64 {
+        let hom = match build_h(c) {
+            Some(x) => x,
+            None => return f64::MIN,
+        };
+        let n = pts.len() as f64;
+        let mut sa = 0.0; // Σs
+        let mut sb = 0.0; // Σt
+        let mut saa = 0.0; // Σs²
+        let mut sbb = 0.0; // Σt²
+        let mut sab = 0.0; // Σs·t
+        for &(u, v, t) in &pts {
+            let (x, y) = apply_h(&hom, u, v);
+            let s = sample_luma(luma, w, h, x, y);
+            sa += s;
+            sb += t;
+            saa += s * s;
+            sbb += t * t;
+            sab += s * t;
+        }
+        let nvar_a = saa - sa * sa / n; // N·Var[s]
+        let nvar_b = sbb - sb * sb / n; // N·Var[t]
+        if nvar_a < 1e-12 || nvar_b < 1e-12 {
+            return f64::MIN; // константная выборка — корреляция не определена.
+        }
+        (sab - sa * sb / n) / (nvar_a.sqrt() * nvar_b.sqrt())
+    };
+
+    let mut c = *corners;
+    let mut best = score(&c);
+    if best < -1.5 {
+        return c; // вырожденная стартовая геометрия — не трогаем.
+    }
+    // масштаб клетки в px из средней длины стороны (шаг спуска задан в клетках).
+    let cell_px = (norm(sub(c[1], c[0]))
+        + norm(sub(c[2], c[1]))
+        + norm(sub(c[3], c[2]))
+        + norm(sub(c[0], c[3])))
+        / (4.0 * G);
+    // Порог принятия шага: корреляция кольца флуктуирует под сенсорным шумом;
+    // движение принимаем только при улучшении СВЕРХ этого пола, иначе на
+    // чистом-но-шумном кадре (без блюра) спуск гонялся бы за шумом и смещал
+    // углы. Под блюром выигрыш субклеточного выравнивания на порядок больше
+    // порога (корреляция при-краевых точек растёт с ~0.97 до ~0.99), поэтому
+    // порог не мешает сходимости. Значение приколочено развёртками (см. отчёт).
+    const ACCEPT_MARGIN: f64 = 5e-4;
+    // паттерн-поиск с уменьшающимся шагом: 0.25 → 0.1 → 0.05 клетки, до 3 свипов.
+    for &step_cells in &[0.25f64, 0.1, 0.05] {
+        let step = step_cells * cell_px;
+        for _ in 0..3 {
+            let mut improved = false;
+            for k in 0..4 {
+                for axis in 0..2 {
+                    for &dir in &[1.0f64, -1.0] {
+                        let mut trial = c;
+                        if axis == 0 {
+                            trial[k].0 += dir * step;
+                        } else {
+                            trial[k].1 += dir * step;
+                        }
+                        let s = score(&trial);
+                        if s > best + ACCEPT_MARGIN {
+                            best = s;
+                            c = trial;
+                            improved = true;
+                        }
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
+    c
+}
+
+// ---------------------------------------------------------------------------
 // Гомография и геометрия
 // ---------------------------------------------------------------------------
 
@@ -559,6 +715,12 @@ mod tests {
         }
         fn unit(&mut self) -> f64 {
             (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Стандартный нормальный отсчёт (Box–Muller), для сенсорного шума.
+        fn gaussian(&mut self) -> f64 {
+            let u1 = self.unit().max(1e-12);
+            let u2 = self.unit();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * core::f64::consts::PI * u2).cos()
         }
     }
 
@@ -1013,5 +1175,207 @@ mod tests {
             eprintln!("[g] shift ({du},{dv}) recovered err = {err:.4} cells");
             assert!(err < 0.15, "сдвиг ({du},{dv}) восстановлен с ошибкой {err:.4} клетки");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // (h) рабочая точка симулятора под блюром: detected-demod vs genie-demod
+    // -----------------------------------------------------------------------
+
+    /// Гауссово ядро (нормированное, радиус ceil(3σ)) — как в тракте sim.
+    fn gauss_kernel(sigma: f64) -> Vec<f64> {
+        if sigma <= 0.0 {
+            return vec![1.0];
+        }
+        let r = (3.0 * sigma).ceil() as usize;
+        let mut k = Vec::with_capacity(2 * r + 1);
+        let mut sum = 0.0;
+        for i in 0..=(2 * r) {
+            let x = i as f64 - r as f64;
+            let wv = (-(x * x) / (2.0 * sigma * sigma)).exp();
+            k.push(wv);
+            sum += wv;
+        }
+        for wv in &mut k {
+            *wv /= sum;
+        }
+        k
+    }
+
+    /// Сепарабельный гауссов блюр линейного RGB, clamp-to-edge (как в sim).
+    fn blur_linear(buf: &[[f32; 3]], w: usize, h: usize, sigma: f64) -> Vec<[f32; 3]> {
+        if sigma <= 0.0 {
+            return buf.to_vec();
+        }
+        let k = gauss_kernel(sigma);
+        let r = (k.len() / 2) as isize;
+        let clamp = |i: isize, n: usize| i.clamp(0, n as isize - 1) as usize;
+        let mut tmp = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f64; 3];
+                for (ki, &wv) in k.iter().enumerate() {
+                    let sx = clamp(x as isize + ki as isize - r, w);
+                    let p = buf[y * w + sx];
+                    for c in 0..3 {
+                        acc[c] += wv * p[c] as f64;
+                    }
+                }
+                tmp[y * w + x] = [acc[0] as f32, acc[1] as f32, acc[2] as f32];
+            }
+        }
+        let mut out = vec![[0.0f32; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f64; 3];
+                for (ki, &wv) in k.iter().enumerate() {
+                    let sy = clamp(y as isize + ki as isize - r, h);
+                    let p = tmp[sy * w + x];
+                    for c in 0..3 {
+                        acc[c] += wv * p[c] as f64;
+                    }
+                }
+                out[y * w + x] = [acc[0] as f32, acc[1] as f32, acc[2] as f32];
+            }
+        }
+        out
+    }
+
+    /// Билинейная выборка линейного RGB (центры пикселей i+0.5), зажим к краю.
+    fn bilin_lin(buf: &[[f32; 3]], w: usize, h: usize, x: f64, y: f64) -> [f32; 3] {
+        let fx = (x - 0.5).clamp(0.0, (w - 1) as f64);
+        let fy = (y - 0.5).clamp(0.0, (h - 1) as f64);
+        let x0 = fx.floor() as usize;
+        let y0 = fy.floor() as usize;
+        let x1 = (x0 + 1).min(w - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let tx = fx - x0 as f64;
+        let ty = fy - y0 as f64;
+        let mut out = [0.0f32; 3];
+        for c in 0..3 {
+            let a = buf[y0 * w + x0][c] as f64;
+            let b = buf[y0 * w + x1][c] as f64;
+            let cc = buf[y1 * w + x0][c] as f64;
+            let d = buf[y1 * w + x1][c] as f64;
+            let top = a + (b - a) * tx;
+            let bot = cc + (d - cc) * tx;
+            out[c] = (top + (bot - top) * ty) as f32;
+        }
+        out
+    }
+
+    /// Строит снимок камеры по рабочей точке sim: §7.4-профиль (cell 16) ->
+    /// display-linear (гамма на канал) -> downscale ×0.5 (→ px/cell 8) ->
+    /// гауссов блюр σ (px камеры) -> аддитивный сенсорный шум -> clamp[0,1].
+    /// Возвращает (линейный RGB-снимок, w, h). Прямая (genie) геометрия проста:
+    /// display-координата (u,v) -> (u/2, v/2) снимка.
+    fn build_camera(
+        p: &CalibProfile,
+        cells: &[u8],
+        sigma_blur: f64,
+        noise: f64,
+        seed: u64,
+    ) -> (Vec<[f32; 3]>, usize, usize) {
+        let frame = render_symbol(p, cells);
+        let sz = frame.size_px;
+        let g = gammas(&p);
+        // display в линейном свете (как emit_linear в sim).
+        let disp: Vec<[f32; 3]> = frame
+            .rgb
+            .iter()
+            .map(|d| {
+                [
+                    (d[0] as f64 / 255.0).powf(g[0]) as f32,
+                    (d[1] as f64 / 255.0).powf(g[1]) as f32,
+                    (d[2] as f64 / 255.0).powf(g[2]) as f32,
+                ]
+            })
+            .collect();
+        // downscale ×0.5: центр камерного пикселя (i+0.5) ← display 2·(i+0.5).
+        let w2 = sz / 2;
+        let h2 = sz / 2;
+        let mut cam = vec![[0.0f32; 3]; w2 * h2];
+        for j in 0..h2 {
+            for i in 0..w2 {
+                cam[j * w2 + i] =
+                    bilin_lin(&disp, sz, sz, 2.0 * (i as f64 + 0.5), 2.0 * (j as f64 + 0.5));
+            }
+        }
+        cam = blur_linear(&cam, w2, h2, sigma_blur);
+        let mut rng = XorShift64(seed);
+        for px in &mut cam {
+            for c in 0..3 {
+                let v = px[c] as f64 + rng.gaussian() * noise;
+                px[c] = v.clamp(0.0, 1.0) as f32;
+            }
+        }
+        (cam, w2, h2)
+    }
+
+    /// Средние (genie SER, detected SER) по нескольким сидам на заданной σ блюра.
+    fn blur_point_sers(sigma: f64, seeds: &[u64]) -> (f64, f64) {
+        let p = prof(3, ChromaMode::Chroma2, 16, 1); // §7.4-подобный, cell 16
+        let noise = 2.0 / 255.0; // сенсорный шум ≈ σ=2 градации серого
+        let mut g_acc = 0.0;
+        let mut d_acc = 0.0;
+        for (si, &seed) in seeds.iter().enumerate() {
+            let cells = rand_cells(&p, 0xB1_0000 ^ seed ^ (si as u64));
+            let (cam, w, h) = build_camera(&p, &cells, sigma, noise, seed);
+            let sample = |x: f64, y: f64| bilin_lin(&cam, w, h, x, y);
+
+            // genie: точная геометрия тракта (display -> снимок ×0.5).
+            let genie_map = |u: f64, v: f64| (u * 0.5, v * 0.5);
+            let genie = symbol::demod_symbol(&p, &genie_map, &sample);
+            g_acc += ser(&genie, &cells);
+
+            // detected: детекция ЗЧ-рамки по G-плоскости снимка + frame_map.
+            let g_plane: Vec<f32> = cam.iter().map(|px| px[1]).collect();
+            let d = detect_symbol(w, h, &g_plane).expect("детекция под блюром");
+            assert_eq!(d.rotation_quadrants, 0);
+            let map = frame_map(&p, &d);
+            let det = symbol::demod_symbol(&p, &map, &sample);
+            d_acc += ser(&det, &cells);
+        }
+        let n = seeds.len() as f64;
+        (g_acc / n, d_acc / n)
+    }
+
+    /// Рабочая точка sim σ=1: детектированная геометрия не должна отставать от
+    /// genie больше чем в 1.5× по SER (раньше — ~4× из-за краевого биения
+    /// пер-сторонних 1-D лагов под сглаживанием).
+    #[test]
+    fn blur_operating_point_sigma1() {
+        let seeds = [0x1111_2222u64, 0x3333_4444, 0x5555_6666, 0x7777_8888, 0x9999_AAAA];
+        let (genie, detected) = blur_point_sers(1.0, &seeds);
+        eprintln!(
+            "[h] σ=1  genie SER = {:.4}%  detected SER = {:.4}%  ratio = {:.2}×",
+            genie * 100.0,
+            detected * 100.0,
+            detected / genie.max(1e-9)
+        );
+        // ПРИКОЛОЧЕНО измерением (см. отчёт): без тонкого выравнивания было ~2.7×
+        // (краевое биение пер-сторонних 1-D лагов под блюром), с ним ≈ 1.1×.
+        // Порог 1.4× — цель ≤1.5× с запасом; регресс выравнивания сразу его
+        // превысит. σ=1 — самая жёсткая точка (при σ=2 payload и так деградирует).
+        assert!(
+            detected <= 1.4 * genie,
+            "detected SER {:.4}% > 1.4× genie {:.4}% (отношение {:.2}×)",
+            detected * 100.0,
+            genie * 100.0,
+            detected / genie.max(1e-9)
+        );
+    }
+
+    /// σ=2: та же рабочая точка при более сильном блюре — только репорт, без
+    /// жёсткого порога (не должно регрессировать против текущего).
+    #[test]
+    fn blur_operating_point_sigma2() {
+        let seeds = [0x1111_2222u64, 0x3333_4444, 0x5555_6666, 0x7777_8888, 0x9999_AAAA];
+        let (genie, detected) = blur_point_sers(2.0, &seeds);
+        eprintln!(
+            "[h] σ=2  genie SER = {:.4}%  detected SER = {:.4}%  ratio = {:.2}×",
+            genie * 100.0,
+            detected * 100.0,
+            detected / genie.max(1e-9)
+        );
     }
 }

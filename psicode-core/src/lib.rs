@@ -31,8 +31,11 @@ extern crate std;
 pub mod base32;
 pub mod bits;
 #[cfg(feature = "std")]
+pub mod calibrate;
+#[cfg(feature = "std")]
 pub mod detect;
 pub mod gf32;
+pub mod l3;
 pub mod profile;
 pub mod rs;
 #[cfg(feature = "std")]
