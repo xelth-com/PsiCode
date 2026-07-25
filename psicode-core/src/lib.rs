@@ -34,6 +34,7 @@ pub mod bits;
 pub mod calibrate;
 #[cfg(feature = "std")]
 pub mod detect;
+pub mod fountain;
 pub mod gf32;
 pub mod l3;
 pub mod profile;

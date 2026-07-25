@@ -37,6 +37,34 @@ The payload region (or designated blocks of it) carries a superposition of
 Mode B parameters move into SPEC (→ DRAFT → STABLE) only after live
 measurements of coefficient SNR vs. blur σ on real display/camera pairs.
 
+**Sim freeze-gate data (v0, 2026-07-25, `psicode-sim modeb`):** 64×64 block,
+w=8, telemetry-truth channel of the §7.4 profile, genie geometry.
+
+* Discrete-basis orthonormality: max Gram off-diagonal **6.9e-5** — the
+  64-px/w=8 grid samples the mode set essentially perfectly.
+* Coefficient **attenuation is monotonic in m+n at every σ ≥ 1** (the §2
+  claim holds); at σ=8 orders 0→4 attenuate to 0.638/0.469/0.366/0.258/0.219.
+  Probe (2,0)/(0,2) isotropy under isotropic blur: 0.5 % at σ=2 — nil.
+  Nuance: full-loading coefficient **SNR** is only broadly (not strictly)
+  monotonic — gamma nonlinearity penalizes the DC-heavy ψ00; the clean
+  monotonic quantity is attenuation.
+* **Graceful shedding schedule:** QPSK BER = 0 for orders 0–3 through σ=8;
+  order 4 is first to cross 10 % (at σ=8). Everything survives σ ≤ 6.
+* **Mode A head-to-head** (same 64×64 area, same channel; Mode A = 64 cells
+  8 px × 3 bit Mono = 192 bit raw vs Mode B 24 bit raw): Mode A cliffs
+  (153→3→0 reliable bits over σ 1→2), Mode B holds 24 bit through σ=6.
+  Crossover ≈ σ 1 for this config (config-dependent; the robust result is
+  cliff-vs-graceful). Mode A's raw floor ≈ 24 bit is pure chance level —
+  reliability-thresholded comparison is the honest one.
+* **Pilot/probe equalization works**: ρ = ‖a20,02‖/‖a00‖ → calibration curve
+  → σ_est (σ4→3.87, σ8→8.00), then w′ = √(w² + σ²); re-decoding with w′
+  recovers **+1.8 dB (σ2) … +14.8 dB (σ8)** coefficient SNR and halves BER
+  at σ=8. The graceful-degradation mechanism is real in v0 already.
+* Caveats: blur applied in linear light while §5.1 is a drive-domain map ⇒
+  mild γ cross-mode coupling on top of pure eigenmode attenuation;
+  w′ = √(w²+σ²) is heuristic (empirically excellent). Live display/camera
+  measurement still required before §5.3 freezes.
+
 ## 2. Mode order as physical priority for fountain symbols — primary line
 
 The most promising composition of the two graceful mechanisms: map RaptorQ
@@ -48,6 +76,12 @@ degradation × fountain graceful reconstruction. Open questions: symbol-to-
 mode scheduling across blocks, how the receiver's per-block w′ estimate
 should gate which coefficients are handed to transport, and whether repair
 symbols belong in low or high modes.
+
+Sim input (2026-07-25, see §1): the shedding order is measured — orders 0–3
+survive through σ=6, order 4 drops first — and the w′ probe estimate tracks
+true σ within ~5 %, so per-block gating has a reliable signal to work with.
+An XOR-fountain interim transport already runs end-to-end in the sim
+(`psicode-sim transfer`, ε ≈ 1 %), giving this line a working harness.
 
 ## 3. QR code as optional return channel for calibration
 

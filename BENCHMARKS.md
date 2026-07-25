@@ -220,3 +220,24 @@ Decoder uses deliberately wrong profile values; channel stays at truth.
 > Asymmetric γ penalty: underestimating gamma is ~4.6× worse than
 > overestimating — prescriptions can safely guard-band γ upward.
 > white_level is the highest-leverage single field measured so far.
+
+## 8. End-to-end file transfer (sim)
+
+`psicode-sim transfer`: 20 KB deterministic payload → XOR fountain
+(EXPERIMENTAL §9.2, ε_pinned ≈ 1 %) → L3 frames (§6.2, symbol 140 B ×
+8/frame, TransferInfo every 8th) → render with frame counter → channel →
+**real ZC detection** → demod → stripe salvage (§6.3 on torn captures) →
+fountain decode → CRC-32C verify. Config = σ=1 optimum of §6 (luma 2 +
+Chroma1, 3 bit/cell), px/cell 8, telemetry-truth channel.
+
+| σ | p_torn | K | frames | recv/lost | overhead ε | goodput | CRC-32C |
+|---|---|---|---|---|---|---|---|
+| 0.5 | 0 % | 143 | 22 | 176/0 | +0.007 | 72.7 kbit/s | OK |
+| 1.0 | 0 % | 143 | 22 | 165/11 | +0.000 | 72.7 kbit/s | OK |
+| 0.5 | 20 % | 143 | 33 | 254/10 | +0.014 | 48.5 kbit/s | OK |
+| 1.0 | 20 % | 143 | 31 | 225/23 | +0.007 | 51.6 kbit/s | OK |
+
+> First full-stack run (2026-07-25). Measured 72.7 kbit/s at σ=1 matches the
+> §6 stripe-survival model's 74.1 kbit/s prediction. At σ=1 the interleaved
+> repair symbols absorbed 11 stripe-death losses at zero net overhead
+> (decode completed at exactly K useful symbols).

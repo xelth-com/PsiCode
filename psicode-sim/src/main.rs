@@ -15,9 +15,11 @@
 mod channel;
 mod framed;
 mod image;
+mod modeb;
 mod pipeline;
 mod report;
 mod rng;
+mod transfer;
 
 use channel::{ChannelParams, Geometry, IDENTITY};
 use pipeline::{
@@ -721,6 +723,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("sweep") => cmd_sweep(),
         Some("framed") => cmd_framed(),
+        Some("modeb") => modeb::cmd_modeb(),
+        Some("transfer") => transfer::cmd_transfer(),
         Some("dump") => {
             let dir = args.get(2).map(String::as_str).unwrap_or(DUMP_DIR_DEFAULT);
             cmd_dump(Path::new(dir));
@@ -731,7 +735,9 @@ fn main() {
         }
         Some("goodput") => cmd_goodput(),
         _ => {
-            eprintln!("usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed>");
+            eprintln!(
+                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | modeb | transfer>"
+            );
             std::process::exit(2);
         }
     }
