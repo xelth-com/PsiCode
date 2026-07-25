@@ -33,5 +33,7 @@ pub mod bits;
 pub mod gf32;
 pub mod profile;
 pub mod rs;
+#[cfg(feature = "std")]
+pub mod symbol;
 
 pub use profile::{CalibProfile, ChromaMode, ProfileError};

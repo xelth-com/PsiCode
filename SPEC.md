@@ -448,8 +448,9 @@ code, including two adjacent fully garbled 4-symbol groups.
 | crate | contents | status |
 |---|---|---|
 | `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile`; no_std + alloc, fuzz-tested no-panic decode | done, 24 tests |
-| `psicode-core` (next) | §3 ZC frame gen/detect, §5.1 color map, §5.2 Mode A | — |
-| `psicode-sim` | channel simulator: blur, noise, gamma, crosstalk, tearing, homography distortion; Monte Carlo SER/FER sweeps → BENCHMARKS.md | — |
+| `psicode-core` `symbol` | §3 render (ZC gen, ref strip), §5.1 color map, §5.2 Mode A mod/demod | done (30 tests total) |
+| `psicode-core` (next) | §3 ZC *detection*: coarse quad, per-side correlation, homography estimation | — |
+| `psicode-sim` | channel simulator: gamma, homography, blur, crosstalk, gain/offset, noise; Monte Carlo SER sweeps → BENCHMARKS.md | v0 done, 21 tests (genie geometry; tearing & FER pending) |
 | `psicode-tx` | Windows 11 transmitter: minifb → winit/softbuffer, calibrate & stream modes | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |

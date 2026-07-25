@@ -1,0 +1,11 @@
+[package]
+name = "psicode-sim"
+version = "0.1.0"
+edition = "2021"
+description = "PsiCode channel simulator: gamma, blur, crosstalk, noise, homography; Monte Carlo SER/FER sweeps."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xelth-com/PsiCode"
+
+[dependencies]
+# намеренно только psicode-core: симулятор тоже без внешних зависимостей
+psicode-core = { path = "../psicode-core" }
