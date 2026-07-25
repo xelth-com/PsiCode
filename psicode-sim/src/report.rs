@@ -16,6 +16,77 @@ pub fn write_ppm(path: &Path, w: usize, h: usize, pixels: &[[u8; 3]]) -> io::Res
     std::fs::write(path, &buf)
 }
 
+/// Пропустить пробелы и комментарии `# ... \n` начиная с позиции `i`.
+fn skip_ws_comments(data: &[u8], i: &mut usize) {
+    loop {
+        while *i < data.len() && data[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        if *i < data.len() && data[*i] == b'#' {
+            while *i < data.len() && data[*i] != b'\n' {
+                *i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// Прочитать целое (с ведущими пробелами/комментариями). Курсор — за последней
+/// цифрой. `None`, если цифр нет.
+fn read_uint(data: &[u8], i: &mut usize) -> Option<usize> {
+    skip_ws_comments(data, i);
+    let start = *i;
+    while *i < data.len() && data[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i == start {
+        return None;
+    }
+    let mut v = 0usize;
+    for &b in &data[start..*i] {
+        v = v * 10 + (b - b'0') as usize;
+    }
+    Some(v)
+}
+
+/// Прочитать бинарный P6 PPM с диска: `P6`, w, h, 255, затем сырые RGB-триплеты.
+/// Терпит пробелы и комментарии `#` в заголовке. Возвращает (w, h, пиксели).
+pub fn read_ppm(path: &Path) -> io::Result<(usize, usize, Vec<[u8; 3]>)> {
+    let data = std::fs::read(path)?;
+    let err = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+
+    let mut i = 0usize;
+    skip_ws_comments(&data, &mut i);
+    if data.get(i) != Some(&b'P') || data.get(i + 1) != Some(&b'6') {
+        return Err(err("ppm: не P6"));
+    }
+    i += 2;
+
+    let w = read_uint(&data, &mut i).ok_or_else(|| err("ppm: нет ширины"))?;
+    let h = read_uint(&data, &mut i).ok_or_else(|| err("ppm: нет высоты"))?;
+    let maxval = read_uint(&data, &mut i).ok_or_else(|| err("ppm: нет maxval"))?;
+    if maxval != 255 {
+        return Err(err("ppm: maxval != 255"));
+    }
+    // ровно один пробельный байт-разделитель перед бинарными данными
+    if i >= data.len() || !data[i].is_ascii_whitespace() {
+        return Err(err("ppm: нет разделителя перед данными"));
+    }
+    i += 1;
+
+    let need = w * h * 3;
+    if data.len() - i < need {
+        return Err(err("ppm: данные обрезаны"));
+    }
+    let body = &data[i..i + need];
+    let mut px = Vec::with_capacity(w * h);
+    for chunk in body.chunks_exact(3) {
+        px.push([chunk[0], chunk[1], chunk[2]]);
+    }
+    Ok((w, h, px))
+}
+
 /// Линейное изображение [0,1] -> drive-байты через ОБРАТНУЮ гамму канала
 /// (для человеческого глаза: чистый канал так восстанавливает исходный кадр).
 pub fn image_to_drive(img: &Image, gammas: [f64; 3]) -> Vec<[u8; 3]> {
@@ -74,6 +145,41 @@ mod tests {
         assert_eq!(bytes.len(), header.len() + w * h * 3);
         // первый пиксель данных
         assert_eq!(&bytes[header.len()..header.len() + 3], &[1, 2, 3]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ppm_write_then_read_roundtrips() {
+        let w = 5;
+        let h = 3;
+        let mut pixels = Vec::with_capacity(w * h);
+        for i in 0..(w * h) {
+            pixels.push([(i * 3) as u8, (i * 3 + 1) as u8, (i * 3 + 2) as u8]);
+        }
+        let path = std::env::temp_dir().join("psicode_sim_ppm_roundtrip.ppm");
+        write_ppm(&path, w, h, &pixels).unwrap();
+
+        let (rw, rh, rpix) = read_ppm(&path).unwrap();
+        assert_eq!(rw, w);
+        assert_eq!(rh, h);
+        assert_eq!(rpix, pixels);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ppm_reader_tolerates_comments() {
+        // заголовок с комментарием и лишними пробелами
+        let path = std::env::temp_dir().join("psicode_sim_ppm_comment.ppm");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"P6\n# psicode-sim comment\n2  1\n255\n");
+        bytes.extend_from_slice(&[10, 20, 30, 40, 50, 60]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (w, h, pix) = read_ppm(&path).unwrap();
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(pix, vec![[10, 20, 30], [40, 50, 60]]);
 
         let _ = std::fs::remove_file(&path);
     }

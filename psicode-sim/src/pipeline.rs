@@ -33,6 +33,23 @@ pub fn emit_linear(frame: &Frame, gammas: [f64; 3]) -> Image {
     img
 }
 
+/// drive-байты с диска -> сенсорно-линейное изображение: linear = (d/255)^γ
+/// поканально (LUT). Обращает запись PPM (`image_to_drive` возводил в 1/γ):
+/// это и есть «идеальный сенсор» для readback уже квантованных файлов.
+pub fn drive_to_linear(drive: &[[u8; 3]], w: usize, h: usize, gammas: [f64; 3]) -> Image {
+    let mut lut = [[0.0f32; 256]; 3];
+    for (c, &g) in gammas.iter().enumerate() {
+        for v in 0..256 {
+            lut[c][v] = (v as f64 / 255.0).powf(g) as f32;
+        }
+    }
+    let mut img = Image::new(w, h);
+    for (dst, d) in img.data.iter_mut().zip(drive.iter()) {
+        *dst = [lut[0][d[0] as usize], lut[1][d[1] as usize], lut[2][d[2] as usize]];
+    }
+    img
+}
+
 /// Warp дисплейного изображения в сетку камеры обратным отображением: для
 /// каждого выходного пикселя берём координату символа через [`Geometry::inverse`]
 /// и билинейно сэмплируем источник.

@@ -14,9 +14,9 @@ mod pipeline;
 mod report;
 mod rng;
 
-use channel::ChannelParams;
-use pipeline::{apply_channel, run_trial};
-use psicode_core::{CalibProfile, ChromaMode};
+use channel::{ChannelParams, Geometry, IDENTITY};
+use pipeline::{apply_channel, drive_to_linear, run_trial};
+use psicode_core::{symbol, CalibProfile, ChromaMode};
 use rng::{seed_for, Rng};
 use std::path::Path;
 use std::time::Instant;
@@ -125,51 +125,180 @@ fn cmd_sweep() {
     println!("\nвсего {:.2} c", t0.elapsed().as_secs_f64());
 }
 
-fn cmd_dump(dir: &str) {
+const DUMP_DIR_DEFAULT: &str = "psicode-sim-dump";
+
+/// Что за файл дампа: `clean.ppm` (сырые drive-байты, геометрия 1:1) либо
+/// выход канала `channel_*.ppm` (после `image_to_drive`, геометрия из `ch`).
+enum DumpKind {
+    Clean,
+    Channel(ChannelParams),
+}
+
+struct DumpSpec {
+    name: String,
+    kind: DumpKind,
+}
+
+/// Розыгрыш клеток дампа: тот же порядок вызовов ГПСЧ, что в тракте попытки,
+/// поэтому при одинаковом сиде клетки совпадают. Общий для dump и readback.
+fn draw_cells(p: &CalibProfile, rng: &mut Rng) -> Vec<u8> {
+    let bpc = symbol::bits_per_cell(p);
+    let n_levels = 1u32 << bpc;
+    let n_cells = symbol::PAYLOAD_COLS * symbol::PAYLOAD_ROWS;
+    (0..n_cells)
+        .map(|_| rng.next_u32_below(n_levels) as u8)
+        .collect()
+}
+
+/// Детерминированный список файлов дампа (порядок фиксирует и последовательность
+/// расхода ГПСЧ на шум: clean без шума, затем s1, s4, перспектива). ГПСЧ не
+/// трогает — параметры канала выводятся только из профиля.
+fn dump_specs(p: &CalibProfile) -> Vec<DumpSpec> {
+    let mut v = Vec::new();
+    v.push(DumpSpec { name: "clean.ppm".into(), kind: DumpKind::Clean });
+    for &s in &[1.0f64, 4.0] {
+        let mut ch = ChannelParams::from_profile(p);
+        ch.px_per_cell = 8.0;
+        ch.blur_sigma_px = s;
+        v.push(DumpSpec {
+            name: format!("channel_s{}.ppm", s as u32),
+            kind: DumpKind::Channel(ch),
+        });
+    }
+    let mut ch = ChannelParams::from_profile(p);
+    ch.px_per_cell = 8.0;
+    ch.blur_sigma_px = 1.0;
+    ch.homography = channel::mild_perspective(channel::symbol_size_px(p));
+    v.push(DumpSpec {
+        name: "channel_perspective.ppm".into(),
+        kind: DumpKind::Channel(ch),
+    });
+    v
+}
+
+fn cmd_dump(dir: &Path) {
     let p = reference_profile();
-    let dir = Path::new(dir);
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("не создать {}: {e}", dir.display());
         std::process::exit(1);
     }
 
-    // фиксированный сид для воспроизводимого кадра
+    // фиксированный сид -> воспроизводимый кадр и шум
     let mut rng = Rng::new(seed_for(0, 0));
-    let bpc = psicode_core::symbol::bits_per_cell(&p);
-    let n_levels = 1u32 << bpc;
-    let n_cells = psicode_core::symbol::PAYLOAD_COLS * psicode_core::symbol::PAYLOAD_ROWS;
-    let cells: Vec<u8> = (0..n_cells)
-        .map(|_| rng.next_u32_below(n_levels) as u8)
-        .collect();
-    let frame = psicode_core::symbol::render_symbol(&p, &cells);
+    let cells = draw_cells(&p, &mut rng);
+    let frame = symbol::render_symbol(&p, &cells);
 
-    // 1. чистый отрендеренный кадр (drive-байты как есть)
-    let clean_path = dir.join("clean.ppm");
-    report::write_ppm(&clean_path, frame.size_px, frame.size_px, &frame.rgb).unwrap();
-    println!("записан {}", clean_path.display());
-
-    // 2–3. после канала при σ = 1 и σ = 4 (px/cell = 8), обратная гамма для глаза
-    for &s in &[1.0f64, 4.0] {
-        let mut ch = ChannelParams::from_profile(&p);
-        ch.px_per_cell = 8.0;
-        ch.blur_sigma_px = s;
-        let (img, _geom) = apply_channel(&frame, &ch, &mut rng);
-        let drive = report::image_to_drive(&img, ch.gammas);
-        let path = dir.join(format!("channel_s{}.ppm", s as u32));
-        report::write_ppm(&path, img.w, img.h, &drive).unwrap();
+    for spec in dump_specs(&p) {
+        let path = dir.join(&spec.name);
+        match spec.kind {
+            // чистый кадр: drive-байты как есть (шум не расходуется)
+            DumpKind::Clean => {
+                report::write_ppm(&path, frame.size_px, frame.size_px, &frame.rgb).unwrap();
+            }
+            // выход канала: шум берётся из общего ГПСЧ, drive для человеческого глаза
+            DumpKind::Channel(ch) => {
+                let (img, _geom) = apply_channel(&frame, &ch, &mut rng);
+                let drive = report::image_to_drive(&img, ch.gammas);
+                report::write_ppm(&path, img.w, img.h, &drive).unwrap();
+            }
+        }
         println!("записан {}", path.display());
     }
+}
 
-    // 4. пресет мягкой перспективы (σ = 1) — увидеть геометрическое искажение
-    let mut ch = ChannelParams::from_profile(&p);
-    ch.px_per_cell = 8.0;
-    ch.blur_sigma_px = 1.0;
-    ch.homography = channel::mild_perspective(channel::symbol_size_px(&p));
-    let (img, _geom) = apply_channel(&frame, &ch, &mut rng);
-    let drive = report::image_to_drive(&img, ch.gammas);
-    let path = dir.join("channel_perspective.ppm");
-    report::write_ppm(&path, img.w, img.h, &drive).unwrap();
-    println!("записан {}", path.display());
+/// Сравнение демодулированных клеток с эталоном: (неверных клеток, ошибочных
+/// бит, всего бит). Биты — младшие bits_per_cell (Грей-код), как в run_trial.
+fn compare_cells(sent: &[u8], got: &[u8], bpc: u32) -> (usize, u32, u32) {
+    let mask = (1u32 << bpc) - 1;
+    let mut wrong_cells = 0;
+    let mut wrong_bits = 0;
+    let mut total_bits = 0;
+    for (&a, &b) in sent.iter().zip(got.iter()) {
+        if a != b {
+            wrong_cells += 1;
+        }
+        wrong_bits += ((a ^ b) as u32 & mask).count_ones();
+        total_bits += bpc;
+    }
+    (wrong_cells, wrong_bits, total_bits)
+}
+
+/// Декодирование ИЗ ФАЙЛОВ на диске: сквозь 8-битное квантование и обратную
+/// гамму, которой писался PPM. Если файлов нет — сначала пишет дамп.
+fn cmd_readback(dir: &Path) {
+    let p = reference_profile();
+    let specs = dump_specs(&p);
+
+    // нет хотя бы одного файла -> сгенерировать дамп (байт-в-байт тот же)
+    let missing = specs.iter().any(|s| !dir.join(&s.name).exists());
+    if missing {
+        println!("(файлы отсутствуют — генерирую дамп в {})", dir.display());
+        cmd_dump(dir);
+        println!();
+    }
+
+    // эталонные клетки: тот же сид и тот же розыгрыш, что в дампе
+    let mut rng = Rng::new(seed_for(0, 0));
+    let cells = draw_cells(&p, &mut rng);
+    let size_px = channel::symbol_size_px(&p);
+    let bpc = symbol::bits_per_cell(&p);
+    let total = cells.len();
+
+    println!("# readback ({total} клеток payload)");
+    println!("| file | correct/total | SER | BER |");
+    println!("|---|---|---|---|");
+
+    for spec in &specs {
+        let path = dir.join(&spec.name);
+        let (w, h, drive) = match report::read_ppm(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{}: ошибка чтения: {e}", spec.name);
+                continue;
+            }
+        };
+
+        // реконструкция сенсорно-линейного и геометрии ровно как при записи
+        let (img, geom) = match &spec.kind {
+            // clean: идеальный сенсор из drive-байт, символ-плоскость 1:1
+            DumpKind::Clean => {
+                let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+                let img = drive_to_linear(&drive, w, h, gammas);
+                let geom = Geometry::new(1.0, IDENTITY, size_px);
+                (img, geom)
+            }
+            // channel: обращаем ту же гамму и повторяем ту же Geometry, что писала файл
+            DumpKind::Channel(ch) => {
+                let img = drive_to_linear(&drive, w, h, ch.gammas);
+                let scale = ch.px_per_cell / ch.cell_size_px;
+                let geom = Geometry::new(scale, ch.homography, size_px);
+                (img, geom)
+            }
+        };
+
+        // геометрия файла должна совпасть с ожидаемой (иначе рассинхрон записи)
+        if geom.out_w != w || geom.out_h != h {
+            eprintln!(
+                "{}: размер {w}x{h} не совпал с геометрией {}x{}",
+                spec.name, geom.out_w, geom.out_h
+            );
+        }
+
+        let map = |u: f64, v: f64| geom.forward(u, v);
+        let sample = |x: f64, y: f64| img.sample(x, y);
+        let out = symbol::demod_symbol(&p, &map, &sample);
+
+        let (wrong, wrong_bits, total_bits) = compare_cells(&cells, &out, bpc);
+        let correct = total - wrong;
+        let ser = wrong as f64 / total as f64;
+        let ber = wrong_bits as f64 / total_bits as f64;
+        println!(
+            "| {} | {correct}/{total} | {} | {} |",
+            spec.name,
+            report::sig4(ser),
+            report::sig4(ber),
+        );
+    }
 }
 
 fn main() {
@@ -177,11 +306,15 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("sweep") => cmd_sweep(),
         Some("dump") => {
-            let dir = args.get(2).map(String::as_str).unwrap_or("psicode-sim-dump");
-            cmd_dump(dir);
+            let dir = args.get(2).map(String::as_str).unwrap_or(DUMP_DIR_DEFAULT);
+            cmd_dump(Path::new(dir));
+        }
+        Some("readback") => {
+            let dir = args.get(2).map(String::as_str).unwrap_or(DUMP_DIR_DEFAULT);
+            cmd_readback(Path::new(dir));
         }
         _ => {
-            eprintln!("usage: psicode-sim <sweep | dump [dir]>");
+            eprintln!("usage: psicode-sim <sweep | dump [dir] | readback [dir]>");
             std::process::exit(2);
         }
     }
