@@ -34,8 +34,10 @@ pub struct ChannelParams {
     pub cell_size_px: f64,
     /// Гомография 3×3 в display-пиксельных координатах (по умолчанию единичная).
     pub homography: [[f64; 3]; 3],
-    /// Сигма гауссова дефокус-блюра, в пикселях КАМЕРЫ (0 — без блюра).
-    pub blur_sigma_px: f64,
+    /// Сигма гауссова дефокус-блюра ПО КАНАЛАМ [R, G, B], в пикселях КАМЕРЫ
+    /// (0 — без блюра). Изотропный дефокус — три равные σ ([`ChannelParams::set_blur`]);
+    /// продольная хроматическая аберрация — разные σ ([`ChannelParams::set_aberration`]).
+    pub blur_sigma_rgb: [f64; 3],
     /// Доля перекрёстной помехи R<->G (0..1).
     pub crosstalk_rg: f64,
     /// Доля перекрёстной помехи G<->B (0..1).
@@ -62,7 +64,7 @@ impl ChannelParams {
             px_per_cell: 8.0,
             cell_size_px: p.cell_size_px as f64,
             homography: IDENTITY,
-            blur_sigma_px: 0.0,
+            blur_sigma_rgb: [0.0; 3],
             crosstalk_rg: p.crosstalk_rg_pct() as f64 / 100.0,
             crosstalk_gb: p.crosstalk_gb_pct() as f64 / 100.0,
             gain: [1.0; 3],
@@ -82,13 +84,29 @@ impl ChannelParams {
             px_per_cell: 8.0,
             cell_size_px: p.cell_size_px as f64,
             homography: IDENTITY,
-            blur_sigma_px: 0.0,
+            blur_sigma_rgb: [0.0; 3],
             crosstalk_rg: 0.0,
             crosstalk_gb: 0.0,
             gain: [1.0; 3],
             offset: [0.0; 3],
             noise_sigma: 0.0,
         }
+    }
+
+    /// Изотропный дефокус: одинаковая σ на все три канала. Замена прежнему
+    /// скалярному полю `blur_sigma_px` — держит инвариант `blur_sigma_rgb`.
+    pub fn set_blur(&mut self, sigma: f64) {
+        self.blur_sigma_rgb = [sigma; 3];
+    }
+
+    /// Пресет продольной хроматической аберрации (§5.1): σ_R = 1.3·σ, σ_G = σ,
+    /// σ_B = 1.5·σ. Красный и синий фокусируются в разных плоскостях, зелёный
+    /// посередине — типичная картина недорогого объектива. Средняя σ = 1.4·σ_G,
+    /// что и есть ядро R−B-хромы (K_R+K_B)/2 из свойства (b) §5.1.
+    /// (Задействован тестами свойств §5.1; в бинаре развёрток не используется.)
+    #[allow(dead_code)]
+    pub fn set_aberration(&mut self, sigma: f64) {
+        self.blur_sigma_rgb = [1.3 * sigma, sigma, 1.5 * sigma];
     }
 }
 

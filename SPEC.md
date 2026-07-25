@@ -448,9 +448,10 @@ code, including two adjacent fully garbled 4-symbol groups.
 | crate | contents | status |
 |---|---|---|
 | `psicode-core` | §7 complete: GF(32), 2 × RS(16,8) interleaved, Base32, bit packing, `CalibProfile`; no_std + alloc, fuzz-tested no-panic decode | done, 24 tests |
-| `psicode-core` `symbol` | §3 render (ZC gen, ref strip), §5.1 color map, §5.2 Mode A mod/demod | done (30 tests total) |
-| `psicode-core` (next) | §3 ZC *detection*: coarse quad, per-side correlation, homography estimation | — |
-| `psicode-sim` | channel simulator: gamma, homography, blur, crosstalk, gain/offset, noise; Monte Carlo SER sweeps → BENCHMARKS.md | v0 done, 21 tests (genie geometry; tearing & FER pending) |
+| `psicode-core` `symbol` | §3 render (ZC gen, ref strip), §5.1 color map, §5.2 Mode A mod/demod | done |
+| `psicode-core` `detect` | §3.2 ZC detection: quad search, per-side correlation with sub-cell lags, orientation, homography | done (core: 36 tests) |
+| `psicode-sim` | channel simulator: gamma, homography, per-channel blur, crosstalk, gain/offset, noise; SER/goodput/calibration-sensitivity sweeps → BENCHMARKS.md | v0 done, 30 tests (incl. detected-geometry path) |
+| next | detected-geometry refinement (≈4× SER cost vs known geometry at σ=1, see BENCHMARKS §1); L3 framing + tearing model in sim → FER & partial-decode goodput | — |
 | `psicode-tx` | Windows 11 transmitter: minifb → winit/softbuffer, calibrate & stream modes | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |

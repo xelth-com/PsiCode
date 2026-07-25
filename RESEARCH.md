@@ -65,7 +65,30 @@ structure at any distance beyond near-contact, so the win exists only in a
 regime where capacity is already abundant. Revisit only if a contact-range
 use case appears.
 
-## 5. Spatial redundancy / cell replication
+## 5. Chroma error budget: gamma dominates aberration (sim finding, 2026-07-25)
+
+Measured in psicode-sim while validating the §5.1 claims (see BENCHMARKS §7):
+
+* Camera-luma Im-leakage: measured 0.201–0.205 vs the theoretical 0.2·A_C —
+  §5.1 property (a) holds essentially exactly; gamma curvature is negligible
+  at the mid-gray operating point.
+* Im kernel averaging, §5.1 property (b): chroma SER under aberration
+  (σ_R = 1.3, σ_B = 1.5) vs matched common blur σ = 1.4 differs by 1.4 pp —
+  confirmed, residual slightly *favors* aberration.
+* The claim the spec does NOT make: with varying luma, K_R ≠ K_B leaks
+  (K_R−K_B)∗(A_L·Re) into the R−B chroma axis. Measured: +0.28 pp — real but
+  second-order. The dominant chroma-error source at σ = 1 is instead the
+  **per-channel gamma-inversion asymmetry** (γ_R ≠ γ_B in the decoder's
+  gamma removal): ~12 pp chroma SER even with matched blur.
+
+Implication: chroma robustness work should target **gamma estimation
+accuracy** (richer reference-strip anchors, per-channel staircase fitting)
+before any optics compensation. Related: calibration-sensitivity sweeps show
+underestimating γ is ~4.6× worse than overestimating (asymmetric penalty —
+prescriptions could guard-band γ upward), and white_level is high-leverage
+(−6 % error ≈ 4× SER) — see BENCHMARKS §7.
+
+## 6. Spatial redundancy / cell replication
 
 Alternative knob to lowering `luma_bits` on noisy channels: keep bit depth
 but replicate each cell n× (or scale `cell_size_px`), trading capacity for
