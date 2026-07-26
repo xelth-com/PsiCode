@@ -12,6 +12,7 @@ use std::path::Path;
 
 use psicode_core::detect::{detect_symbol, frame_map};
 use psicode_core::symbol::{self, demod_symbol, read_counters};
+use psicode_core::tone;
 use psicode_core::{CalibProfile, ChromaMode};
 
 use crate::report;
@@ -72,141 +73,6 @@ fn apply_h(h: &[[f64; 3]; 3], u: f64, v: f64) -> (f64, f64) {
     )
 }
 
-/// Оценивает пер-канальную гамму линеаризации по референсной строке (§3.4).
-/// На канал подбираем γ так, чтобы (raw/255)^γ была максимально ЛИНЕЙНА
-/// (d/255)^γ_профиля по НЕЙТРАЛЬНЫМ клеткам строки (K, W и 6 серых ступеней) —
-/// т.е. форма кривой совпала с той, что ждёт демодулятор (он затем сам снимет
-/// gain/offset по K/W). Заменяет жёсткую CAMERA_GAMMA самокалибровкой на кадр.
-/// Возвращает [γr, γg, γb]; при нехватке точек — дефолт на все каналы.
-fn estimate_channel_gammas(
-    p: &CalibProfile,
-    w: usize,
-    h: usize,
-    rgb: &[[u8; 3]],
-    map: &dyn Fn(f64, f64) -> (f64, f64),
-) -> [f64; 3] {
-    const REF_PERIOD: usize = 16; // §3.4: K W R G B C M Y K W + 6 серых
-    const REF_GRAY_STEPS: usize = 6;
-    let quiet = p.quiet_zone_cells() as usize;
-    let cell = p.cell_size_px as usize;
-    let white = (255.0 * p.white_level_pct() as f64 / 100.0).round();
-    let black = (255.0 * p.black_level_pct() as f64 / 100.0).round();
-    // нейтральный drive клетки строки по индексу периода (None — цветная).
-    let neutral = |idx: usize| -> Option<f64> {
-        match idx {
-            0 | 8 => Some(black),
-            1 | 9 => Some(white),
-            10..=15 => {
-                let step = (idx - 10) as f64;
-                Some(black + (white - black) * step / (REF_GRAY_STEPS - 1) as f64)
-            }
-            _ => None,
-        }
-    };
-    // сырой билинейный сэмпл rgb (0..1 на канал), зажим к краю.
-    let raw = |x: f64, y: f64| -> [f64; 3] {
-        let xc = x.clamp(0.0, (w - 1) as f64);
-        let yc = y.clamp(0.0, (h - 1) as f64);
-        let x0 = xc.floor() as usize;
-        let y0 = yc.floor() as usize;
-        let x1 = (x0 + 1).min(w - 1);
-        let y1 = (y0 + 1).min(h - 1);
-        let (fx, fy) = (xc - x0 as f64, yc - y0 as f64);
-        let mut o = [0.0f64; 3];
-        for c in 0..3 {
-            let a = rgb[y0 * w + x0][c] as f64 * (1.0 - fx) + rgb[y0 * w + x1][c] as f64 * fx;
-            let b = rgb[y1 * w + x0][c] as f64 * (1.0 - fx) + rgb[y1 * w + x1][c] as f64 * fx;
-            o[c] = (a * (1.0 - fy) + b * fy) / 255.0;
-        }
-        o
-    };
-    // сэмпл клетки (cx,cy) канона: 4 точки ±cell/4 от центра (как sample_cell).
-    let cell_raw = |cx: usize, cy: usize| -> [f64; 3] {
-        let u = ((quiet + cx) * cell) as f64 + cell as f64 / 2.0;
-        let v = ((quiet + cy) * cell) as f64 + cell as f64 / 2.0;
-        let d = cell as f64 / 4.0;
-        let mut acc = [0.0f64; 3];
-        for &(sx, sy) in &[(-d, -d), (-d, d), (d, -d), (d, d)] {
-            let (x, y) = map(u + sx, v + sy);
-            let s = raw(x, y);
-            for c in 0..3 {
-                acc[c] += s[c];
-            }
-        }
-        for c in 0..3 {
-            acc[c] /= 4.0;
-        }
-        acc
-    };
-    // собираем (drive01, raw[c]) по нейтральным клеткам, ГРУППИРУЯ по уровню
-    // drive (усредняем повторы периода -> чистая лесенка из ~6 точек).
-    let mut levels: Vec<(f64, [f64; 3], usize)> = Vec::new();
-    for ic in 0..symbol::INTERIOR {
-        if let Some(d) = neutral(ic % REF_PERIOD) {
-            let d01 = d / 255.0;
-            let s = cell_raw(symbol::RING + ic, symbol::RING);
-            match levels.iter_mut().find(|e| (e.0 - d01).abs() < 1e-6) {
-                Some(e) => {
-                    for c in 0..3 {
-                        e.1[c] += s[c];
-                    }
-                    e.2 += 1;
-                }
-                None => levels.push((d01, s, 1)),
-            }
-        }
-    }
-    if levels.len() < 3 {
-        return [CAMERA_GAMMA_DEFAULT; 3];
-    }
-    levels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    for e in &mut levels {
-        for c in 0..3 {
-            e.1[c] /= e.2 as f64;
-        }
-    }
-    let gprof = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
-    let mut out = [CAMERA_GAMMA_DEFAULT; 3];
-    // Крайние уровни (чёрный/белый) — якоря a,b, как у демодулятора (§3.4).
-    let (dk, sk_all) = (levels[0].0, levels[0].1);
-    let (dw, sw_all) = (levels[levels.len() - 1].0, levels[levels.len() - 1].1);
-    for c in 0..3 {
-        let gp = gprof[c];
-        let (xk, xw) = (dk.powf(gp), dw.powf(gp));
-        // подбираем γ ∈ [1,6] по МИНИМУМУ невязки восстановления drive: строим
-        // сенсорную модель s=(raw)^γ, снимаем a,b по чёрн/бел, инвертируем как
-        // демодулятор d̂=((s−b)/a)^(1/γ_проф) и штрафуем |d̂−d| по всем ступеням.
-        let mut best_g = CAMERA_GAMMA_DEFAULT;
-        let mut best_res = f64::MAX;
-        let mut g = 1.0;
-        while g <= 6.0 + 1e-9 {
-            let sk = sk_all[c].max(1e-6).powf(g);
-            let sw = sw_all[c].max(1e-6).powf(g);
-            let denom = xw - xk;
-            if denom.abs() > 1e-12 {
-                let a = (sw - sk) / denom;
-                let b = sk - a * xk;
-                if a.abs() > 1e-12 {
-                    let mut res = 0.0;
-                    for e in &levels {
-                        let s = e.1[c].max(1e-6).powf(g);
-                        let base = ((s - b) / a).max(0.0);
-                        let dhat = base.powf(1.0 / gp);
-                        res += (dhat - e.0).powi(2);
-                    }
-                    if res < best_res {
-                        best_res = res;
-                        best_g = g;
-                    }
-                }
-            }
-            g += 0.05;
-        }
-        out[c] = best_g;
-    }
-    out
-}
-
 /// Декод одного PPM-снимка экрана; `cell_override` — если tx рендерил
 /// с --cell, отличным от профиля.
 pub fn cmd_live(path: &str, cell_override: Option<u8>) {
@@ -265,9 +131,29 @@ pub fn cmd_live(path: &str, cell_override: Option<u8>) {
     let forced = std::env::var("PSICODE_CAMERA_GAMMA")
         .ok()
         .and_then(|s| s.parse::<f64>().ok());
+    // СЫРОЙ (до гаммы) билинейный сэмпл rgb[0,1] с зажимом к краю — тот же
+    // стиль map/sample, что у демодулятора; ядро (§3.4) оценивает по нему форму
+    // тон-кривой на канал.
+    let raw_sample = |x: f64, y: f64| -> [f32; 3] {
+        let xc = x.clamp(0.0, (w - 1) as f64);
+        let yc = y.clamp(0.0, (h - 1) as f64);
+        let x0 = xc.floor() as usize;
+        let y0 = yc.floor() as usize;
+        let x1 = (x0 + 1).min(w - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let fx = (xc - x0 as f64) as f32;
+        let fy = (yc - y0 as f64) as f32;
+        let mut o = [0.0f32; 3];
+        for c in 0..3 {
+            let a = rgb[y0 * w + x0][c] as f32 * (1.0 - fx) + rgb[y0 * w + x1][c] as f32 * fx;
+            let b = rgb[y1 * w + x0][c] as f32 * (1.0 - fx) + rgb[y1 * w + x1][c] as f32 * fx;
+            o[c] = (a * (1.0 - fy) + b * fy) / 255.0;
+        }
+        o
+    };
     let cg = match forced {
         Some(g) => [g; 3],
-        None => estimate_channel_gammas(&p, w, h, &rgb, &map),
+        None => tone::estimate_channel_gammas(&p, &map, &raw_sample),
     };
     println!(
         "  тон γ (R,G,B)    : {:.2}, {:.2}, {:.2}{}",

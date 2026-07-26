@@ -1,0 +1,17 @@
+[package]
+name = "psicode-rx"
+version = "0.1.0"
+edition = "2021"
+description = "PsiCode Android receiver core: Camera2 YUV_420_888 frame -> ZC detect -> demod -> L3 -> XOR-fountain, behind JNI."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xelth-com/PsiCode"
+
+[lib]
+# cdylib -> libpsicode_rx.so для JNI на Android; rlib -> десктоп-тесты приёмного тракта.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# psicode-core со std (по умолчанию): нужны detect/symbol/tone (вещественная математика).
+psicode-core = { path = "../psicode-core" }
+# jni — ЕДИНСТВЕННАЯ внешняя зависимость (правило zero-dep касается core/sim, не rx).
+jni = "0.21"

@@ -8,6 +8,13 @@ channel**, using color-encoded complex fields, Hermite–Gauss mode payloads for
 graceful degradation under defocus, a Zadoff–Chu synchronization frame, and
 fountain-coded transport.
 
+PsiCode is a barcode specification as much as a link: the static symbol is a
+2-D color barcode, and the streaming form is a **3-D barcode whose third
+dimension is time** — a symbol that evolves frame by frame on a display.
+Barcodes left paper long ago; a code *designed* for emissive, time-varying
+screens (rather than a paper code shown on one) is the niche this
+specification claims.
+
 This document is published as an open specification and as a **defensive
 publication**: the mechanisms described herein are placed in the public domain
 as prior art as of the date above. The PsiCode format is free to implement by

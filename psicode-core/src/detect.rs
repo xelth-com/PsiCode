@@ -179,6 +179,106 @@ pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, Dete
     finalize_detection(luma, w, h, &ac, best_r).ok_or(DetectError::NotFound)
 }
 
+/// Число кандидатов, выравниваемых при ЗАХВАТЕ (§8): топ по сырому orient-score.
+const ACQUIRE_CANDS: usize = 3;
+
+/// ЗАХВАТ для приёмника реального времени (§8): ОГРАНИЧЕННЫЙ align-as-gate.
+/// Полный фолбэк [`detect_symbol`] (все кандидаты × 4 ориентации) стоит секунды
+/// (стоимость не зависит от размера кадра). Здесь: ранжируем кандидатов по СЫРОМУ
+/// orient-score, берём топ-[`ACQUIRE_CANDS`], на каждом выравниваем ВСЕ 4 ротации
+/// (сырой orient на смещённом квадре реального снимка почти не различает ротации —
+/// наблюдённые margin'ы 0.01–0.05 — поэтому судить надо ПО ВЫРОВНЕННОЙ corr, а не
+/// по сырой) и досрочно выходим на уверенном локе (≥ [`CHEAP_ACCEPT`]). Худший
+/// случай ~12 align вместо ~32; типичный — 4 (лок на первом кандидате). Выполняется
+/// РАЗ на лок; дальше кадры ведёт дешёвый [`track_symbol`]. NotFound/Ambiguous как
+/// у [`detect_symbol`]. Поведение [`detect_symbol`] не меняется.
+pub fn detect_symbol_acquire(w: usize, h: usize, luma: &[f32]) -> Result<Detection, DetectError> {
+    if w == 0 || h == 0 || luma.len() != w * h {
+        return Err(DetectError::BadInput);
+    }
+    if w < GRID || h < GRID {
+        return Err(DetectError::NotFound);
+    }
+    let candidates = coarse_candidates(w, h, luma);
+    if candidates.is_empty() {
+        return Err(DetectError::NotFound);
+    }
+
+    // 1. ранжируем кандидатов по СЫРОМУ orient-score (лучшая ротация); топ-N.
+    let mut ranked: Vec<([(f64, f64); 4], f64)> = Vec::new();
+    for corners in candidates.iter().take(CAND_LIMIT) {
+        if let Some(hom) = build_h(corners) {
+            let (_r, score, _m) = orient_gate(luma, w, h, &hom);
+            ranked.push((*corners, score));
+        }
+    }
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+
+    // 2. align-as-gate: топ-N кандидатов, ВСЕ 4 ротации; досрочный выход на
+    //    уверенном локе. Судим по ВЫРОВНЕННОЙ corr (см. док).
+    let mut best: Option<([(f64, f64); 4], usize, f64, f64)> = None; // углы, r, corr, 2-я corr
+    for (corners, _s) in ranked.iter().take(ACQUIRE_CANDS) {
+        let mut oc = [f64::MIN; 4];
+        let mut oa: [[(f64, f64); 4]; 4] = [*corners; 4];
+        for r in 0..4 {
+            let (ac, corr) = align_ring(luma, w, h, corners, r);
+            oa[r] = ac;
+            oc[r] = corr;
+        }
+        let (br, bc, sc) = argmax2(&oc);
+        // уверенный лок -> сразу возвращаем (типичный реальный снимок).
+        if bc >= CHEAP_ACCEPT && bc - sc >= AMBIG_MARGIN {
+            return finalize_detection(luma, w, h, &oa[br], br).ok_or(DetectError::NotFound);
+        }
+        if best.as_ref().map_or(true, |b| bc > b.2) {
+            best = Some((oa[br], br, bc, sc));
+        }
+    }
+    let (ac, best_r, corr, second) = match best {
+        Some(t) => t,
+        None => return Err(DetectError::NotFound),
+    };
+    if corr < SCORE_MIN {
+        return Err(DetectError::NotFound);
+    }
+    if corr - second < AMBIG_MARGIN {
+        return Err(DetectError::Ambiguous);
+    }
+    finalize_detection(luma, w, h, &ac, best_r).ok_or(DetectError::NotFound)
+}
+
+/// СЛЕЖЕНИЕ для приёмника реального времени (§8): дешёвый путь ПОСЛЕ лока. Из
+/// `prev.homography` восстанавливаем углы кольца (apply_h к каноническим
+/// (0,0),(G,0),(G,G),(0,G) — ровно то, что кодирует [`build_h`]), берём
+/// `prev.rotation_quadrants` и гоняем ТОЛЬКО [`align_ring`] (её фаза-1 ±4 клетки
+/// сама включается лишь при низкой corr, а на соседнем кадре геометрия почти та
+/// же -> corr высок -> идёт лишь субклеточный спуск) + переоценку score. Успех ⇒
+/// обновлённый [`Detection`]; провал (score < SCORE_MIN) ⇒ NotFound, вызывающий
+/// перезахватывает. Дёшево — цель ≤ ~30 мс @640px.
+pub fn track_symbol(
+    w: usize,
+    h: usize,
+    luma: &[f32],
+    prev: &Detection,
+) -> Result<Detection, DetectError> {
+    if w == 0 || h == 0 || luma.len() != w * h {
+        return Err(DetectError::BadInput);
+    }
+    if w < GRID || h < GRID {
+        return Err(DetectError::NotFound);
+    }
+    let r = (prev.rotation_quadrants % 4) as usize;
+    // внешние углы кольца [tl, tr, br, bl] из прошлой гомографии.
+    let corners = [
+        apply_h(&prev.homography, 0.0, 0.0),
+        apply_h(&prev.homography, G, 0.0),
+        apply_h(&prev.homography, G, G),
+        apply_h(&prev.homography, 0.0, G),
+    ];
+    let (ac, _corr) = align_ring(luma, w, h, &corners, r);
+    finalize_detection(luma, w, h, &ac, r).ok_or(DetectError::NotFound)
+}
+
 /// Финализация детекции по (выровненные углы, ориентация): собирает гомографию,
 /// считает финальный score суммой пер-сторонних корреляций (§3.2) и гейтит его.
 /// None — вырожденная геометрия или score ниже [`SCORE_MIN`].

@@ -41,5 +41,7 @@ pub mod profile;
 pub mod rs;
 #[cfg(feature = "std")]
 pub mod symbol;
+#[cfg(feature = "std")]
+pub mod tone;
 
 pub use profile::{CalibProfile, ChromaMode, ProfileError};

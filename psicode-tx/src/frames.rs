@@ -88,8 +88,10 @@ pub fn reference_profile() -> CalibProfile {
         version: CalibProfile::VERSION,
         cell_size_px: 16,
         frame_hold_periods: 6,
-        luma_bits: 2,
-        chroma_mode: ChromaMode::Chroma1,
+        // v0 live: 1 бит/клетку — живой канал даёт эффективный блюр ~σ2,
+        // BENCHMARKS §6 для него предписывает luma1+Mono (SER 0 в симе).
+        luma_bits: 1,
+        chroma_mode: ChromaMode::Mono,
         gamma_g_q: 28,
         gamma_r_delta_q: 8,
         gamma_b_delta_q: 10,

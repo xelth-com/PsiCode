@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PsiCode RX</string>
+    <string name="no_core">libpsicode_rx.so отсутствует — соберите cargo ndk</string>
+    <string name="perm_needed">Нужен доступ к камере</string>
+</resources>
