@@ -15,6 +15,7 @@
 mod channel;
 mod framed;
 mod image;
+mod live;
 mod modeb;
 mod pipeline;
 mod report;
@@ -725,6 +726,14 @@ fn main() {
         Some("framed") => cmd_framed(),
         Some("modeb") => modeb::cmd_modeb(),
         Some("transfer") => transfer::cmd_transfer(),
+        Some("live") => {
+            let path = args.get(2).map(String::as_str).unwrap_or_else(|| {
+                eprintln!("usage: psicode-sim live <file.ppm> [cell]");
+                std::process::exit(2);
+            });
+            let cell = args.get(3).and_then(|s| s.parse::<u8>().ok());
+            live::cmd_live(path, cell);
+        }
         Some("dump") => {
             let dir = args.get(2).map(String::as_str).unwrap_or(DUMP_DIR_DEFAULT);
             cmd_dump(Path::new(dir));

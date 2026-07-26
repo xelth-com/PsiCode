@@ -10,6 +10,7 @@
 
 use crate::profile::CalibProfile;
 use crate::symbol::{zc_binary, GRID, ZC_ROOTS};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -63,6 +64,16 @@ impl fmt::Display for DetectError {
 #[cfg(feature = "std")]
 impl std::error::Error for DetectError {}
 
+/// Отладочный вывод стадий детекции (переменная окружения PSICODE_DETECT_DEBUG).
+fn dbg_on() -> bool {
+    std::env::var_os("PSICODE_DETECT_DEBUG").is_some()
+}
+
+/// Максимум кандидатов-квадов, прогоняемых через гейт ориентации (в порядке
+/// [`coarse_candidates`]: сначала полная маска яркости, затем карта активности,
+/// затем связные компоненты). Ограничивает стоимость: 16 корреляций на кандидат.
+const CAND_LIMIT: usize = 8;
+
 /// Обнаружение символа на снимке. `luma` — линейная яркость (напр. G-канал),
 /// `w`·`h`, построчно. См. алгоритм v0 в описании модуля.
 pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, DetectError> {
@@ -74,84 +85,99 @@ pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, Dete
         return Err(DetectError::NotFound);
     }
 
-    // 1. грубая детекция: нормировка по робастным перцентилям + маска активных
-    //    (не средне-серых) пикселей + экстремальные углы четырёхугольника.
-    let corners = coarse_corners(w, h, luma).ok_or(DetectError::NotFound)?;
-    let mut h0 = build_h(&corners).ok_or(DetectError::NotFound)?;
-
-    // 2. пер-сторонняя корреляция со всеми четырьмя корнями (forward): матрица
-    //    4×4 корреляций и лучших лагов при текущей гомографии.
-    let mut cm = [[0.0f64; 4]; 4];
-    for side in 0..4 {
-        for ri in 0..4 {
-            let (c, _l) = side_corr(luma, w, h, &h0, side, ZC_ROOTS[ri]);
-            cm[side][ri] = c;
-        }
-    }
-
-    // 3. ориентация: снимок = канон, повёрнутый на r четвертей CW, тогда сторона
-    //    i (по часовой: 0=верх,1=право,2=низ,3=лево) несёт корень с индексом
-    //    (i−r) mod 4. Выбираем r с максимальной суммой корреляций.
-    let mut totals = [0.0f64; 4];
-    for r in 0..4usize {
-        let mut t = 0.0;
-        for side in 0..4 {
-            let ri = (side + 4 - r) % 4;
-            t += cm[side][ri];
-        }
-        totals[r] = t;
-    }
-    let (best_r, best_total, second_total) = argmax2(&totals);
-    let score0 = (best_total / 4.0).clamp(0.0, 1.0);
-    if score0 < SCORE_MIN {
+    // 1. грубая детекция: НАБОР кандидатов-четырёхугольников (§ алгоритм v0.1).
+    //    Кандидат 0 — экстремумы полной маски «яркость − фон» (символ во весь
+    //    кадр: сим, плотный кроп). Далее — крупные плотно-квадратные компоненты
+    //    карты активности (символ в загромождённой сцене: живой снимок, где
+    //    титул/редактор по краям утягивают глобальные экстремумы) и связные
+    //    компоненты маски яркости. Ложных кандидатов отсеет гейт ориентации.
+    let candidates = coarse_candidates(w, h, luma);
+    if candidates.is_empty() {
         return Err(DetectError::NotFound);
     }
-    if (best_total - second_total) / 4.0 < AMBIG_MARGIN {
+
+    // 2. ПРОХОД 1 (дешёвый): гейт ориентации по СЫРОЙ пер-сторонней корреляции
+    //    на каждый кандидат (§3.2) -> лучшая ориентация r, score и отрыв. Для
+    //    сим-кадров и плотных кропов грубая рамка уже на кольце -> score высок,
+    //    ориентация верна. Берём глобально лучший (кандидат, r) по score.
+    let mut cheap: Option<([(f64, f64); 4], usize, f64, f64)> = None;
+    for corners in candidates.iter().take(CAND_LIMIT) {
+        let hc = match build_h(corners) {
+            Some(x) => x,
+            None => continue,
+        };
+        let (r, s, margin) = orient_gate(luma, w, h, &hc);
+        if dbg_on() {
+            std::eprintln!("[detect] cand {corners:?}: r{r} score {s:.4} margin {margin:.4}");
+        }
+        // строгое сравнение: при равенстве score побеждает ПЕРВЫЙ кандидат
+        // (полная маска яркости) — так поведение на сим-кадрах не меняется.
+        if cheap.as_ref().map_or(true, |b| s > b.2) {
+            cheap = Some((*corners, r, s, margin));
+        }
+    }
+    // если дешёвый победитель уверенно прошёл гейт — выравниваем и возвращаем.
+    // Сим-кадры и tight1 идут этим путём (фолбэк ниже НЕ запускается -> пины и
+    // их время не трогаются).
+    if let Some((cc, cr, cs, cm)) = cheap {
+        if cs >= SCORE_MIN && cm >= AMBIG_MARGIN {
+            let (ac, _corr) = align_ring(luma, w, h, &cc, cr);
+            if let Some(d) = finalize_detection(luma, w, h, &ac, cr) {
+                return Ok(d);
+            }
+        }
+    }
+
+    // 3. ПРОХОД 2 (фолбэк): ВЫРАВНИВАНИЕ-КАК-ГЕЙТ (§3.2). Живые снимки (tight2/3,
+    //    кроп) стартуют с кривой рамкой -> сырой гейт их топит И путает
+    //    ориентацию. Выравниваем КАЖДЫЙ кандидат во ВСЕХ 4 ориентациях и судим по
+    //    ВЫРОВНЕННОЙ корреляции кольца: верная (кандидат, r) локается к ~1.0,
+    //    ложные ЗЧ-корни другой стороны — не выше ~0.36 (граница кросс-корр).
+    //    Дороже, но запускается лишь когда дешёвый проход ничего не принял.
+    let mut fb: Option<([(f64, f64); 4], usize, f64, f64)> = None; // углы, r, corr, 2-я corr
+    for corners in candidates.iter().take(CAND_LIMIT) {
+        if build_h(corners).is_none() {
+            continue;
+        }
+        let mut oc = [f64::MIN; 4];
+        let mut oa: [[(f64, f64); 4]; 4] = [*corners; 4];
+        for r in 0..4 {
+            let (ac, corr) = align_ring(luma, w, h, corners, r);
+            oa[r] = ac;
+            oc[r] = corr;
+        }
+        let (br, bc, sc) = argmax2(&oc);
+        if dbg_on() {
+            std::eprintln!("[detect] fb cand: aligned {oc:?} -> r{br} {bc:.4} (2nd {sc:.4})");
+        }
+        if fb.as_ref().map_or(true, |b| bc > b.2) {
+            fb = Some((oa[br], br, bc, sc));
+        }
+    }
+    let (ac, best_r, corr, second) = match fb {
+        Some(t) => t,
+        None => return Err(DetectError::NotFound),
+    };
+    if corr < SCORE_MIN {
+        return Err(DetectError::NotFound);
+    }
+    if corr - second < AMBIG_MARGIN {
         return Err(DetectError::Ambiguous);
     }
+    finalize_detection(luma, w, h, &ac, best_r).ok_or(DetectError::NotFound)
+}
 
-    // 4. уточнение: пер-сторонний лаг сдвигает углы вдоль своих сторон,
-    //    пересобираем гомографию. Две итерации сходятся с запасом.
-    let mut c = corners;
-    for _ in 0..2 {
-        let hc = match build_h(&c) {
-            Some(hc) => hc,
-            None => break,
-        };
-        let mut deltas = [0.0f64; 4];
-        for side in 0..4 {
-            let ri = (side + 4 - best_r) % 4;
-            let (_c, l) = side_corr(luma, w, h, &hc, side, ZC_ROOTS[ri]);
-            deltas[side] = l;
-        }
-        // единичные (на клетку) векторы сторон по часовой стрелке.
-        let e_t = scale(sub(c[1], c[0]), 1.0 / G);
-        let e_r = scale(sub(c[2], c[1]), 1.0 / G);
-        let e_b = scale(sub(c[3], c[2]), 1.0 / G);
-        let e_l = scale(sub(c[0], c[3]), 1.0 / G);
-        // угол смещается на сумму вкладов двух примыкающих сторон (ортогональные
-        // направления рёбер -> суммирование, не усреднение).
-        let n0 = add(c[0], add(scale(e_l, deltas[3]), scale(e_t, deltas[0])));
-        let n1 = add(c[1], add(scale(e_t, deltas[0]), scale(e_r, deltas[1])));
-        let n2 = add(c[2], add(scale(e_r, deltas[1]), scale(e_b, deltas[2])));
-        let n3 = add(c[3], add(scale(e_b, deltas[2]), scale(e_l, deltas[3])));
-        c = [n0, n1, n2, n3];
-    }
-    if let Some(hr) = build_h(&c) {
-        h0 = hr;
-    }
-
-    // 4b. тонкое выравнивание по ПОЛНОМУ двойному кольцу (§3.2): 2-D корреляция
-    //     всех ~488 известных клеток (внешнее + инвертированное внутреннее,
-    //     четыре стороны) вместо 244 одномерных отсчётов. Координатный спуск по
-    //     углам ловит субклеточный сдвиг, устойчиво к блюру (центры клеток
-    //     дольше краёв сохраняют знак). Уточнение геометрии, не ориентации.
-    let cf = refine_ring(luma, w, h, &c, best_r);
-    if let Some(hf) = build_h(&cf) {
-        h0 = hf;
-    }
-
-    // 5. финальный score по уточнённой гомографии.
+/// Финализация детекции по (выровненные углы, ориентация): собирает гомографию,
+/// считает финальный score суммой пер-сторонних корреляций (§3.2) и гейтит его.
+/// None — вырожденная геометрия или score ниже [`SCORE_MIN`].
+fn finalize_detection(
+    luma: &[f32],
+    w: usize,
+    h: usize,
+    corners: &[(f64, f64); 4],
+    best_r: usize,
+) -> Option<Detection> {
+    let h0 = build_h(corners)?;
     let mut fs = 0.0;
     for side in 0..4 {
         let ri = (side + 4 - best_r) % 4;
@@ -160,10 +186,9 @@ pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, Dete
     }
     let score = (fs / 4.0).clamp(0.0, 1.0);
     if score < SCORE_MIN {
-        return Err(DetectError::NotFound);
+        return None;
     }
-
-    Ok(Detection {
+    Some(Detection {
         homography: h0,
         rotation_quadrants: best_r as u8,
         score,
@@ -193,72 +218,427 @@ pub fn frame_map(p: &CalibProfile, d: &Detection) -> impl Fn(f64, f64) -> (f64, 
 // Грубая детекция
 // ---------------------------------------------------------------------------
 
-/// Четыре внешних угла кольца [tl, tr, br, bl] в непрерывных координатах снимка.
-/// None — если контраста нет (средне-серое поле) или четырёхугольник вырожден.
-fn coarse_corners(w: usize, h: usize, luma: &[f32]) -> Option<[(f64, f64); 4]> {
+/// Гейт ориентации при гомографии `hom`: пер-сторонняя корреляция со всеми
+/// четырьмя корнями ЗЧ (§3.2). Снимок = канон, повёрнутый на r четвертей CW,
+/// тогда сторона i (по часовой: 0=верх,1=право,2=низ,3=лево) несёт корень с
+/// индексом (i−r) mod 4. Возвращает (лучшая ориентация r, её score∈[0,1],
+/// отрыв от второй ориентации в тех же единицах). Служит и отбором кандидата,
+/// и проверкой неоднозначности ориентации.
+fn orient_gate(luma: &[f32], w: usize, h: usize, hom: &[[f64; 3]; 3]) -> (usize, f64, f64) {
+    let mut cm = [[0.0f64; 4]; 4];
+    for side in 0..4 {
+        for ri in 0..4 {
+            let (c, _l) = side_corr(luma, w, h, hom, side, ZC_ROOTS[ri]);
+            cm[side][ri] = c;
+        }
+    }
+    let mut totals = [0.0f64; 4];
+    for r in 0..4usize {
+        let mut t = 0.0;
+        for side in 0..4 {
+            let ri = (side + 4 - r) % 4;
+            t += cm[side][ri];
+        }
+        totals[r] = t;
+    }
+    let (best_r, best_total, second_total) = argmax2(&totals);
+    (
+        best_r,
+        (best_total / 4.0).clamp(0.0, 1.0),
+        (best_total - second_total) / 4.0,
+    )
+}
+
+/// Кандидаты грубой детекции: четвёрки внешних углов [tl, tr, br, bl] в
+/// непрерывных координатах снимка. Порядок (важен для tie-break в гейте):
+///   0) экстремумы ПОЛНОЙ маски «яркость − фон» — символ во весь кадр (сим,
+///      плотный кроп); при равенстве score побеждает он -> поведение сим не
+///      меняется относительно baseline;
+///   1..) крупные плотно-квадратные компоненты КАРТЫ АКТИВНОСТИ — символ в
+///      загромождённой сцене (живой снимок: титул/редактор по краям утягивают
+///      глобальные экстремумы, но ров тихой зоны изолирует символ);
+///   ..) связные компоненты маски яркости (запас). Ложных кандидатов отсеет
+///      гейт ориентации в [`detect_symbol`].
+fn coarse_candidates(w: usize, h: usize, luma: &[f32]) -> Vec<[(f64, f64); 4]> {
+    let mut out: Vec<[(f64, f64); 4]> = Vec::new();
+
     // робастные перцентили 1%/99% для оценки контрастного размаха (устойчиво
     // к выбросам). Работаем в исходном (линейном) домене яркости.
     let (p1, p99) = percentiles(luma, 0.01, 0.99);
     let span = p99 - p1;
-    if span < 1e-6 {
-        return None; // равномерное поле — детектировать нечего.
-    }
+    let have_span = span >= 1e-6;
     // Фон — тихая зона (§3.1): равномерное средне-серое, но в ЛИНЕЙНОМ домене
-    // оно не 0.5, поэтому опорное значение берём как среднюю яркость по рамке
-    // снимка (у реального кадра рамка целиком в тихой зоне). Активны пиксели,
-    // далёкие от фона: клетки кольца почти чёрные/белые -> активны при любом
-    // бите ЗЧ, а тихая зона и средне-серый payload — нет.
+    // оно не 0.5, поэтому опору берём как среднюю яркость по рамке снимка.
+    // Активны пиксели, далёкие от фона: клетки кольца почти чёрные/белые.
     let bg = border_mean(luma, w, h);
     let thr = 0.15 * span;
+    if dbg_on() {
+        std::eprintln!("[detect] p1 {p1:.4} p99 {p99:.4} span {span:.4} bg {bg:.4} thr {thr:.4}");
+    }
 
-    // экстремальные точки по четырём диагональным проекциям (§ алгоритм v0.1).
-    let mut tl = (isize::MAX, 0usize, 0usize); // минимизируем i+j
-    let mut tr = (isize::MIN, 0usize, 0usize); // максимизируем i−j
-    let mut br = (isize::MIN, 0usize, 0usize); // максимизируем i+j
-    let mut bl = (isize::MIN, 0usize, 0usize); // максимизируем j−i
-    let mut active = 0usize;
-    for j in 0..h {
+    // маска яркости и её глобальные экстремумы (baseline-путь) — кандидат 0.
+    let mask: Vec<bool> = if have_span {
+        luma.iter().map(|&v| (v as f64 - bg).abs() > thr).collect()
+    } else {
+        Vec::new()
+    };
+    if have_span {
+        let mut whole = Extremes::new();
+        for j in 0..h {
+            let row = j * w;
+            for i in 0..w {
+                if mask[row + i] {
+                    whole.add(i, j);
+                }
+            }
+        }
+        if whole.count >= 4 * GRID {
+            if let Some(q) = whole.quad() {
+                out.push(q);
+            }
+        }
+    }
+
+    // кандидаты карты активности (основной путь для живых снимков).
+    out.extend(activity_candidates(w, h, luma));
+
+    // связные компоненты маски яркости (запас: если карта активности промахнулась).
+    if have_span && out.len() < CAND_LIMIT {
+        let mut visited = vec![false; w * h];
+        let mut comps: Vec<Extremes> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for start in 0..w * h {
+            if !mask[start] || visited[start] {
+                continue;
+            }
+            let mut ext = Extremes::new();
+            visited[start] = true;
+            stack.push(start);
+            while let Some(px) = stack.pop() {
+                let i = px % w;
+                let j = px / w;
+                ext.add(i, j);
+                if i > 0 && mask[px - 1] && !visited[px - 1] {
+                    visited[px - 1] = true;
+                    stack.push(px - 1);
+                }
+                if i + 1 < w && mask[px + 1] && !visited[px + 1] {
+                    visited[px + 1] = true;
+                    stack.push(px + 1);
+                }
+                if j > 0 && mask[px - w] && !visited[px - w] {
+                    visited[px - w] = true;
+                    stack.push(px - w);
+                }
+                if j + 1 < h && mask[px + w] && !visited[px + w] {
+                    visited[px + w] = true;
+                    stack.push(px + w);
+                }
+            }
+            if ext.count >= 4 * GRID {
+                comps.push(ext);
+            }
+        }
+        comps.sort_by(|a, b| b.count.cmp(&a.count));
+        for c in comps.iter().take(MAX_CANDIDATES) {
+            if let Some(q) = c.quad() {
+                out.push(q);
+            }
+        }
+    }
+    out
+}
+
+/// Максимум связных компонент маски яркости, добавляемых как кандидаты.
+const MAX_CANDIDATES: usize = 4;
+
+/// Сторона блока при агрегации карты активности (px). Активность — градиентная
+/// энергия яркости, усреднённая по блокам: символ (плотная сетка чёрно-белых/
+/// цветных клеток) даёт высокую активность в КАЖДОМ блоке, а тихая зона / серое
+/// окно / небо — почти нулевую. Так тихая зона работает «рвом», отделяющим
+/// символ от загромождения (редактор, титул), чего маска «яркость − фон» не
+/// даёт (титул тоже не серый и слипается с символом).
+const ACT_BLOCK: usize = 8;
+/// Радиус бокс-размытия карты активности в БЛОКАХ. Заполняет «дыры» в центрах
+/// крупных клеток (внутри одной клетки градиента нет), делая символ сплошным
+/// пятном при размере клетки ~8..28 px. Меньше — символ рассыпается на крупной
+/// клетке; больше — ров тихой зоны затягивается и символ слипается с мусором.
+const ACT_BLUR_R: usize = 4;
+/// Порог активной клетки карты = доля от 99.5-го перцентиля активности.
+const ACT_THR_FRAC: f64 = 0.28;
+/// Радиус эрозии активной маски в БЛОКАХ (морфологическое «открытие»). Рвёт
+/// ТОНКИЕ мостики активности от загромождения (титул окна, кнопки, строки
+/// редактора) к телу символа. Заодно компенсирует систематический вынос края
+/// наружу от бокс-размытия (эрозия ≈ на тот же радиус возвращает границу к
+/// внешнему краю кольца).
+const ACT_ERODE_R: usize = 5;
+/// Максимум квадов-кандидатов от активной карты (крупнейшие компоненты).
+const ACT_MAX_CANDIDATES: usize = 4;
+
+/// Кандидаты по КАРТЕ АКТИВНОСТИ: градиентная энергия -> агрегация по блокам ->
+/// бокс-размытие -> порог -> эрозия -> связные компоненты -> ранжирование по
+/// площади × плотности × квадратности. Возвращает квады внешних углов
+/// крупнейших плотно-квадратных компонент (обычно первая — сам символ).
+fn activity_candidates(w: usize, h: usize, luma: &[f32]) -> Vec<[(f64, f64); 4]> {
+    if w < 2 * ACT_BLOCK || h < 2 * ACT_BLOCK {
+        return Vec::new();
+    }
+    // 1. градиентная энергия на пиксель (|Δx| + |Δy|), сразу в блоки.
+    let bw = w / ACT_BLOCK;
+    let bh = h / ACT_BLOCK;
+    let mut act = vec![0.0f64; bw * bh];
+    for j in 0..bh * ACT_BLOCK {
         let row = j * w;
-        for i in 0..w {
-            if (luma[row + i] as f64 - bg).abs() <= thr {
-                continue; // близко к фону — неактивен.
-            }
-            active += 1;
-            let ii = i as isize;
-            let jj = j as isize;
-            if ii + jj < tl.0 {
-                tl = (ii + jj, i, j);
-            }
-            if ii - jj > tr.0 {
-                tr = (ii - jj, i, j);
-            }
-            if ii + jj > br.0 {
-                br = (ii + jj, i, j);
-            }
-            if jj - ii > bl.0 {
-                bl = (jj - ii, i, j);
-            }
+        let rown = if j + 1 < h { (j + 1) * w } else { row };
+        let bj = j / ACT_BLOCK;
+        for i in 0..bw * ACT_BLOCK {
+            let c = luma[row + i] as f64;
+            let gx = if i + 1 < w {
+                (luma[row + i + 1] as f64 - c).abs()
+            } else {
+                0.0
+            };
+            let gy = (luma[rown + i] as f64 - c).abs();
+            act[bj * bw + i / ACT_BLOCK] += gx + gy;
         }
     }
-    if active < 4 * GRID {
-        return None; // недостаточно структуры.
+    let inv = 1.0 / (ACT_BLOCK * ACT_BLOCK) as f64;
+    for a in &mut act {
+        *a *= inv;
     }
-    // полупиксельная привязка к ВНЕШНЕЙ границе кольца: угол = внешний край
-    // экстремального пикселя (уточнение потом снимет остаточный сдвиг).
-    let p_tl = (tl.1 as f64, tl.2 as f64);
-    let p_tr = (tr.1 as f64 + 1.0, tr.2 as f64);
-    let p_br = (br.1 as f64 + 1.0, br.2 as f64 + 1.0);
-    let p_bl = (bl.1 as f64, bl.2 as f64 + 1.0);
+    // 2. бокс-размытие через интегральное изображение.
+    let blurred = box_blur(&act, bw, bh, ACT_BLUR_R);
+    // 3. порог по 99.5-му перцентилю (устойчив к одиночным горячим блокам).
+    let p995 = percentile_f64(&blurred, 0.995);
+    let thr = ACT_THR_FRAC * p995;
+    if thr < 1e-9 {
+        return Vec::new();
+    }
+    let mask0: Vec<bool> = blurred.iter().map(|&v| v > thr).collect();
+    let mask = erode(&mask0, bw, bh, ACT_ERODE_R);
 
-    // отбраковка вырожденной геометрии: все стороны заметной длины.
-    let quad = [p_tl, p_tr, p_br, p_bl];
-    for k in 0..4 {
-        let len = norm(sub(quad[(k + 1) % 4], quad[k]));
-        if len < 4.0 {
-            return None;
+    // 4. связные компоненты (4-связность) на сетке блоков.
+    struct Comp {
+        ext: Extremes,
+        imin: usize,
+        imax: usize,
+        jmin: usize,
+        jmax: usize,
+    }
+    let mut visited = vec![false; bw * bh];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut comps: Vec<Comp> = Vec::new();
+    let min_blocks = (bw * bh) / 100;
+    for start in 0..bw * bh {
+        if !mask[start] || visited[start] {
+            continue;
+        }
+        let mut ext = Extremes::new();
+        let (mut imin, mut imax, mut jmin, mut jmax) = (bw, 0usize, bh, 0usize);
+        visited[start] = true;
+        stack.push(start);
+        while let Some(px) = stack.pop() {
+            let i = px % bw;
+            let j = px / bw;
+            ext.add(i, j);
+            imin = imin.min(i);
+            imax = imax.max(i);
+            jmin = jmin.min(j);
+            jmax = jmax.max(j);
+            if i > 0 && mask[px - 1] && !visited[px - 1] {
+                visited[px - 1] = true;
+                stack.push(px - 1);
+            }
+            if i + 1 < bw && mask[px + 1] && !visited[px + 1] {
+                visited[px + 1] = true;
+                stack.push(px + 1);
+            }
+            if j > 0 && mask[px - bw] && !visited[px - bw] {
+                visited[px - bw] = true;
+                stack.push(px - bw);
+            }
+            if j + 1 < bh && mask[px + bw] && !visited[px + bw] {
+                visited[px + bw] = true;
+                stack.push(px + bw);
+            }
+        }
+        if ext.count >= min_blocks {
+            comps.push(Comp {
+                ext,
+                imin,
+                imax,
+                jmin,
+                jmax,
+            });
         }
     }
-    Some(quad)
+    // 5. ранжирование: площадь × плотность bbox × квадратность.
+    let mut ranked: Vec<(f64, usize)> = comps
+        .iter()
+        .enumerate()
+        .map(|(k, c)| {
+            let bw_c = (c.imax - c.imin + 1) as f64;
+            let bh_c = (c.jmax - c.jmin + 1) as f64;
+            let solidity = c.ext.count as f64 / (bw_c * bh_c);
+            let square = bw_c.min(bh_c) / bw_c.max(bh_c);
+            (c.ext.count as f64 * solidity * square, k)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+
+    let mut out = Vec::new();
+    let s = ACT_BLOCK as f64;
+    for &(_, k) in ranked.iter().take(ACT_MAX_CANDIDATES) {
+        let e = &comps[k].ext;
+        // внешние углы блоков-экстремумов -> px (внешний край блока).
+        let q = [
+            (e.tl.1 as f64 * s, e.tl.2 as f64 * s),
+            ((e.tr.1 as f64 + 1.0) * s, e.tr.2 as f64 * s),
+            ((e.br.1 as f64 + 1.0) * s, (e.br.2 as f64 + 1.0) * s),
+            (e.bl.1 as f64 * s, (e.bl.2 as f64 + 1.0) * s),
+        ];
+        let mut ok = true;
+        for m in 0..4 {
+            if norm(sub(q[(m + 1) % 4], q[m])) < 4.0 {
+                ok = false;
+            }
+        }
+        if ok {
+            out.push(q);
+        }
+    }
+    if dbg_on() {
+        std::eprintln!(
+            "[detect] активность: блоков {bw}x{bh}, thr {thr:.5}, компонент {}, квадов {}",
+            comps.len(),
+            out.len()
+        );
+        for q in &out {
+            std::eprintln!("[detect]   act-quad {q:?}");
+        }
+    }
+    out
+}
+
+/// Бокс-размытие 2-D через интегральное изображение (окно (2r+1)²), край — зажим.
+fn box_blur(a: &[f64], w: usize, h: usize, r: usize) -> Vec<f64> {
+    let mut ii = vec![0.0f64; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut rowsum = 0.0;
+        for x in 0..w {
+            rowsum += a[y * w + x];
+            ii[(y + 1) * (w + 1) + (x + 1)] = ii[y * (w + 1) + (x + 1)] + rowsum;
+        }
+    }
+    let mut out = vec![0.0f64; w * h];
+    for y in 0..h {
+        let y0 = y.saturating_sub(r);
+        let y1 = (y + r + 1).min(h);
+        for x in 0..w {
+            let x0 = x.saturating_sub(r);
+            let x1 = (x + r + 1).min(w);
+            let sm = ii[y1 * (w + 1) + x1] - ii[y0 * (w + 1) + x1] - ii[y1 * (w + 1) + x0]
+                + ii[y0 * (w + 1) + x0];
+            out[y * w + x] = sm / ((y1 - y0) * (x1 - x0)) as f64;
+        }
+    }
+    out
+}
+
+/// Эрозия булевой маски квадратным элементом радиуса `r` (блок выживает, если
+/// ВСЕ блоки окна (2r+1)² активны). Область за пределами карты — неактивна,
+/// поэтому краевые блоки эродируются.
+fn erode(mask: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+    let mut ii = vec![0u32; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut rowsum = 0u32;
+        for x in 0..w {
+            rowsum += mask[y * w + x] as u32;
+            ii[(y + 1) * (w + 1) + (x + 1)] = ii[y * (w + 1) + (x + 1)] + rowsum;
+        }
+    }
+    let mut out = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            if x < r || y < r || x + r >= w || y + r >= h {
+                continue;
+            }
+            let (x0, y0, x1, y1) = (x - r, y - r, x + r + 1, y + r + 1);
+            // группируем как (a+d)−(b+c): каждая скобка неотрицательна и сумма
+            // окна >= 0, поэтому нет промежуточного underflow (u32, debug-режим).
+            let add = ii[y1 * (w + 1) + x1] + ii[y0 * (w + 1) + x0];
+            let sub = ii[y0 * (w + 1) + x1] + ii[y1 * (w + 1) + x0];
+            out[y * w + x] = add - sub == ((x1 - x0) * (y1 - y0)) as u32;
+        }
+    }
+    out
+}
+
+/// Перцентиль по копии буфера f64 (доля 0..1), частичная сортировка.
+fn percentile_f64(v: &[f64], q: f64) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let idx = ((q * (s.len() - 1) as f64).round() as usize).min(s.len() - 1);
+    s[idx]
+}
+
+/// Трекер диагональных экстремумов множества пикселей/блоков + счётчик.
+struct Extremes {
+    count: usize,
+    tl: (isize, usize, usize), // минимум i+j
+    tr: (isize, usize, usize), // максимум i−j
+    br: (isize, usize, usize), // максимум i+j
+    bl: (isize, usize, usize), // максимум j−i
+}
+
+impl Extremes {
+    fn new() -> Self {
+        Extremes {
+            count: 0,
+            tl: (isize::MAX, 0, 0),
+            tr: (isize::MIN, 0, 0),
+            br: (isize::MIN, 0, 0),
+            bl: (isize::MIN, 0, 0),
+        }
+    }
+
+    fn add(&mut self, i: usize, j: usize) {
+        self.count += 1;
+        let ii = i as isize;
+        let jj = j as isize;
+        if ii + jj < self.tl.0 {
+            self.tl = (ii + jj, i, j);
+        }
+        if ii - jj > self.tr.0 {
+            self.tr = (ii - jj, i, j);
+        }
+        if ii + jj > self.br.0 {
+            self.br = (ii + jj, i, j);
+        }
+        if jj - ii > self.bl.0 {
+            self.bl = (jj - ii, i, j);
+        }
+    }
+
+    /// Квад [tl, tr, br, bl] с полупиксельной привязкой к внешней границе кольца
+    /// (угол = внешний край экстремального пикселя); None — вырожден.
+    fn quad(&self) -> Option<[(f64, f64); 4]> {
+        let q = [
+            (self.tl.1 as f64, self.tl.2 as f64),
+            (self.tr.1 as f64 + 1.0, self.tr.2 as f64),
+            (self.br.1 as f64 + 1.0, self.br.2 as f64 + 1.0),
+            (self.bl.1 as f64, self.bl.2 as f64 + 1.0),
+        ];
+        for k in 0..4 {
+            if norm(sub(q[(k + 1) % 4], q[k])) < 4.0 {
+                return None;
+            }
+        }
+        Some(q)
+    }
 }
 
 /// Средняя яркость по 1-пиксельной рамке снимка (опора «фон/тихая зона»).
@@ -424,104 +804,247 @@ fn ring_point(side: usize, depth: f64, n: f64) -> (f64, f64) {
     }
 }
 
-/// Тонкое выравнивание гомографии по ПОЛНОМУ двойному ЗЧ-кольцу (§3.2): и
-/// внешнее, и (инвертированное) внутреннее кольцо, все четыре стороны —
-/// 2·4·GRID известных клеток ±1. Координатный спуск по четырём углам (по 2-D
-/// каждый) максимизирует нормированную корреляцию СЫРЫХ (не бинаризованных)
-/// центровых отсчётов с ±1-эталоном. Линейная корреляция мягко деградирует под
-/// блюром (центр клетки дольше края держит знак), поэтому даёт субклеточную
-/// точность там, где пер-сторонний 1-D лаг смещается под сглаживанием.
-/// Возвращает уточнённые углы [tl, tr, br, bl].
-fn refine_ring(
-    luma: &[f32],
-    w: usize,
-    h: usize,
-    corners: &[(f64, f64); 4],
-    best_r: usize,
-) -> [(f64, f64); 4] {
-    // Канонические координаты отсчётов кольца + эталон ±1 (от гомографии не
-    // зависят — считаем один раз). Внутреннее кольцо = инверсия внешнего, так
-    // что эталон почти знако-симметричен (точное Σt=0 нарушают лишь угловые
-    // пропуски внутреннего кольца — поэтому score считает честный Пирсон).
-    // Отсчёты берём НЕ только по центру клетки, а тремя точками вдоль стороны
-    // (−0.35, 0, +0.35 клетки): центр устойчив по знаку, а при-краевые точки
-    // лежат на скате размытого перехода и делают корреляцию ЧУВСТВИТЕЛЬНОЙ к
-    // субклеточному сдвигу (иначе центровая корреляция сатурируется у 1.0 под
-    // блюром и не может вести спуск). t — знак клетки n для всех трёх точек.
-    const TANG: [f64; 3] = [-0.35, 0.0, 0.35];
-    let mut pts: Vec<(f64, f64, f64)> = Vec::with_capacity(2 * 4 * GRID * TANG.len());
+/// Полудиапазон пер-углового 2-D поиска анти-алиас выравнивания, в клетках (±).
+const ALIGN_RANGE_CELLS: i32 = 4;
+/// Порог активации грубой фазы выравнивания по стартовой корреляции кольца.
+/// Живой снимок стартует с corr ~0.2 (грубая рамка криво), сим-кадр — с ~0.9+
+/// (экстремумы уже на кольце). Ниже порога -> запускаем агрессивный пер-угловой
+/// поиск; выше -> сразу субклеточный спуск (тождественно старому refine_ring),
+/// поэтому сим-кадры и пин блюра НЕ трогаются грубой фазой.
+const ALIGN_ACTIVATE: f64 = 0.6;
+/// Вес штрафа тихой зоны в композитной цели трансляции (анти-алиас якорь).
+/// При 0 остаётся чистая корреляция кольца (у неё есть ложные максимумы на
+/// сдвиге в толщину кольца); >0 — штраф гасит их. Приколочено развёрткой на
+/// живых снимках (tight1): см. WORKER_NOTES.
+const QUIET_LAMBDA: f64 = 0.7;
+/// Смещения вдоль стороны для отсчётов кольца (клетки): центр держит знак под
+/// блюром, при-краевые точки чувствительны к субклеточному сдвигу.
+const TANG: [f64; 3] = [-0.35, 0.0, 0.35];
+
+/// Строит ПЕР-СТОРОННИЕ канонические отсчёты двойного кольца (u, v, эталон ±1) и
+/// щупы тихой зоны (u, v) для ориентации `best_r`. Внутреннее кольцо = инверсия
+/// внешнего, кроме угловых n (там глубина 1 уходит на сторону соседа — иной
+/// корень). Щуп тихой зоны — центр первой клетки НАРУЖУ от внешнего края
+/// (depth=−1). Возврат: [pts_side; 4], [quiet_side; 4].
+#[allow(clippy::type_complexity)]
+fn ring_samples_side(best_r: usize) -> ([Vec<(f64, f64, f64)>; 4], [Vec<(f64, f64)>; 4]) {
+    let mut pts: [Vec<(f64, f64, f64)>; 4] =
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut quiet: [Vec<(f64, f64)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for side in 0..4 {
         let ri = (side + 4 - best_r) % 4;
         let root = ZC_ROOTS[ri];
         for n in 0..GRID {
             let t = if zc_binary(root, n) { 1.0 } else { -1.0 };
             for &off in &TANG {
-                // внешнее кольцо: полная сторона (углы принадлежат стороне по
-                // приоритету §3.2, корень стороны верен во всех позициях).
                 let (ou, ov) = ring_point(side, 0.0, n as f64 + off);
-                pts.push((ou, ov, t));
-                // внутреннее кольцо: инверсия примыкающей внешней клетки, но
-                // КРОМЕ угловых n=0/GRID-1 — там глубина 1 уходит на внешнее
-                // кольцо СОСЕДНЕЙ стороны (иной корень), эталон был бы неверен.
+                pts[side].push((ou, ov, t));
                 if n > 0 && n < GRID - 1 {
                     let (iu, iv) = ring_point(side, 1.0, n as f64 + off);
-                    pts.push((iu, iv, -t));
+                    pts[side].push((iu, iv, -t));
                 }
             }
+            let (qu, qv) = ring_point(side, -1.0, n as f64);
+            quiet[side].push((qu, qv));
         }
     }
+    (pts, quiet)
+}
 
-    // Нормированная корреляция Пирсона кольца при углах `c` (общий вид: эталон
-    // почти нулевого среднего, но угловые пропуски делают Σt≠0 — считаем честно).
-    let score = |c: &[(f64, f64); 4]| -> f64 {
+/// Нормированная корреляция сырых отсчётов `pts` (u, v, ±1) при гомографии `hom`
+/// с ±1-эталоном + амплитуда кольца (СКО). None — константная выборка.
+fn corr_of(luma: &[f32], w: usize, h: usize, hom: &[[f64; 3]; 3], pts: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
+    let n = pts.len() as f64;
+    let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(u, v, t) in pts {
+        let (x, y) = apply_h(hom, u, v);
+        let s = sample_luma(luma, w, h, x, y);
+        sa += s;
+        sb += t;
+        saa += s * s;
+        sbb += t * t;
+        sab += s * t;
+    }
+    let nvar_a = saa - sa * sa / n;
+    let nvar_b = sbb - sb * sb / n;
+    if nvar_a < 1e-12 || nvar_b < 1e-12 {
+        return None;
+    }
+    Some((
+        (sab - sa * sb / n) / (nvar_a.sqrt() * nvar_b.sqrt()),
+        (nvar_a / n).sqrt(),
+    ))
+}
+
+/// Штраф тихой зоны: СКО щупов `quiet` (попавших в кадр), нормированное на
+/// амплитуду кольца `ring_amp`. Отключён (0), если щупов < GRID (кроп без тихой
+/// зоны / край) — как для сим-профилей quiet=0.
+fn quiet_penalty(luma: &[f32], w: usize, h: usize, hom: &[[f64; 3]; 3], quiet: &[(f64, f64)], ring_amp: f64) -> f64 {
+    let (mut qs, mut qss, mut qn) = (0.0f64, 0.0f64, 0usize);
+    for &(u, v) in quiet {
+        let (x, y) = apply_h(hom, u, v);
+        if x < 0.0 || x > (w - 1) as f64 || y < 0.0 || y > (h - 1) as f64 {
+            continue;
+        }
+        let s = sample_luma(luma, w, h, x, y);
+        qs += s;
+        qss += s * s;
+        qn += 1;
+    }
+    if qn >= GRID && ring_amp > 1e-6 {
+        let qvar = (qss - qs * qs / qn as f64) / qn as f64;
+        qvar.max(0.0).sqrt() / ring_amp
+    } else {
+        0.0
+    }
+}
+
+/// АНТИ-АЛИАС 2-D выравнивание по ПОЛНОМУ двойному ЗЧ-кольцу (§3.2). Заменяет и
+/// пер-сторонний 1-D лаг, и старый refine_ring. Целевая функция:
+///   J = corr_ring − λ·penalty_quiet,
+/// где corr_ring — нормированная корреляция полного двойного кольца (внешнее +
+/// инвертированное внутреннее, 3 точки вдоль стороны) с ±1-эталоном, а
+/// penalty_quiet — контраст (СКО) полосы на 1 клетку НАРУЖУ от кольца,
+/// нормированный на амплитуду кольца. В верном положении полоса-щуп лежит в
+/// тихой зоне (серо -> контраст ~0); при сдвиге «на толщину кольца» (где чистая
+/// corr тоже высока из-за инверсии внутреннего кольца) щуп попадает на настоящее
+/// кольцо -> штраф гасит J. Так истинное положение — единственный максимум, и
+/// безопасны и грубый поиск трансляции, и крупные шаги спуска.
+///
+/// Две фазы: (1) ГРУБАЯ пер-угловая — каждый угол по 2-D сетке ±[`ALIGN_RANGE_CELLS`]
+/// клетки (шаг 0.5), максимизируя сумму композитных J двух примыкающих сторон;
+/// охватывает трансляцию + поворот + одиночную сторону в клаттере, но запускается
+/// лишь при низкой стартовой corr (< [`ALIGN_ACTIVATE`]) — живой снимок; (2)
+/// СУБКЛЕТОЧНЫЙ спуск паттерн-поиском по чистой corr (шаги 0.25 → 0.05 клетки).
+/// Для выровненных кадров (сим) фаза 1 пропускается, а фаза 2 тождественна
+/// прежнему refine_ring — поэтому пины (в т.ч. блюр σ=1 ≤1.4×) не трогаются.
+/// Ориентацию не трогает. Возвращает (выровненные углы, полную corr кольца в
+/// найденной точке) — corr служит гейтом выравнивания в фолбэке детекции.
+fn align_ring(
+    luma: &[f32],
+    w: usize,
+    h: usize,
+    corners: &[(f64, f64); 4],
+    best_r: usize,
+) -> ([(f64, f64); 4], f64) {
+    let (pts_s, quiet_s) = ring_samples_side(best_r);
+    let pts_all: Vec<(f64, f64, f64)> = pts_s.iter().flatten().copied().collect();
+
+    // Пер-сторонняя композитная J: corr стороны − λ·штраф её тихой зоны. Именно
+    // ПЕР-СТОРОННЯЯ (не полная) метрика развязывает стороны — иначе промах одной
+    // стороны в клаттер тонет в сумме по кольцу и жадный поиск его не видит.
+    let side_j = |c: &[(f64, f64); 4], side: usize| -> f64 {
         let hom = match build_h(c) {
             Some(x) => x,
             None => return f64::MIN,
         };
-        let n = pts.len() as f64;
-        let mut sa = 0.0; // Σs
-        let mut sb = 0.0; // Σt
-        let mut saa = 0.0; // Σs²
-        let mut sbb = 0.0; // Σt²
-        let mut sab = 0.0; // Σs·t
-        for &(u, v, t) in &pts {
-            let (x, y) = apply_h(&hom, u, v);
-            let s = sample_luma(luma, w, h, x, y);
-            sa += s;
-            sb += t;
-            saa += s * s;
-            sbb += t * t;
-            sab += s * t;
+        match corr_of(luma, w, h, &hom, &pts_s[side]) {
+            Some((corr, amp)) => corr - QUIET_LAMBDA * quiet_penalty(luma, w, h, &hom, &quiet_s[side], amp),
+            None => f64::MIN,
         }
-        let nvar_a = saa - sa * sa / n; // N·Var[s]
-        let nvar_b = sbb - sb * sb / n; // N·Var[t]
-        if nvar_a < 1e-12 || nvar_b < 1e-12 {
-            return f64::MIN; // константная выборка — корреляция не определена.
+    };
+    // Полная корреляция кольца (для субклеточного спуска и отчёта).
+    let full_corr = |c: &[(f64, f64); 4]| -> f64 {
+        match build_h(c) {
+            Some(hom) => corr_of(luma, w, h, &hom, &pts_all).map(|t| t.0).unwrap_or(f64::MIN),
+            None => f64::MIN,
         }
-        (sab - sa * sb / n) / (nvar_a.sqrt() * nvar_b.sqrt())
+    };
+    // Пер-сторонняя чистая corr (для отладки).
+    let side_corr_dbg = |c: &[(f64, f64); 4], side: usize| -> f64 {
+        match build_h(c) {
+            Some(hom) => corr_of(luma, w, h, &hom, &pts_s[side]).map(|t| t.0).unwrap_or(f64::MIN),
+            None => f64::MIN,
+        }
     };
 
     let mut c = *corners;
-    let mut best = score(&c);
-    if best < -1.5 {
-        return c; // вырожденная стартовая геометрия — не трогаем.
+    let corr0 = full_corr(&c);
+    if corr0 <= f64::MIN {
+        return (c, 0.0); // вырожденная геометрия — не трогаем.
     }
-    // масштаб клетки в px из средней длины стороны (шаг спуска задан в клетках).
     let cell_px = (norm(sub(c[1], c[0]))
         + norm(sub(c[2], c[1]))
         + norm(sub(c[3], c[2]))
         + norm(sub(c[0], c[3])))
         / (4.0 * G);
-    // Порог принятия шага: корреляция кольца флуктуирует под сенсорным шумом;
-    // движение принимаем только при улучшении СВЕРХ этого пола, иначе на
-    // чистом-но-шумном кадре (без блюра) спуск гонялся бы за шумом и смещал
-    // углы. Под блюром выигрыш субклеточного выравнивания на порядок больше
-    // порога (корреляция при-краевых точек растёт с ~0.97 до ~0.99), поэтому
-    // порог не мешает сходимости. Значение приколочено развёртками (см. отчёт).
+    if dbg_on() {
+        std::eprintln!(
+            "[detect] align in: corr {corr0:.3} sides [{:.2} {:.2} {:.2} {:.2}]",
+            side_corr_dbg(&c, 0),
+            side_corr_dbg(&c, 1),
+            side_corr_dbg(&c, 2),
+            side_corr_dbg(&c, 3)
+        );
+    }
+
+    // --- фаза 1: ПЕР-УГЛОВОЙ 2-D поиск (§3.2 анти-алиас), только для живых ---
+    // Грубая рамка карты активности криво стоит по НЕСКОЛЬКИМ степеням свободы
+    // сразу (трансляция + поворот + одиночная сторона в клаттере), а
+    // целочисленный промах даёт визуально чистый, но полностью неверный demod.
+    // Двигаем КАЖДЫЙ угол по 2-D сетке ±ALIGN_RANGE_CELLS клетки (шаг 0.5),
+    // максимизируя сумму композитных J двух ПРИМЫКАЮЩИХ сторон (их corr кольца −
+    // λ·штраф их тихой зоны). 2-D охватывает и тангенциальный, и перпендикулярный
+    // сдвиг угла; якорь тихой зоны ломает алиас, ограниченный диапазон — без
+    // разбегания. Итерируем (углы делят стороны). Гейт по стартовой corr: на
+    // сим-кадрах (corr высок) фаза пропускается — субклеточный спуск ниже
+    // тождествен старому refine_ring, поэтому пины не трогаются.
+    // угол k примыкает к сторонам (k+3)%4 и k.
+    const CORNER_SIDES: [(usize, usize); 4] = [(3, 0), (0, 1), (1, 2), (2, 3)];
+    if corr0 < ALIGN_ACTIVATE {
+        let r = 2 * ALIGN_RANGE_CELLS; // шаг 0.5 клетки
+        for _iter in 0..3 {
+            let mut moved = false;
+            for (k, &(s1, s2)) in CORNER_SIDES.iter().enumerate() {
+                let mut best_j = side_j(&c, s1) + side_j(&c, s2);
+                let mut best_off = (0.0f64, 0.0f64);
+                for dj in -r..=r {
+                    for di in -r..=r {
+                        if di == 0 && dj == 0 {
+                            continue;
+                        }
+                        let (dx, dy) = (di as f64 * 0.5 * cell_px, dj as f64 * 0.5 * cell_px);
+                        let mut trial = c;
+                        trial[k].0 += dx;
+                        trial[k].1 += dy;
+                        let j = side_j(&trial, s1) + side_j(&trial, s2);
+                        if j > best_j {
+                            best_j = j;
+                            best_off = (dx, dy);
+                        }
+                    }
+                }
+                if best_off != (0.0, 0.0) {
+                    c[k].0 += best_off.0;
+                    c[k].1 += best_off.1;
+                    moved = true;
+                }
+            }
+            if dbg_on() {
+                std::eprintln!(
+                    "[detect] align it: corr {:.3} sides [{:.2} {:.2} {:.2} {:.2}]",
+                    full_corr(&c),
+                    side_corr_dbg(&c, 0),
+                    side_corr_dbg(&c, 1),
+                    side_corr_dbg(&c, 2),
+                    side_corr_dbg(&c, 3)
+                );
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    // --- фаза 2: субклеточный спуск паттерн-поиском по ЧИСТОЙ корреляции ---
+    // МЕЛКИЕ шаги (0.25 → 0.05 клетки), по одному углу за раз. После фазы 1 мы в
+    // пределах ~0.5 клетки от истины, а ближайший алиас — на толщине кольца
+    // (~2 клетки), поэтому мелкий спуск в него не свалится и якорь не нужен.
+    // Тот же приём давал субклеточную точность под блюром (пин σ=1 ≤1.4×).
     const ACCEPT_MARGIN: f64 = 5e-4;
-    // паттерн-поиск с уменьшающимся шагом: 0.25 → 0.1 → 0.05 клетки, до 3 свипов.
+    let mut cur = full_corr(&c);
     for &step_cells in &[0.25f64, 0.1, 0.05] {
-        let step = step_cells * cell_px;
+        let st = step_cells * cell_px;
         for _ in 0..3 {
             let mut improved = false;
             for k in 0..4 {
@@ -529,13 +1052,13 @@ fn refine_ring(
                     for &dir in &[1.0f64, -1.0] {
                         let mut trial = c;
                         if axis == 0 {
-                            trial[k].0 += dir * step;
+                            trial[k].0 += dir * st;
                         } else {
-                            trial[k].1 += dir * step;
+                            trial[k].1 += dir * st;
                         }
-                        let s = score(&trial);
-                        if s > best + ACCEPT_MARGIN {
-                            best = s;
+                        let s = full_corr(&trial);
+                        if s > cur + ACCEPT_MARGIN {
+                            cur = s;
                             c = trial;
                             improved = true;
                         }
@@ -547,7 +1070,16 @@ fn refine_ring(
             }
         }
     }
-    c
+    if dbg_on() {
+        std::eprintln!(
+            "[detect] align out: corr {cur:.3} sides [{:.2} {:.2} {:.2} {:.2}]",
+            side_corr_dbg(&c, 0),
+            side_corr_dbg(&c, 1),
+            side_corr_dbg(&c, 2),
+            side_corr_dbg(&c, 3)
+        );
+    }
+    (c, cur)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,10 +1211,7 @@ fn argmax2(t: &[f64; 4]) -> (usize, f64, f64) {
 fn sub(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     (a.0 - b.0, a.1 - b.1)
 }
-#[inline]
-fn add(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    (a.0 + b.0, a.1 + b.1)
-}
+#[cfg(test)]
 #[inline]
 fn scale(a: (f64, f64), s: f64) -> (f64, f64) {
     (a.0 * s, a.1 * s)
@@ -1175,6 +1704,98 @@ mod tests {
             eprintln!("[g] shift ({du},{dv}) recovered err = {err:.4} cells");
             assert!(err < 0.15, "сдвиг ({du},{dv}) восстановлен с ошибкой {err:.4} клетки");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // (i) детекция в ЗАГРОМОЖДЁННОЙ сцене: символ на сером поле с полосами-
+    //     клаттером по краям («титул окна» + «слайвер редактора»). Baseline с
+    //     глобальными экстремумами тянул углы в клаттер (кадр не находился);
+    //     карта активности + связные компоненты изолируют символ рвом серого
+    //     поля. Регресс детектора активности сразу проваливает этот пин.
+    // -----------------------------------------------------------------------
+
+    /// Кладёт drive-RGB `frame` (sz×sz) в серый холст с полем `margin` и рисует
+    /// клаттер: яркий чёрно-белый «титул» вдоль верха и тёмный «редактор» слева.
+    /// Возвращает (холст, W, H, off_x, off_y).
+    fn embed_with_clutter(
+        frame: &[[u8; 3]],
+        sz: usize,
+        margin: usize,
+    ) -> (Vec<[u8; 3]>, usize, usize, usize, usize) {
+        let w = sz + 2 * margin;
+        let h = sz + 2 * margin;
+        let mut buf = vec![[128u8; 3]; w * h]; // серое поле (drive 128)
+        let (ox, oy) = (margin, margin);
+        for y in 0..sz {
+            for x in 0..sz {
+                buf[(oy + y) * w + ox + x] = frame[y * sz + x];
+            }
+        }
+        draw_clutter(&mut buf, w, h);
+        (buf, w, h, ox, oy)
+    }
+
+    /// Рисует по краям холста высококонтрастный клаттер (титул + редактор).
+    fn draw_clutter(buf: &mut [[u8; 3]], w: usize, h: usize) {
+        for y in 0..24 {
+            for x in 0..w {
+                buf[y * w + x] = if (x / 8) % 2 == 0 {
+                    [10, 10, 10]
+                } else {
+                    [245, 245, 245]
+                };
+            }
+        }
+        for y in 0..h {
+            for x in 0..18 {
+                let v = if (y / 6) % 5 == 0 { 200 } else { 25 };
+                buf[y * w + x] = [v, v, v];
+            }
+        }
+    }
+
+    #[test]
+    fn cluttered_scene_detection() {
+        let p = prof(3, ChromaMode::Chroma2, 8, 1);
+        let cells = rand_cells(&p, 0xC1AC_7E11);
+        let frame = render_symbol(&p, &cells);
+        let sz = frame.size_px;
+        let g = gammas(&p);
+        let margin = 96usize;
+        let (buf, w, h, ox, oy) = embed_with_clutter(&frame.rgb, sz, margin);
+        let luma = luma_g(&buf, g[1]);
+
+        let d = detect_symbol(w, h, &luma).expect("детекция символа в клаттере");
+        assert_eq!(d.rotation_quadrants, 0, "поворот в клаттере");
+        // углы должны лечь на символ (внутри поля), не в клаттер по краям.
+        let q = p.quiet_zone_cells() as f64;
+        let cell = p.cell_size_px as f64;
+        let (lo, hi) = (q * cell, (q + G) * cell);
+        let gt = [
+            (ox as f64 + lo, oy as f64 + lo),
+            (ox as f64 + hi, oy as f64 + lo),
+            (ox as f64 + hi, oy as f64 + hi),
+            (ox as f64 + lo, oy as f64 + hi),
+        ];
+        let ce = max_corner_err_cells(&detected_corners(&d), &gt, cell);
+        eprintln!("[i] clutter corner err = {ce:.4} cells, score = {:.4}", d.score);
+        assert!(ce < 0.5, "углы утянуло в клаттер: err {ce:.4} клетки");
+
+        let map = frame_map(&p, &d);
+        let sample = make_sampler(&buf, w, h, g);
+        let got = symbol::demod_symbol(&p, &map, &sample);
+        let s = ser(&got, &cells);
+        eprintln!("[i] clutter SER = {:.4}%", s * 100.0);
+        assert!(s < 0.05, "SER {:.4}% в клаттере велик", s * 100.0);
+
+        // негатив: тот же холст БЕЗ символа (только клаттер + серое поле).
+        let mut empty = vec![[128u8; 3]; w * h];
+        draw_clutter(&mut empty, w, h);
+        let luma_e = luma_g(&empty, g[1]);
+        assert!(
+            detect_symbol(w, h, &luma_e).is_err(),
+            "клаттер без символа принят за кадр"
+        );
     }
 
     // -----------------------------------------------------------------------
