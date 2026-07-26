@@ -482,8 +482,8 @@ code, including two adjacent fully garbled 4-symbol groups.
 | `psicode-core` `fountain` | interim XOR-fountain transport (EXPERIMENTAL, §9.2; ε ≈ 1 %) + CRC-32C; replaced by RaptorQ before freeze | done |
 | `psicode-sim` `transfer` / `modeb` | end-to-end file transfer over the full stack (BENCHMARKS §8); Mode B freeze-gate measurements (RESEARCH §1) | done (workspace: 101 tests) |
 | `psicode-tx` | Windows 11 transmitter (winit 0.30 + softbuffer 0.4): `calibrate` (§4 pattern + animated counter, console profile-code entry), `stream` (fountain §6.1–6.3), `single` | done (workspace: 107 tests) |
-| `psicode-sim` `live` | offline decode of phone photos: first live captures decoded end-to-end (SER ≈ 0.10, see BENCHMARKS §5) | first light 2026-07-26 |
-| next | tilt-robust coarse corners; RaptorQ per RFC 6330; `psicode-rx` (Android); live bring-up §9.2–9.3 | — |
+| `psicode-sim` `live` | offline decode of phone photos: full uncropped frames, tilt-robust (rotating-calipers corners), SER 0.057–0.105 (BENCHMARKS §5) | first light 2026-07-26 |
+| next | RaptorQ per RFC 6330; `psicode-rx` (Android, Camera2 YUV); live bring-up §9.2–9.3 | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |
 

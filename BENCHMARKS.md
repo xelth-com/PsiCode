@@ -133,7 +133,7 @@ condition; includes torn-frame partial decoding (SPEC §6.3) on/off.
 
 | display | camera | mtf_limit_px | torn % | crosstalk R↔G / G↔B (%) | max goodput |
 |---|---|---|---|---|---|
-| 1080p dev display (cell 12 px) | Samsung Galaxy A22 5G, camera-app JPEG | — | — | — | n/a (offline single frame; SER 0.094–0.105) |
+| 1080p dev display (cell 12 px) | Samsung Galaxy A22 5G, camera-app JPEG | — | — | — | n/a (offline single frame; SER 0.057–0.105, BER 0.019–0.035) |
 | | | | | | |
 | | | | | | |
 
@@ -144,10 +144,13 @@ condition; includes torn-frame partial decoding (SPEC §6.3) on/off.
 > counter; 2/3 fully decoded at SER 0.094/0.105 (BER 0.031/0.035). The phone's
 > tone curve was self-calibrated per channel from the reference-strip gray
 > staircase (γ_RGB ≈ 3.8/4.7/5.7 — far from sRGB; assuming γ 2.2 gives SER
-> 0.34). The third frame (~7° in-plane tilt) detects and reads its counter but
-> fine alignment stalls at score 0.76 → SER 0.79: tilt-robust coarse corner
-> extraction is the flagged follow-up. Crops must include the full ring +
-> quiet zone; a window title bar inside the crop breaks the coarse quad.
+> 0.34). Tilt update (same day): rotating-calipers min-area-rect coarse
+> corners (convex hull of the activity component) made the ~7°-tilted frame
+> the BEST decode (SER 0.058, BER 0.019), and **full uncropped 12 Mpx photos
+> now decode end-to-end with no manual framing** (shot1 SER 0.104, shot2
+> 0.057). Remaining edge cases: clutter fused to the symbol across a
+> narrower-than-blur quiet moat, and one busy-frame partial lock — both
+> documented for the Android rx.
 
 ## 6. Goodput vs (luma_bits × chroma) — sim
 

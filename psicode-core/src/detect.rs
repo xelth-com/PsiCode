@@ -28,6 +28,12 @@ const SCORE_MIN: f64 = 0.45;
 /// Минимальный отрыв лучшей ориентации от второй (в единицах score), иначе
 /// ориентация неоднозначна. Real-кадр даёт отрыв ~0.6; импосторы — <0.1.
 const AMBIG_MARGIN: f64 = 0.15;
+/// Порог финального score, при котором ДЕШЁВЫЙ путь возвращает результат сразу,
+/// не запуская дорогой фолбэк (§3.2). Сим-кадры/tight/blur финализируют ~1.0 и
+/// проходят; посредственный лок на наклонённом кропе (score ниже) проваливается
+/// в фолбэк с полным перебором кандидатов. Между 0.45 (SCORE_MIN) и ~0.99
+/// (реальные хорошие кадры) — ни один корректный кейс тестов сюда не попадает.
+const CHEAP_ACCEPT: f64 = 0.85;
 
 /// Результат обнаружения символа на снимке.
 pub struct Detection {
@@ -118,12 +124,18 @@ pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, Dete
     }
     // если дешёвый победитель уверенно прошёл гейт — выравниваем и возвращаем.
     // Сим-кадры и tight1 идут этим путём (фолбэк ниже НЕ запускается -> пины и
-    // их время не трогаются).
+    // их время не трогаются). ВАЖНО: раннее возвращение только при СИЛЬНОМ
+    // выровненном результате (score ≥ CHEAP_ACCEPT). Иначе сырой гейт мог выбрать
+    // НЕ лучший кандидат (на наклонённом кропе один квад алиасит по сырой
+    // корреляции выше верного и, зафиксировавшись, дал бы посредственный лок) —
+    // проваливаемся в фолбэк, который выравнивает ВСЕ кандидаты и берёт лучший.
     if let Some((cc, cr, cs, cm)) = cheap {
         if cs >= SCORE_MIN && cm >= AMBIG_MARGIN {
             let (ac, _corr) = align_ring(luma, w, h, &cc, cr);
             if let Some(d) = finalize_detection(luma, w, h, &ac, cr) {
-                return Ok(d);
+                if d.score >= CHEAP_ACCEPT {
+                    return Ok(d);
+                }
             }
         }
     }
@@ -372,8 +384,19 @@ const ACT_THR_FRAC: f64 = 0.28;
 /// наружу от бокс-размытия (эрозия ≈ на тот же радиус возвращает границу к
 /// внешнему краю кольца).
 const ACT_ERODE_R: usize = 5;
+/// Тяжёлый радиус эрозии (второй уровень). Рвёт ТОЛСТЫЕ мостики активности от
+/// широкого бокового клаттера (панель редактора, титул) к телу символа на
+/// реальных кропах, где лёгкой эрозии не хватает. Символ (плотная сетка)
+/// переживает и её; клаттерный мостик — нет. Кандидаты обоих уровней идут в
+/// гейт совместно, он и арбитрирует (лишние кандидаты безопасны).
+const ACT_ERODE_HEAVY: usize = 9;
 /// Максимум квадов-кандидатов от активной карты (крупнейшие компоненты).
 const ACT_MAX_CANDIDATES: usize = 4;
+/// Сколько лучших компонент берём С КАЖДОГО уровня эрозии. Меньше суммарного
+/// лимита эмиссии, чтобы чистая (но меньшая по площади) компонента символа с
+/// тяжёлого уровня НЕ вытеснялась несколькими крупными загрязнёнными
+/// компонентами лёгкого уровня при глобальном ранжировании.
+const ACT_PER_LEVEL: usize = 2;
 
 /// Кандидаты по КАРТЕ АКТИВНОСТИ: градиентная энергия -> агрегация по блокам ->
 /// бокс-размытие -> порог -> эрозия -> связные компоненты -> ранжирование по
@@ -415,26 +438,92 @@ fn activity_candidates(w: usize, h: usize, luma: &[f32]) -> Vec<[(f64, f64); 4]>
         return Vec::new();
     }
     let mask0: Vec<bool> = blurred.iter().map(|&v| v > thr).collect();
-    let mask = erode(&mask0, bw, bh, ACT_ERODE_R);
 
-    // 4. связные компоненты (4-связность) на сетке блоков.
+    // 4. Компоненты на ДВУХ уровнях эрозии; кандидаты каждого уровня собираем в
+    //    общий список (rank, rect, diag) и глобально ранжируем. Лёгкая эрозия
+    //    (ACT_ERODE_R) держит тонкий ров тихой зоны; тяжёлая (ACT_ERODE_HEAVY)
+    //    рвёт толстые мостики широкого клаттера. Символ выживает на обеих.
+    let mut cand: Vec<(f64, Option<[(f64, f64); 4]>, [(f64, f64); 4])> = Vec::new();
+    for er in [ACT_ERODE_R, ACT_ERODE_HEAVY] {
+        let mask = erode(&mask0, bw, bh, er);
+        activity_components(&mask, bw, bh, &mut cand);
+    }
+    // глобальное ранжирование по площади × плотности × квадратности (desc).
+    cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+
+    // Эмиссия: СНАЧАЛА все min-area rect (tilt-инвариантные — верные углы при
+    // наклоне в плоскости), ПОТОМ диагональные экстремумы (запас, точны при
+    // осевой ориентации). Так на пути сим (осевой) rect ≈ diag ≈ идеал, а
+    // tie-break в detect_symbol отдаёт победу кандидату 0 (полной маске).
+    let mut out: Vec<[(f64, f64); 4]> = Vec::new();
+    let push_valid = |out: &mut Vec<[(f64, f64); 4]>, q: [(f64, f64); 4]| {
+        for m in 0..4 {
+            if norm(sub(q[(m + 1) % 4], q[m])) < 4.0 {
+                return;
+            }
+        }
+        out.push(q);
+    };
+    for c in cand.iter().take(ACT_MAX_CANDIDATES) {
+        if let Some(rect) = c.1 {
+            push_valid(&mut out, rect);
+        }
+    }
+    for c in cand.iter().take(ACT_MAX_CANDIDATES) {
+        push_valid(&mut out, c.2);
+    }
+    if dbg_on() {
+        std::eprintln!(
+            "[detect] активность: блоков {bw}x{bh}, thr {thr:.5}, кандидатов {}, квадов {}",
+            cand.len(),
+            out.len()
+        );
+        for q in &out {
+            std::eprintln!("[detect]   act-quad {q:?}");
+        }
+    }
+    out
+}
+
+/// Извлекает связные компоненты активной маски `mask` (сетка bw×bh, 4-связность),
+/// ранжирует по площади × плотности bbox × квадратности и дописывает в `out`
+/// топ-[`ACT_MAX_CANDIDATES`] компонент как тройки (rank, min-area rect, квад
+/// диагональных экстремумов). Вызывается по одному разу на уровень эрозии.
+fn activity_components(
+    mask: &[bool],
+    bw: usize,
+    bh: usize,
+    out: &mut Vec<(f64, Option<[(f64, f64); 4]>, [(f64, f64); 4])>,
+) {
     struct Comp {
         ext: Extremes,
         imin: usize,
         imax: usize,
         jmin: usize,
         jmax: usize,
+        /// Пер-строчные экстремумы (min i, max i) по каждой строке блоков bj —
+        /// силуэт компоненты. Вершины выпуклой оболочки всегда лежат на строчных
+        /// экстремумах, поэтому этого набора хватает для tilt-инвариантной
+        /// прямоугольной аппроксимации (min-area rect), а стоит он O(число строк).
+        rows: Vec<(usize, usize, usize)>, // (bj, imin, imax)
     }
     let mut visited = vec![false; bw * bh];
     let mut stack: Vec<usize> = Vec::new();
     let mut comps: Vec<Comp> = Vec::new();
     let min_blocks = (bw * bh) / 100;
+    // Пер-строчные экстремумы: переиспользуемые буферы на всю сетку, сбрасываем
+    // только тронутые строки (список touched) — так стоимость O(размер компоненты),
+    // а не O(bw·bh) на каждую компоненту.
+    let mut row_lo = vec![usize::MAX; bh];
+    let mut row_hi = vec![0usize; bh];
+    let mut touched: Vec<usize> = Vec::new();
     for start in 0..bw * bh {
         if !mask[start] || visited[start] {
             continue;
         }
         let mut ext = Extremes::new();
         let (mut imin, mut imax, mut jmin, mut jmax) = (bw, 0usize, bh, 0usize);
+        touched.clear();
         visited[start] = true;
         stack.push(start);
         while let Some(px) = stack.pop() {
@@ -445,6 +534,11 @@ fn activity_candidates(w: usize, h: usize, luma: &[f32]) -> Vec<[(f64, f64); 4]>
             imax = imax.max(i);
             jmin = jmin.min(j);
             jmax = jmax.max(j);
+            if row_lo[j] == usize::MAX {
+                touched.push(j);
+            }
+            row_lo[j] = row_lo[j].min(i);
+            row_hi[j] = row_hi[j].max(i);
             if i > 0 && mask[px - 1] && !visited[px - 1] {
                 visited[px - 1] = true;
                 stack.push(px - 1);
@@ -463,13 +557,24 @@ fn activity_candidates(w: usize, h: usize, luma: &[f32]) -> Vec<[(f64, f64); 4]>
             }
         }
         if ext.count >= min_blocks {
+            let mut rows: Vec<(usize, usize, usize)> = touched
+                .iter()
+                .map(|&bj| (bj, row_lo[bj], row_hi[bj]))
+                .collect();
+            rows.sort_unstable_by_key(|r| r.0);
             comps.push(Comp {
                 ext,
                 imin,
                 imax,
                 jmin,
                 jmax,
+                rows,
             });
+        }
+        // сброс тронутых строк для следующей компоненты (дёшево).
+        for &bj in &touched {
+            row_lo[bj] = usize::MAX;
+            row_hi[bj] = 0;
         }
     }
     // 5. ранжирование: площадь × плотность bbox × квадратность.
@@ -486,38 +591,145 @@ fn activity_candidates(w: usize, h: usize, luma: &[f32]) -> Vec<[(f64, f64); 4]>
         .collect();
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
 
-    let mut out = Vec::new();
     let s = ACT_BLOCK as f64;
-    for &(_, k) in ranked.iter().take(ACT_MAX_CANDIDATES) {
+    for &(rank, k) in ranked.iter().take(ACT_PER_LEVEL) {
+        // (a) min-area прямоугольник по выпуклой оболочке силуэта компоненты
+        //     (rotating calipers). Центры крайних блоков строк -> px.
+        let mut hull_pts: Vec<(f64, f64)> = Vec::with_capacity(2 * comps[k].rows.len());
+        for &(bj, lo, hi) in &comps[k].rows {
+            let y = (bj as f64 + 0.5) * s;
+            hull_pts.push(((lo as f64 + 0.5) * s, y));
+            hull_pts.push(((hi as f64 + 0.5) * s, y));
+        }
+        let rect = min_area_rect(&convex_hull(hull_pts)).map(|r| order_corners(&r));
+        // (b) диагональные экстремумы (внешний край блока) — прежний путь.
         let e = &comps[k].ext;
-        // внешние углы блоков-экстремумов -> px (внешний край блока).
-        let q = [
+        let diag = [
             (e.tl.1 as f64 * s, e.tl.2 as f64 * s),
             ((e.tr.1 as f64 + 1.0) * s, e.tr.2 as f64 * s),
             ((e.br.1 as f64 + 1.0) * s, (e.br.2 as f64 + 1.0) * s),
             (e.bl.1 as f64 * s, (e.bl.2 as f64 + 1.0) * s),
         ];
-        let mut ok = true;
-        for m in 0..4 {
-            if norm(sub(q[(m + 1) % 4], q[m])) < 4.0 {
-                ok = false;
-            }
+        out.push((rank, rect, diag));
+    }
+}
+
+/// Выпуклая оболочка множества точек (монотонная цепочка Эндрю). Возвращает
+/// вершины против часовой стрелки без повтора замыкающей. Точки-дубликаты и
+/// вырожденные (<3 вершин) случаи обрабатываются: вернётся сам вход.
+fn convex_hull(mut pts: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    pts.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal))
+    });
+    pts.dedup();
+    let n = pts.len();
+    if n < 3 {
+        return pts;
+    }
+    // векторное произведение (o->a)×(o->b); >0 — левый поворот.
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    let mut hull: Vec<(f64, f64)> = Vec::with_capacity(2 * n);
+    // нижняя цепочка.
+    for &p in &pts {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
         }
-        if ok {
-            out.push(q);
+        hull.push(p);
+    }
+    // верхняя цепочка.
+    let lower = hull.len() + 1;
+    for &p in pts.iter().rev() {
+        while hull.len() >= lower && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    hull.pop(); // замыкающая точка = стартовая.
+    hull
+}
+
+/// Прямоугольник минимальной площади, охватывающий выпуклую оболочку `hull`
+/// (метод вращающихся штангенциркулей): оптимальный прямоугольник всегда имеет
+/// сторону, коллинеарную ребру оболочки, поэтому перебираем рёбра, проецируем
+/// вершины на ось ребра и его нормаль, берём габаритный прямоугольник, храним
+/// минимальный по площади. Возвращает 4 угла в произвольном (повёрнутом)
+/// порядке; None — вырожденная оболочка. Инвариантен к наклону в плоскости:
+/// углы истинного прямоугольника кольца восстанавливаются без диагонального
+/// смещения (в отличие от экстремумов i±j при наклоне 0<θ<45°).
+fn min_area_rect(hull: &[(f64, f64)]) -> Option<[(f64, f64); 4]> {
+    let n = hull.len();
+    if n < 3 {
+        return None;
+    }
+    let mut best_area = f64::MAX;
+    let mut best = [(0.0f64, 0.0f64); 4];
+    for k in 0..n {
+        let a = hull[k];
+        let b = hull[(k + 1) % n];
+        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+        let len = (ex * ex + ey * ey).sqrt();
+        if len < 1e-9 {
+            continue;
+        }
+        let (ux, uy) = (ex / len, ey / len); // ось ребра
+        // нормаль = (−uy, ux); проекции: du = p·u, dv = p·n.
+        let (mut min_u, mut max_u, mut min_v, mut max_v) =
+            (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for &p in hull {
+            let du = p.0 * ux + p.1 * uy;
+            let dv = -p.0 * uy + p.1 * ux;
+            min_u = min_u.min(du);
+            max_u = max_u.max(du);
+            min_v = min_v.min(dv);
+            max_v = max_v.max(dv);
+        }
+        let area = (max_u - min_u) * (max_v - min_v);
+        if area < best_area {
+            best_area = area;
+            // (u,v) -> (x,y): p = du·u + dv·n = (du·ux − dv·uy, du·uy + dv·ux).
+            let to_xy = |u: f64, v: f64| (u * ux - v * uy, u * uy + v * ux);
+            best = [
+                to_xy(min_u, min_v),
+                to_xy(max_u, min_v),
+                to_xy(max_u, max_v),
+                to_xy(min_u, max_v),
+            ];
         }
     }
-    if dbg_on() {
-        std::eprintln!(
-            "[detect] активность: блоков {bw}x{bh}, thr {thr:.5}, компонент {}, квадов {}",
-            comps.len(),
-            out.len()
-        );
-        for q in &out {
-            std::eprintln!("[detect]   act-quad {q:?}");
+    if best_area == f64::MAX {
+        None
+    } else {
+        Some(best)
+    }
+}
+
+/// Канонизация 4 углов прямоугольника в порядок [tl, tr, br, bl] по часовой:
+/// tl=min(x+y), br=max(x+y), tr=max(x−y), bl=min(x−y). Однозначно для наклона
+/// |θ|<45°; 90°-неоднозначность разрешает гейт ориентации ниже по тракту.
+fn order_corners(c: &[(f64, f64); 4]) -> [(f64, f64); 4] {
+    let mut tl = 0usize;
+    let mut br = 0usize;
+    let mut tr = 0usize;
+    let mut bl = 0usize;
+    for k in 1..4 {
+        if c[k].0 + c[k].1 < c[tl].0 + c[tl].1 {
+            tl = k;
+        }
+        if c[k].0 + c[k].1 > c[br].0 + c[br].1 {
+            br = k;
+        }
+        if c[k].0 - c[k].1 > c[tr].0 - c[tr].1 {
+            tr = k;
+        }
+        if c[k].0 - c[k].1 < c[bl].0 - c[bl].1 {
+            bl = k;
         }
     }
-    out
+    [c[tl], c[tr], c[br], c[bl]]
 }
 
 /// Бокс-размытие 2-D через интегральное изображение (окно (2r+1)²), край — зажим.
@@ -1796,6 +2008,88 @@ mod tests {
             detect_symbol(w, h, &luma_e).is_err(),
             "клаттер без символа принят за кадр"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // (j) НАКЛОН В ПЛОСКОСТИ ~7° + полосы-клаттер: tilt-инвариантная грубая
+    //     детекция (выпуклая оболочка -> min-area rect вращающимися
+    //     штангенциркулями) обязана дать верные углы, где диагональные экстремумы
+    //     i±j смещаются и утапливают выравнивание. Регресс rotating-calipers сразу
+    //     проваливает этот пин: символ повёрнут на 7°, обёрнут клаттером, декод
+    //     должен пройти с SER 0 и ошибкой углов < 0.5 клетки.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn tilted_cluttered_scene_detection() {
+        let p = prof(3, ChromaMode::Chroma2, 8, 1);
+        let cells = rand_cells(&p, 0x7117_ED00);
+        let frame = render_symbol(&p, &cells);
+        let sz = frame.size_px;
+        let g = gammas(&p);
+        let margin = 96usize;
+        let (buf, w, h, ox, oy) = embed_with_clutter(&frame.rgb, sz, margin);
+
+        // поворот всего холста на θ≈7° вокруг центра (аффинное = гомография).
+        let theta = 7.0_f64.to_radians();
+        let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+        let rot = |x: f64, y: f64| -> (f64, f64) {
+            let (dx, dy) = (x - cx, y - cy);
+            (
+                cx + dx * theta.cos() - dy * theta.sin(),
+                cy + dx * theta.sin() + dy * theta.cos(),
+            )
+        };
+        let src4 = [
+            (0.0, 0.0),
+            (w as f64, 0.0),
+            (w as f64, h as f64),
+            (0.0, h as f64),
+        ];
+        let dst4 = [
+            rot(0.0, 0.0),
+            rot(w as f64, 0.0),
+            rot(w as f64, h as f64),
+            rot(0.0, h as f64),
+        ];
+        let inv = homog(&dst4, &src4); // warped-px -> исходный холст
+
+        // warped-холст обратной билинейной выборкой.
+        let mut warped = vec![[0u8; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (u, v) = apply_h(&inv, x as f64 + 0.5, y as f64 + 0.5);
+                let d = bilin_rgb(&buf, w, h, u, v);
+                warped[y * w + x] = [d[0].round() as u8, d[1].round() as u8, d[2].round() as u8];
+            }
+        }
+
+        let luma = luma_g(&warped, g[1]);
+        let d = detect_symbol(w, h, &luma).expect("детекция наклонённого символа в клаттере");
+        assert_eq!(d.rotation_quadrants, 0, "поворот при наклоне 7°");
+
+        // ground-truth углы: осевые углы символа на холсте, повёрнутые на θ.
+        let q = p.quiet_zone_cells() as f64;
+        let cell = p.cell_size_px as f64;
+        let (glo, ghi) = (q * cell, (q + G) * cell);
+        let axis = [
+            (ox as f64 + glo, oy as f64 + glo),
+            (ox as f64 + ghi, oy as f64 + glo),
+            (ox as f64 + ghi, oy as f64 + ghi),
+            (ox as f64 + glo, oy as f64 + ghi),
+        ];
+        let mut gt = [(0.0, 0.0); 4];
+        for k in 0..4 {
+            gt[k] = rot(axis[k].0, axis[k].1);
+        }
+        let ce = max_corner_err_cells(&detected_corners(&d), &gt, cell);
+        eprintln!("[j] tilt 7° corner err = {ce:.4} cells, score = {:.4}", d.score);
+        assert!(ce < 0.5, "наклон 7°: ошибка углов {ce:.4} клетки >= 0.5");
+
+        let map = frame_map(&p, &d);
+        let sample = make_sampler(&warped, w, h, g);
+        let got = symbol::demod_symbol(&p, &map, &sample);
+        let s = ser(&got, &cells);
+        eprintln!("[j] tilt 7° SER = {:.4}%", s * 100.0);
+        assert_eq!(s, 0.0, "SER != 0 при наклоне 7° (геометрия неточна)");
     }
 
     // -----------------------------------------------------------------------
