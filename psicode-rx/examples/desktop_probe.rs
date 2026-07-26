@@ -67,8 +67,28 @@ fn rgb_to_yuv420(w: usize, h: usize, rgb: &[[u8; 3]]) -> (Vec<u8>, Vec<u8>, Vec<
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).expect("usage: desktop_probe <file.ppm> [cell]");
+    let path = args.get(1).expect("usage: desktop_probe <file.ppm|dump-prefix> [cell]");
     let cell: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12);
+    // режим YUV-дампов: префиксы через запятую -> одна сессия, кадры по очереди
+    if !path.ends_with(".ppm") {
+        let mut p = tx_default_profile();
+        p.cell_size_px = cell;
+        let mut s = RxSession::new(p);
+        for prefix in path.split(',') {
+            let meta = std::fs::read_to_string(format!("{prefix}.meta")).expect("meta");
+            let m: Vec<usize> = meta.split_whitespace().map(|t| t.parse().unwrap()).collect();
+            let (w, h, ys, uvs, uvp) = (m[0], m[1], m[2], m[3], m[4]);
+            let y = std::fs::read(format!("{prefix}.y")).unwrap();
+            let u = std::fs::read(format!("{prefix}.u")).unwrap();
+            let v = std::fs::read(format!("{prefix}.v")).unwrap();
+            for i in 0..2 {
+                let t0 = std::time::Instant::now();
+                let st = s.process_frame_yuv(&y, &u, &v, w, h, ys, uvs, uvp);
+                println!("  [{prefix} #{i}] {:.0}ms {}", t0.elapsed().as_secs_f64()*1000.0, st.to_json());
+            }
+        }
+        return;
+    }
     let (w, h, rgb) = read_ppm(path);
     println!("probe: {path} ({w}x{h}), cell {cell}");
     let (y, u, v) = rgb_to_yuv420(w, h, &rgb);

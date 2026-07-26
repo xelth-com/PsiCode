@@ -133,7 +133,7 @@ condition; includes torn-frame partial decoding (SPEC §6.3) on/off.
 
 | display | camera | mtf_limit_px | torn % | crosstalk R↔G / G↔B (%) | max goodput |
 |---|---|---|---|---|---|
-| 1080p dev display (cell 12 px) | Samsung Galaxy A22 5G, camera-app JPEG | — | — | — | n/a (offline single frame; SER 0.057–0.105, BER 0.019–0.035) |
+| 1080p dev display (cell 12 px) | Samsung Galaxy A22 5G, live Camera2 YUV | — | — | — | **first live file transfer 2026-07-26: 25 007 B byte-exact (SHA256 verified), ~2.5 kbit/s effective** (1 bpc, hold 16, stripes 8/8 on clean captures) |
 | | | | | | |
 | | | | | | |
 

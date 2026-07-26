@@ -87,7 +87,7 @@ pub fn reference_profile() -> CalibProfile {
     CalibProfile {
         version: CalibProfile::VERSION,
         cell_size_px: 16,
-        frame_hold_periods: 6,
+        frame_hold_periods: 16, // live v0: длинный hold против ISP-смешивания (~84% чистых захватов)
         // v0 live: 1 бит/клетку — живой канал даёт эффективный блюр ~σ2,
         // BENCHMARKS §6 для него предписывает luma1+Mono (SER 0 в симе).
         luma_bits: 1,

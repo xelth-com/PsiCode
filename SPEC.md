@@ -490,7 +490,8 @@ code, including two adjacent fully garbled 4-symbol groups.
 | `psicode-sim` `transfer` / `modeb` | end-to-end file transfer over the full stack (BENCHMARKS §8); Mode B freeze-gate measurements (RESEARCH §1) | done (workspace: 101 tests) |
 | `psicode-tx` | Windows 11 transmitter (winit 0.30 + softbuffer 0.4): `calibrate` (§4 pattern + animated counter, console profile-code entry), `stream` (fountain §6.1–6.3), `single` | done (workspace: 107 tests) |
 | `psicode-sim` `live` | offline decode of phone photos: full uncropped frames, tilt-robust (rotating-calipers corners), SER 0.057–0.105 (BENCHMARKS §5) | first light 2026-07-26 |
-| next | RaptorQ per RFC 6330; `psicode-rx` (Android, Camera2 YUV); live bring-up §9.2–9.3 | — |
+| `psicode-rx` + `psicode-android` | Android receiver: Camera2 (pinned exposure ≈ 1 refresh, decoder-guided focus sweep, ISP filters off), acquire/track detection, local-threshold demod, live L3+fountain | **first live file transfer 2026-07-26 (byte-exact, CRC-32C + SHA256)** |
+| next | RaptorQ per RFC 6330; §3.2 border v0.2 (drop inner-ring inversion + Gaussian corner beacons — sim-validated); telemetry to xelth.com; live device matrix §9.3 | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |
 

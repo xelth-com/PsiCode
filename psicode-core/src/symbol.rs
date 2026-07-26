@@ -233,6 +233,103 @@ pub fn demod_symbol(
     out
 }
 
+/// [LIVE] Радиус тонкого окна локального порога (клетки): 1 = 3×3, масштаб
+/// эффективного блюра камеры/ISI при ~13 px/клетку.
+const LOCAL_FINE_RADIUS: i32 = 1;
+/// [LIVE] Радиус грубого окна локального порога (клетки): плавный фон освещения
+/// (виньетка/блик). 12 = окно 25×25 клеток.
+const LOCAL_COARSE_RADIUS: i32 = 12;
+/// [LIVE] Вес грубого члена двухмасштабного порога: порог эквивалентен
+/// (mean_fine + A·mean_coarse)/(1+A). Подобран на живых дампах телефона (широкий
+/// оптимум A∈[0.4,0.5], K∈[10,14]).
+const LOCAL_COARSE_WEIGHT: f64 = 0.5;
+
+/// [LIVE] Адаптивная демодуляция 1-битной яркостной сетки (Mono/GreenOnly с
+/// luma_bits=1, chroma_bits=0) для РЕАЛЬНОЙ камеры. Заменяет ГЛОБАЛЬНЫЙ порог
+/// (MID/якоря референсной строки §3.4) на ЛОКАЛЬНЫЙ ДВУХМАСШТАБНЫЙ порог по
+/// яркости клеток: тонкое окно 3×3 снимает блюр и локальный наклон, грубое окно
+/// радиуса `LOCAL_COARSE_RADIUS` оценивает плавный фон (виньетку/блик) и снимает
+/// неоднозначность в локально-однородных блоках. Решение: белая, если
+/// `(g − mean_fine) + A·(g − mean_coarse) > 0`.
+///
+/// Мотивация: на живых снимках телефона фон яркости гуляет 0.62..0.86 по кадру
+/// (центральный блик + угловая виньетка), и глобальный порог демодулятора даёт
+/// SER ≈ 0.13; локальный двухмасштабный порог — SER ≈ 0.0004 на тех же дампах.
+///
+/// Для не-1-битных или хромо-режимов делегирует в [`demod_symbol`] (двухуровневый
+/// порог неприменим к многоуровневой яркости/хроме). Соглашения `map`/`sample` —
+/// как у [`demod_symbol`]; порог монотонен, поэтому годится и сырой, и
+/// линеаризованный зелёный канал `sample`.
+pub fn demod_symbol_local(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+) -> Vec<u8> {
+    // Локальный порог определён только для двоичной яркости без хромы.
+    if p.luma_bits != 1 || p.chroma_bits() != 0 {
+        return demod_symbol(p, map, sample);
+    }
+    let quiet = p.quiet_zone_cells() as usize;
+    let cell = p.cell_size_px as usize;
+    let ii = INTERIOR;
+    // сетка зелёного по всей внутренней области (реф-строка ir=0, payload
+    // ir=1..=PAYLOAD_ROWS, строка счётчика ir=INTERIOR−1) — краевым payload-
+    // клеткам нужен контекст соседей за пределами payload.
+    let mut g = vec![0.0f64; ii * ii];
+    for ir in 0..ii {
+        for ic in 0..ii {
+            let s = sample_cell(quiet, cell, RING + ic, RING + ir, map, sample);
+            g[ir * ii + ic] = s[1]; // Mono: R=G=B, зелёный ~ яркость
+        }
+    }
+    // предвычисляем среднее по двум окнам (интегральное изображение, O(1)/клетку).
+    let mfine = box_mean(&g, ii, LOCAL_FINE_RADIUS);
+    let mcoarse = box_mean(&g, ii, LOCAL_COARSE_RADIUS);
+    let aw = LOCAL_COARSE_WEIGHT;
+    let mut out = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+    for pr in 0..PAYLOAD_ROWS {
+        let ir = pr + 1; // payload под референсной строкой
+        for pc in 0..PAYLOAD_COLS {
+            let idx = ir * ii + pc;
+            let gc = g[idx];
+            let score = (gc - mfine[idx]) + aw * (gc - mcoarse[idx]);
+            out[pr * PAYLOAD_COLS + pc] = (score > 0.0) as u8;
+        }
+    }
+    out
+}
+
+/// Среднее по квадратному окну радиуса `rad` (клампованные края) через
+/// интегральное изображение: O(n) вместо O(n·окно). `n` — сторона сетки.
+fn box_mean(src: &[f64], n: usize, rad: i32) -> Vec<f64> {
+    // sat[(r)(n+1)+(c)] = сумма src[0..r][0..c] (с нулевой окантовкой сверху/слева).
+    let mut sat = vec![0.0f64; (n + 1) * (n + 1)];
+    for r in 0..n {
+        let mut row = 0.0;
+        for c in 0..n {
+            row += src[r * n + c];
+            sat[(r + 1) * (n + 1) + (c + 1)] = sat[r * (n + 1) + (c + 1)] + row;
+        }
+    }
+    let area = |r0: usize, c0: usize, r1: usize, c1: usize| -> f64 {
+        // сумма по [r0,r1)×[c0,c1)
+        sat[r1 * (n + 1) + c1] - sat[r0 * (n + 1) + c1] - sat[r1 * (n + 1) + c0]
+            + sat[r0 * (n + 1) + c0]
+    };
+    let mut out = vec![0.0f64; n * n];
+    for r in 0..n {
+        let r0 = (r as i32 - rad).max(0) as usize;
+        let r1 = (r as i32 + rad + 1).min(n as i32) as usize;
+        for c in 0..n {
+            let c0 = (c as i32 - rad).max(0) as usize;
+            let c1 = (c as i32 + rad + 1).min(n as i32) as usize;
+            let cnt = ((r1 - r0) * (c1 - c0)) as f64;
+            out[r * n + c] = area(r0, c0, r1, c1) / cnt;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Внутренние помощники
 // ---------------------------------------------------------------------------
@@ -727,5 +824,75 @@ mod tests {
                 assert_roundtrip(&p, 0.8, 0.05, 0xC0FF_EE00_1234_5678 ^ cell as u64);
             }
         }
+    }
+
+    /// [LIVE] demod_symbol_local на ЧИСТОМ идеальном канале (1 бит, Mono) обязан
+    /// давать SER 0: локальный порог самокалибруется, а грубое окно 25×25 на
+    /// случайной сетке не бывает одноцветным -> нет неоднозначных клеток. Это
+    /// условие безопасно для e2e-теста приёмника (точный демод чистого кадра).
+    #[test]
+    fn local_demod_exact_on_clean_1bpc() {
+        let p = prof(1, ChromaMode::Mono, 16, 0);
+        let mut rng = XorShift64(0xA5A5_1234_DEAD_BEEF);
+        let cells: Vec<u8> = (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+            .map(|_| (rng.next() & 1) as u8)
+            .collect();
+        let frame = render_symbol(&p, &cells);
+        let size = frame.size_px;
+        let rgb = frame.rgb.clone();
+        let gg = p.gamma_g() as f64;
+        let sample = move |x: f64, y: f64| -> [f32; 3] {
+            let xi = (x.max(0.0) as usize).min(size - 1);
+            let yi = (y.max(0.0) as usize).min(size - 1);
+            let d = rgb[yi * size + xi];
+            let f = |c: u8| (c as f64 / 255.0).powf(gg) as f32;
+            [f(d[0]), f(d[1]), f(d[2])]
+        };
+        let map = |u: f64, v: f64| (u, v);
+        let got = demod_symbol_local(&p, &map, &sample);
+        let errors = got.iter().zip(&cells).filter(|(a, b)| a != b).count();
+        assert_eq!(errors, 0, "локальный демод не точен на чистом канале: {errors}");
+    }
+
+    /// [LIVE] Под сильным ПРОСТРАНСТВЕННЫМ фоном (аддитивный градиент «блика»,
+    /// растущий сверху вниз) глобальный порог демодулятора, калиброванный по
+    /// верхней референсной строке, разваливается на нижних рядах, а локальный
+    /// двухмасштабный порог его отслеживает. Проверяем сам МЕХАНИЗМ выигрыша.
+    #[test]
+    fn local_demod_survives_illumination_gradient() {
+        let p = prof(1, ChromaMode::Mono, 16, 0);
+        let mut rng = XorShift64(0x1357_9BDF_2468_ACE0);
+        let cells: Vec<u8> = (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+            .map(|_| (rng.next() & 1) as u8)
+            .collect();
+        let frame = render_symbol(&p, &cells);
+        let size = frame.size_px;
+        let rgb = frame.rgb.clone();
+        let gg = p.gamma_g() as f64;
+        // сенсор: идеальная гамма + аддитивный «блик», линейно растущий вниз
+        // (0 сверху -> +0.5 снизу). Смещение поднимает пол яркости так, что
+        // нижний ЧЁРНЫЙ по сырому сигналу перекрывает верхний уровень порога.
+        let sample = move |x: f64, y: f64| -> [f32; 3] {
+            let xi = (x.max(0.0) as usize).min(size - 1);
+            let yi = (y.max(0.0) as usize).min(size - 1);
+            let glare = 0.5 * (yi as f64 / size as f64);
+            let d = rgb[yi * size + xi];
+            let f = |c: u8| ((c as f64 / 255.0).powf(gg) + glare).clamp(0.0, 1.5) as f32;
+            [f(d[0]), f(d[1]), f(d[2])]
+        };
+        let map = |u: f64, v: f64| (u, v);
+        let n = (PAYLOAD_COLS * PAYLOAD_ROWS) as f64;
+        let g_glob = demod_symbol(&p, &map, &sample);
+        let g_loc = demod_symbol_local(&p, &map, &sample);
+        let e_glob = g_glob.iter().zip(&cells).filter(|(a, b)| a != b).count() as f64 / n;
+        let e_loc = g_loc.iter().zip(&cells).filter(|(a, b)| a != b).count() as f64 / n;
+        assert!(
+            e_glob > 0.08,
+            "тест некорректен: глобальный порог должен разваливаться (SER {e_glob:.4})"
+        );
+        assert!(
+            e_loc < 0.02,
+            "локальный порог не удержал градиент: SER {e_loc:.4} (глоб {e_glob:.4})"
+        );
     }
 }

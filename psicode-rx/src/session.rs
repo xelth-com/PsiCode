@@ -24,14 +24,28 @@ use std::collections::HashMap;
 use psicode_core::detect::{detect_symbol_acquire, frame_map, track_symbol, Detection};
 use psicode_core::fountain::FountainDecoder;
 use psicode_core::l3::{self, FrameHeader, ParsedFrame};
-use psicode_core::symbol::{self, demod_symbol, read_counters};
+use psicode_core::symbol::{self, demod_symbol, demod_symbol_local, read_counters};
 use psicode_core::tone;
 use psicode_core::{CalibProfile, ChromaMode};
 
 use crate::yuv::YuvFrame;
 
-/// Размер encoding-символа (байт) — зеркалит transfer.rs (§6.2 раскладка).
-const SYMBOL_SIZE: usize = 140;
+/// Отладка приёмного тракта (переменная окружения PSICODE_RX_DEBUG).
+fn rx_dbg() -> bool {
+    std::env::var_os("PSICODE_RX_DEBUG").is_some()
+}
+
+/// Размер encoding-символа как в psicode-tx: (ёмкость кадра − заголовок 12 −
+/// TransferInfo 14) / 8. Зависит от bits_per_cell профиля (3bpc -> 141,
+/// 1bpc -> 42). ВНИМАНИЕ: psicode-sim/transfer.rs исторически использует 140 —
+/// сим самосогласован, а живой тракт обязан совпадать с psicode-tx.
+fn symbol_size_for(bpc: u32) -> usize {
+    let cap: usize = l3::STRIPE_ROWS
+        .iter()
+        .map(|&r| (r * l3::PAYLOAD_COLS * bpc as usize - 16) / 8)
+        .sum();
+    (cap - l3::FRAME_HEADER_LEN - l3::TRANSFER_INFO_LEN) / SYMBOLS_PER_FRAME
+}
 /// Число символов в кадре (фиксировано — упрощает разметку ESI и §6.3).
 const SYMBOLS_PER_FRAME: usize = 8;
 /// Вплетать repair после каждых 4 source (§6.1, fec_overhead=2).
@@ -340,7 +354,16 @@ impl RxSession {
         };
 
         // --- демод + разбор L3 ---
-        let cells_rx = demod_symbol(&self.profile, &map, &lin_sample);
+        // 1-битная яркость (Mono/GreenOnly): ЛОКАЛЬНЫЙ двухмасштабный порог
+        // (symbol::demod_symbol_local) — на живом телефоне SER 0.13 -> ~0.0004
+        // против глобального порога, т.к. фон яркости гуляет 0.62..0.86 по кадру.
+        // Порог монотонен -> берём СЫРОЙ зелёный (raw_sample), гамма не нужна.
+        // Прочие режимы (многоуровневая яркость/хрома) — прежний demod_symbol.
+        let cells_rx = if self.profile.luma_bits == 1 && self.profile.chroma_bits() == 0 {
+            demod_symbol_local(&self.profile, &map, &raw_sample)
+        } else {
+            demod_symbol(&self.profile, &map, &lin_sample)
+        };
         let parsed = l3::parse_frame(&cells_rx, self.bpc);
         let (c_start, c_end) = read_counters(&self.profile, &map, &lin_sample);
         let stripes_ok = parsed.stripes_ok.iter().filter(|&&ok| ok).count() as u8;
@@ -358,6 +381,7 @@ impl RxSession {
                     }
                 }
                 if self.decoder.is_some() {
+                    self.ensure_emit_covers(hdr.esi);
                     let (_, useful) = self.feed_frame(&parsed, &hdr, c_start, c_end);
                     symbols_new = useful;
                     self.try_complete();
@@ -380,6 +404,30 @@ impl RxSession {
             symbols_have: have,
             done: self.state == RxState::Done,
             crc_ok: self.state == RxState::Done,
+        }
+    }
+
+    /// Дорастить разметку ESI до `esi` (§6.1): tx крутится бесконечно, и после
+    /// систематической фазы поток — чистый repair с инкрементом ESI, поэтому
+    /// продолжение таблицы тривиально. Без этого приёмник, подключившийся к
+    /// давно идущей передаче, молча выбрасывал КАЖДЫЙ кадр (esi за горизонтом).
+    fn ensure_emit_covers(&mut self, esi: u32) {
+        if self.k == 0 || esi < self.k || self.pos.contains_key(&esi) {
+            return;
+        }
+        let mut last = match self.emit.last() {
+            Some(&e) => e,
+            None => return,
+        };
+        if last < self.k {
+            return; // хвост ещё в систематической фазе — esi не отсюда
+        }
+        let target = esi.saturating_add(SYMBOLS_PER_FRAME as u32 * 64);
+        while last < target {
+            last += 1;
+            self.emit.push(last);
+            let i = self.emit.len() - 1;
+            self.pos.entry(last).or_insert(i);
         }
     }
 
@@ -410,6 +458,7 @@ impl RxSession {
         c_end: u8,
     ) -> (usize, usize) {
         // разъединяем заимствования полей self (decoder mut, emit/pos/cum immut).
+        let symbol_size = symbol_size_for(self.bpc);
         let RxSession {
             decoder,
             emit,
@@ -421,7 +470,7 @@ impl RxSession {
             Some(d) => d,
             None => return (0, 0),
         };
-        process_frame(decoder, emit, pos, parsed, hdr, c_start, c_end, cum)
+        process_frame(decoder, emit, pos, parsed, hdr, c_start, c_end, cum, symbol_size)
     }
 
     /// Попытка завершить сборку; при успехе фиксирует результат и Done.
@@ -529,6 +578,7 @@ fn recover_and_feed(
     emit: &[u32],
     j0: usize,
     header_len: usize,
+    symbol_size: usize,
     stripe_data: &[Option<Vec<u8>>; 8],
     include: &[bool; 8],
     cum: &[usize; 9],
@@ -550,11 +600,16 @@ fn recover_and_feed(
         }
     }
     let (mut recv, mut useful) = (0usize, 0usize);
+    let mut cov_dbg = String::new();
     for kk in 0..SYMBOLS_PER_FRAME {
-        let s = header_len + kk * SYMBOL_SIZE;
-        let e = s + SYMBOL_SIZE;
+        let s = header_len + kk * symbol_size;
+        let e = s + symbol_size;
         if e > total {
             break;
+        }
+        if rx_dbg() {
+            let cov = known[s..e].iter().filter(|&&x| x).count();
+            cov_dbg.push_str(&format!(" s{kk}:{cov}/{symbol_size}"));
         }
         if known[s..e].iter().all(|&x| x) {
             let ei = j0 + kk;
@@ -565,6 +620,9 @@ fn recover_and_feed(
                 }
             }
         }
+    }
+    if rx_dbg() {
+        std::eprintln!("[rx] recover j0={j0} hlen={header_len}:{cov_dbg} -> recv {recv} useful {useful}");
     }
     (recv, useful)
 }
@@ -581,6 +639,7 @@ fn process_frame(
     c_start: u8,
     c_end: u8,
     cum: &[usize; 9],
+    symbol_size: usize,
 ) -> (usize, usize) {
     // индекс кадра N из заголовка (emit[seq·8] уникален -> позиция = seq·8).
     let j0 = match pos.get(&h.esi) {
@@ -613,7 +672,7 @@ fn process_frame(
     let (mut recv, mut useful) = (0usize, 0usize);
     if c_start == exp_clean && c_end == exp_clean {
         // не рвано: все CRC-валидные страйпы принадлежат кадру N.
-        let (r, u) = recover_and_feed(decoder, emit, j0, hlen_n, &stripe_data, &valid, cum);
+        let (r, u) = recover_and_feed(decoder, emit, j0, hlen_n, symbol_size, &stripe_data, &valid, cum);
         recv += r;
         useful += u;
     } else if c_start == exp_torn && c_end == exp_torn {
@@ -626,7 +685,7 @@ fn process_frame(
         for b in inc_top.iter_mut().take(top_end) {
             *b = true;
         }
-        let (r, u) = recover_and_feed(decoder, emit, j0, hlen_n, &stripe_data, &inc_top, cum);
+        let (r, u) = recover_and_feed(decoder, emit, j0, hlen_n, symbol_size, &stripe_data, &inc_top, cum);
         recv += r;
         useful += u;
 
@@ -647,7 +706,7 @@ fn process_frame(
                     *b = true;
                 }
                 let (r, u) =
-                    recover_and_feed(decoder, emit, j0_np1, hlen_np1, &stripe_data, &inc_bot, cum);
+                    recover_and_feed(decoder, emit, j0_np1, hlen_np1, symbol_size, &stripe_data, &inc_bot, cum);
                 recv += r;
                 useful += u;
             }
@@ -662,7 +721,7 @@ fn process_frame(
         for b in inc_top.iter_mut().take(top_end) {
             *b = true;
         }
-        let (r, u) = recover_and_feed(decoder, emit, j0, hlen_n, &stripe_data, &inc_top, cum);
+        let (r, u) = recover_and_feed(decoder, emit, j0, hlen_n, symbol_size, &stripe_data, &inc_top, cum);
         recv += r;
         useful += u;
     }

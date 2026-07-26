@@ -188,6 +188,182 @@ fn main() {
             println!("  страйп {si}: {sw} из {} (SER {:.3})", rh * 57, sw as f64 / (rh * 57) as f64);
             r0 += rh;
         }
+
+        // =====================================================================
+        // ЭКСПЕРИМЕНТ: пороговая демодуляция по зелёному/яркости (1 бит/клетка).
+        // Для Mono решение = зелёный клетки против порога. Базовый demod берёт
+        // ГЛОБАЛЬНЫЙ порог из K/W якорей референсной строки; здесь пробуем
+        // ЛОКАЛЬНЫЙ порог (среднее/медиана соседних клеток) — payload DC-баланс.
+        // =====================================================================
+        let quiet = p.quiet_zone_cells() as usize;
+        let cellpx = p.cell_size_px as usize;
+        let ii = symbol::INTERIOR; // 57
+        let pc_n = symbol::PAYLOAD_COLS; // 57
+        let pr_n = symbol::PAYLOAD_ROWS; // 55
+
+        // сэмпл канала ch клетки (cx,cy) в GRID-координатах: среднее 2x2 ±cell/4.
+        let samp = |cx: usize, cy: usize, src: &dyn Fn(f64, f64) -> [f32; 3], ch: usize| -> f64 {
+            let u = ((quiet + cx) * cellpx) as f64 + cellpx as f64 / 2.0;
+            let v = ((quiet + cy) * cellpx) as f64 + cellpx as f64 / 2.0;
+            let d = cellpx as f64 / 4.0;
+            let mut acc = 0.0;
+            for &(sx, sy) in &[(-d, -d), (-d, d), (d, -d), (d, d)] {
+                let (x, y) = map(u + sx, v + sy);
+                acc += src(x, y)[ch] as f64;
+            }
+            acc / 4.0
+        };
+        // билинейная выборка яркости Y (все 3 канала = Y, чтобы переиспользовать samp).
+        let luma_at = |x: f64, y: f64| -> [f32; 3] {
+            let xc = x.clamp(0.0, (w - 1) as f64);
+            let yc = y.clamp(0.0, (h - 1) as f64);
+            let (x0, y0) = (xc.floor() as usize, yc.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+            let (fx, fy) = ((xc - x0 as f64) as f32, (yc - y0 as f64) as f32);
+            let a = luma[y0 * w + x0] * (1.0 - fx) + luma[y0 * w + x1] * fx;
+            let b = luma[y1 * w + x0] * (1.0 - fx) + luma[y1 * w + x1] * fx;
+            let vv = a * (1.0 - fy) + b * fy;
+            [vv, vv, vv]
+        };
+        // сетки зелёного(raw) и яркости(Y) по внутренней области 57x57.
+        let mut grn = vec![0.0f64; ii * ii];
+        let mut lum = vec![0.0f64; ii * ii];
+        for ir in 0..ii {
+            for ic in 0..ii {
+                grn[ir * ii + ic] = samp(symbol::RING + ic, symbol::RING + ir, &raw, 1);
+                lum[ir * ii + ic] = samp(symbol::RING + ic, symbol::RING + ir, &luma_at, 1);
+            }
+        }
+
+        // SER локального порога радиуса rad (окно (2rad+1)^2 клеток).
+        let local_ser = |grid: &[f64], rad: i32| -> f64 {
+            let mut wrong = 0usize;
+            for pr in 0..pr_n {
+                for pc in 0..pc_n {
+                    let ir = (pr + 1) as i32;
+                    let ic = pc as i32;
+                    let mut sum = 0.0;
+                    let mut cnt = 0.0;
+                    for dr in -rad..=rad {
+                        for dc in -rad..=rad {
+                            let (r, c) = (ir + dr, ic + dc);
+                            if r >= 0 && r < ii as i32 && c >= 0 && c < ii as i32 {
+                                sum += grid[r as usize * ii + c as usize];
+                                cnt += 1.0;
+                            }
+                        }
+                    }
+                    let thr = sum / cnt;
+                    let pred = (grid[ir as usize * ii + ic as usize] > thr) as u8;
+                    if pred != truth[pr * pc_n + pc] {
+                        wrong += 1;
+                    }
+                }
+            }
+            wrong as f64 / (pr_n * pc_n) as f64
+        };
+        // локальная МЕДИАНА окна как порог (устойчивее к однородным блокам).
+        let local_ser_med = |grid: &[f64], rad: i32| -> f64 {
+            let mut wrong = 0usize;
+            let mut buf: Vec<f64> = Vec::new();
+            for pr in 0..pr_n {
+                for pc in 0..pc_n {
+                    let ir = (pr + 1) as i32;
+                    let ic = pc as i32;
+                    buf.clear();
+                    for dr in -rad..=rad {
+                        for dc in -rad..=rad {
+                            let (r, c) = (ir + dr, ic + dc);
+                            if r >= 0 && r < ii as i32 && c >= 0 && c < ii as i32 {
+                                buf.push(grid[r as usize * ii + c as usize]);
+                            }
+                        }
+                    }
+                    buf.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let thr = buf[buf.len() / 2];
+                    let pred = (grid[ir as usize * ii + ic as usize] > thr) as u8;
+                    if pred != truth[pr * pc_n + pc] {
+                        wrong += 1;
+                    }
+                }
+            }
+            wrong as f64 / (pr_n * pc_n) as f64
+        };
+        println!("  --- ЛОКАЛЬНОЕ СРЕДНЕЕ (зелёный raw / яркость Y) ---");
+        for &rad in &[1, 2, 3, 4, 6, 28] {
+            println!(
+                "    mean rad {:2}: G {:.4}  Y {:.4}",
+                rad,
+                local_ser(&grn, rad),
+                local_ser(&lum, rad)
+            );
+        }
+        println!("  --- ЛОКАЛЬНАЯ МЕДИАНА ---");
+        for &rad in &[2, 3, 4, 6] {
+            println!(
+                "    med  rad {:2}: G {:.4}  Y {:.4}",
+                rad,
+                local_ser_med(&grn, rad),
+                local_ser_med(&lum, rad)
+            );
+        }
+        // ПРОДАКШН: двухмасштабный локальный порог из core (symbol::demod_symbol_local).
+        let got_loc = symbol::demod_symbol_local(&p, &map, &raw);
+        let wrong_loc = got_loc.iter().zip(&truth).filter(|(a, b)| a != b).count();
+        println!(
+            "  *** demod_symbol_local: SER {:.4} ({} / {})",
+            wrong_loc as f64 / n as f64,
+            wrong_loc,
+            n
+        );
+        {
+            let rows = [7usize, 7, 7, 7, 7, 7, 7, 6];
+            let mut r0 = 0usize;
+            for (si, &rh) in rows.iter().enumerate() {
+                let mut sw = 0usize;
+                for r in r0..r0 + rh {
+                    for c in 0..57 {
+                        if got_loc[r * 57 + c] != truth[r * 57 + c] {
+                            sw += 1;
+                        }
+                    }
+                }
+                println!("      L-страйп {si}: {sw}/{}  SER {:.3}", rh * 57, sw as f64 / (rh * 57) as f64);
+                r0 += rh;
+            }
+        }
+
+        // дамп сеток для визуализации/голосования питоном (ключ = basename префикса).
+        if std::env::var("PSI_DUMP").is_ok() {
+            use std::io::Write;
+            let bn = std::path::Path::new(prefix)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("dump");
+            let out = format!("C:/Users/Dmytro/AppData/Local/Temp/claude/C--Users-Dmytro-psicode/05d92c67-463a-48df-929c-278fa3508f02/scratchpad/live/exp_grids_{bn}.txt");
+            let mut f = std::fs::File::create(&out).unwrap();
+            writeln!(f, "GREEN {ii} {ii}").unwrap();
+            for ir in 0..ii {
+                let row: Vec<String> = (0..ii).map(|ic| format!("{:.5}", grn[ir * ii + ic])).collect();
+                writeln!(f, "{}", row.join(" ")).unwrap();
+            }
+            writeln!(f, "LUMA {ii} {ii}").unwrap();
+            for ir in 0..ii {
+                let row: Vec<String> = (0..ii).map(|ic| format!("{:.5}", lum[ir * ii + ic])).collect();
+                writeln!(f, "{}", row.join(" ")).unwrap();
+            }
+            writeln!(f, "TRUTH {pr_n} {pc_n}").unwrap();
+            for pr in 0..pr_n {
+                let row: Vec<String> = (0..pc_n).map(|pc| truth[pr * pc_n + pc].to_string()).collect();
+                writeln!(f, "{}", row.join(" ")).unwrap();
+            }
+            writeln!(f, "BASEPRED {pr_n} {pc_n}").unwrap();
+            for pr in 0..pr_n {
+                let row: Vec<String> = (0..pc_n).map(|pc| got[pr * pc_n + pc].to_string()).collect();
+                writeln!(f, "{}", row.join(" ")).unwrap();
+            }
+            println!("  дамп сеток -> {out}");
+        }
         return;
     }
 

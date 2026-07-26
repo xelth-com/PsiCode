@@ -127,7 +127,9 @@ fn splitmix(state: &mut u64) -> u64 {
 // tx-сторона фрейминга (зеркалит transfer.rs) — для сквозного теста
 // ---------------------------------------------------------------------------
 
-const SYMBOL_SIZE: usize = 140;
+// symbol_size обязан совпадать с формулой приёмника (session::symbol_size_for):
+// (ёмкость кадра − 26) / 8; при luma1+Mono (1 bpc) = 42.
+const SYMBOL_SIZE: usize = 42;
 const SYMBOLS_PER_FRAME: usize = 8;
 const REPAIR_EVERY: u32 = 4;
 
