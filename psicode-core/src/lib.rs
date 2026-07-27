@@ -11,6 +11,7 @@
 //! - [`base32`]  — eck Base32 с терпимым парсером
 //! - [`bits`]    — битовая упаковка 80-битного payload поверх u128
 //! - [`profile`] — [`profile::CalibProfile`]: поля, CRC-8, encode/decode строки
+//! - [`isi`]     — выравнивание межклеточной интерференции на сетке клеток
 //!
 //! Crate по умолчанию `no_std` (в тестовой сборке — обычный std, чтобы тесты
 //! пользовались std как обычно). Аллокатор нужен только для `String`/`Vec`
@@ -40,6 +41,7 @@ pub mod calibrate;
 pub mod detect;
 pub mod fountain;
 pub mod gf32;
+pub mod isi;
 pub mod l3;
 pub mod profile;
 pub mod rs;

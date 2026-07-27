@@ -4,6 +4,7 @@
 //! Модуль доступен только с фичей `std` (нужна вещественная математика с
 //! transcendental-функциями для гамма-коррекции).
 
+use crate::isi::{self, Grid, IsiKernel};
 use crate::profile::{BorderMode, CalibProfile, ChromaMode};
 use crate::zcborder;
 use alloc::vec;
@@ -94,6 +95,28 @@ pub fn bits_per_cell(p: &CalibProfile) -> u32 {
 /// равносторонний треугольник (120°), ограничение гамута на диске сводится к
 /// ОДНОМУ радиусу, и одновременно выравнивается шум по осям (из обращения
 /// σ_x ∝ √6/(2Sb), σ_y ∝ 3√2/(2Sc); равенство ⇔ c = √3·b).
+///
+/// # Что показал замер баланса осей (`examples/isi_eq.rs axes`)
+///
+/// Равенство Q по осям выведено в предположении НЕЗАВИСИМОГО и РАВНОГО шума в
+/// R, G, B. На живом канале (Galaxy A22, 4 цветных кадра) оно нарушено, но
+/// **не в ту сторону, которую предсказывает байеровская мозаика**: измеренные
+/// поканальные остатки драйва — σ_R 30.9, σ_G 37.0, σ_B 28.9 кода, то есть
+/// зелёный САМЫЙ ШУМНЫЙ, а не самый тихий (байер дал бы σ_G ≈ σ/√2). Плюс
+/// каналы сильно ОТРИЦАТЕЛЬНО коррелированы (RG −0.26, GB −0.45, RB −0.18), что
+/// дополнительно раздувает `Var(2G−R−B)`. Итог: `σ(2G−R−B)/σ(R−B) = 2.18`
+/// против 1.73 у модели iid, и хуже оказывается ось **Re**, а не Im
+/// (Q 2.43σ против 3.22σ).
+///
+/// **Но это следствие ISI, а не свойство сенсора.** После выравнивателя
+/// ([`crate::isi`]) поканальные σ выравниваются (27.1 / 25.8 / 25.2), отношение
+/// падает до 1.82 — практически модель iid, — и перекос осей исчезает
+/// (Q 3.04σ и 2.60σ). Оптимальное `c/b`, посчитанное по измеренной ковариации,
+/// равно 1.27 ДО выравнивания и 1.85 ПОСЛЕ; второе отстоит от нынешнего √3
+/// настолько мало, что перераспределение амплитуды даёт менее процентного
+/// пункта выживаемости страйпа. Иными словами, **перекрой созвездия и
+/// выравниватель не складываются: они лечат одно и то же, и выравниватель
+/// лечит сильнее.**
 ///
 /// # Оптимум гамута
 /// Обозначив A = u·2b (свинг драйва на канал на границе диска), ограничения
@@ -564,20 +587,41 @@ impl ChannelSolve {
         }
     }
 
-    /// Измеренный линеаризованный RGB клетки -> drive 0..255 на канал.
-    fn drive(&self, s: [f64; 3], gammas: &[f64; 3]) -> [f64; 3] {
-        let mut d = [0.0f64; 3];
+    /// Измеренный сенсорный RGB клетки -> ЛИНЕАРИЗОВАННЫЙ драйв `t` (§3.4),
+    /// то есть `t_c = (d_c/255)^γ_c`, ДО обращения гаммы.
+    ///
+    /// Вынесено отдельным шагом, потому что именно `t` пропорционален СВЕТУ, а
+    /// свёртка оптики и ISP линейна по свету: выравниватель межклеточной
+    /// интерференции ([`crate::isi`]) обязан работать здесь, между развязкой
+    /// каналов и обращением гаммы. Поле освещённости входит в `t`
+    /// мультипликативно и проходит выравниватель насквозь — его по-прежнему
+    /// снимает штатная нормировка ниже по тракту.
+    fn linear(&self, s: [f64; 3]) -> [f64; 3] {
+        let mut t = [0.0f64; 3];
         for c in 0..3 {
-            let t = match self {
+            t[c] = match self {
                 ChannelSolve::PerChannel { a, b } => (s[c] - b[c]) / a[c],
                 ChannelSolve::Matrix { n, q } => {
                     n[c][0] * s[0] + n[c][1] * s[1] + n[c][2] * s[2] + q[c]
                 }
             };
-            d[c] = (255.0 * t.max(0.0).powf(1.0 / gammas[c])).clamp(0.0, 255.0);
         }
-        d
+        t
     }
+
+    /// Измеренный линеаризованный RGB клетки -> drive 0..255 на канал.
+    fn drive(&self, s: [f64; 3], gammas: &[f64; 3]) -> [f64; 3] {
+        drive_from_linear(&self.linear(s), gammas)
+    }
+}
+
+/// Обращение гаммы: линеаризованный драйв `t` -> drive 0..255 на канал.
+fn drive_from_linear(t: &[f64; 3], gammas: &[f64; 3]) -> [f64; 3] {
+    let mut d = [0.0f64; 3];
+    for c in 0..3 {
+        d[c] = (255.0 * t[c].max(0.0).powf(1.0 / gammas[c])).clamp(0.0, 255.0);
+    }
+    d
 }
 
 /// Решает нормальные уравнения `AᵀA · x_c = AᵀB_c` для трёх выходных каналов
@@ -730,6 +774,411 @@ fn box_mean(src: &[f64], n: usize, rad: i32) -> Vec<f64> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// [LIVE] Демодуляция с выравниванием межклеточной интерференции
+// ---------------------------------------------------------------------------
+
+/// Клеток от края сетки символа, не берущихся ОТКЛИКОМ в оценку ядра.
+///
+/// Три — потому что при радиусе 2 у клетки на третьей строке окрестность 5×5
+/// целиком лежит внутри сетки; клетки ближе к краю получали бы зажатые (то есть
+/// повторённые) значения соседей, а повтор искусственно завышает близкие
+/// отсчёты ядра. СОСЕДЯМИ приграничные клетки при этом участвуют — за краем
+/// payload лежит реальное содержимое (референсная строка, строка счётчика,
+/// ЗЧ-кольцо), и именно его подмешивание в крайние payload-клетки выравниватель
+/// и должен снимать.
+const ISI_FIT_MARGIN: usize = 3;
+
+/// Порог отказа: ядро с внецентральной энергией выше этого — не ISI, а
+/// сломанная геометрия (сетка съехала на полклетки, и «сосед» коррелирует
+/// сильнее собственной клетки). В таком случае выравниватель НЕ применяется.
+const ISI_MAX_STRENGTH: f64 = 0.5;
+
+/// Минимальная дисперсия идеальной плоскости канала, при которой ядро вообще
+/// оценивается. Отсекает постоянные каналы (в `GreenOnly` R и B равны MID
+/// тождественно, регрессия по ним вырождена).
+const ISI_MIN_IDEAL_VAR: f64 = 1e-8;
+
+/// Настройки выравнивателя ISI (см. [`crate::isi`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IsiConfig {
+    /// Радиус ядра в клетках: 1 => 3×3, 2 => 5×5.
+    pub radius: usize,
+    /// Итераций ряда Неймана при обращении свёртки.
+    pub iters: usize,
+    /// Проходов «решить -> оценить ядро -> выровнять -> перерешить».
+    pub passes: usize,
+    /// Форма носителя ядра (полный квадрат или крест). Помеха на квадратной
+    /// решётке сильно анизотропна — на живых ядрах отношение «рёберные соседи /
+    /// диагональные» лежит в диапазоне 2…15 при медиане около 5, — но диагонали
+    /// всё же не шум: см. абляцию в [`IsiConfig::default`].
+    pub shape: crate::isi::KernelShape,
+    /// Готовое ядро на канал (из калибровочного кадра). `None` — оценить по
+    /// собственным пробным решениям этого же кадра.
+    pub kernel: Option<[IsiKernel; 3]>,
+    /// Только для 1-битного яркостного пути: оставлять ли ТОНКОЕ окно
+    /// двухмасштабного порога. `false` — порог по одному грубому окну
+    /// (выравниватель уже снял вклад соседей, и тонкое окно снимало бы его
+    /// второй раз).
+    pub fine_threshold: bool,
+}
+
+impl Default for IsiConfig {
+    /// Умолчания выбраны АБЛЯЦИЕЙ на реальных снимках, а не из общих
+    /// соображений (`psicode-rx/examples/isi_eq.rs`, режим `chroma`):
+    ///
+    /// | форма | итераций | SER | живых страйпов |
+    /// |---|---|---|---|
+    /// | квадрат | 1 | 0.00027 | 29/32 |
+    /// | квадрат | **2..4** | **0.00055** | **27/32** |
+    /// | крест | 1 | 0.00046 | 28/32 |
+    /// | крест | 2..4 | 0.00073 | 25/32 |
+    ///
+    /// **Расходимости с ростом числа итераций НЕТ**, и это проверено прямо:
+    /// 2, 3 и 4 итерации дают побитово ОДИН И ТОТ ЖЕ результат — ряд Неймана
+    /// сходится на второй, дальше меняться нечему. Обусловленность измеренных
+    /// ядер: `|H(ω)| ∈ [0.75, 1.25]` по ВСЕЙ частотной плоскости (провалов
+    /// нет), усиление дисперсии шума применяемым фильтром ×1.01…1.05, то есть
+    /// 0.03…0.2 дБ. Обращение этой помехи хорошо обусловлено; классическое
+    /// «деконволюция усиливает шум» здесь не работает, потому что ядро —
+    /// слабое размытие без нулей в спектре.
+    ///
+    /// Между 1 и 2 итерациями разница на реальных снимках статистически
+    /// неразличима (3 против 6 ошибок на 10944 клетки, 29 против 27 страйпов из
+    /// 32). Взято **2**: при более сильном ядре (сила 0.46, как на осях
+    /// созвездия) одна итерация оставляет остаток `O(h²) ≈ 0.2` и заметно
+    /// проигрывает, а вторая его закрывает. Один лишний проход свёртки стоит
+    /// ~0.2 мс — дешевле, чем риск недокоррекции.
+    ///
+    /// Форма — ПОЛНЫЙ квадрат: анизотропия помехи действительно велика
+    /// (рёберные соседи против диагональных ~6…10× на живых ядрах), но при 3721
+    /// клетке на 15 параметров диагонали оцениваются устойчиво и дают чуть
+    /// лучший результат. Разница между формами — один страйп из 32, то есть в
+    /// пределах погрешности; [`crate::isi::KernelShape::Cross`] остаётся как
+    /// более дешёвый и физически более скупой вариант.
+    ///
+    /// Радиус 1: окно 3×3 против 5×5 экономит вчетверо и на оценке, и на
+    /// свёртке, а 5×5 на реальных кадрах ничего не добавляет.
+    fn default() -> Self {
+        IsiConfig {
+            radius: 1,
+            iters: 2,
+            passes: 1,
+            shape: crate::isi::KernelShape::Full,
+            kernel: None,
+            fine_threshold: true,
+        }
+    }
+}
+
+/// Результат демодуляции с выравнивателем.
+#[derive(Debug, Clone)]
+pub struct IsiDemod {
+    /// Символы payload после выравнивания (или базовые, если оно не применялось).
+    pub cells: Vec<u8>,
+    /// Символы payload БЕЗ выравнивания — тот же кадр, тот же тракт. Хранится,
+    /// чтобы «до/после» меряли на одних и тех же данных, а не на двух прогонах.
+    pub base_cells: Vec<u8>,
+    /// Оценённое (или переданное) ядро на канал.
+    pub kernels: [IsiKernel; 3],
+    /// Сколько клеток изменило решение.
+    pub changed: usize,
+    /// Применялось ли выравнивание (оценка могла выродиться или быть отбракована).
+    pub applied: bool,
+}
+
+/// Сенсорный RGB ВСЕЙ клеточной сетки символа `GRID×GRID` в растровом порядке.
+///
+/// Демодулятор без выравнивателя читает только payload; выравнивателю нужна
+/// ещё и окрестность payload — референсная строка, строка счётчика и ЗЧ-кольцо
+/// подмешиваются в крайние payload-клетки физически, и без них край остался бы
+/// нескорректированным (это 4·57 из 3135 клеток, 7 %).
+pub fn sample_symbol_grid(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+) -> Vec<[f64; 3]> {
+    let quiet = p.quiet_zone_cells() as usize;
+    let cell = p.cell_size_px as usize;
+    let mut out = vec![[0.0f64; 3]; GRID * GRID];
+    for cy in 0..GRID {
+        for cx in 0..GRID {
+            out[cy * GRID + cx] = sample_cell(quiet, cell, cx, cy, map, sample);
+        }
+    }
+    out
+}
+
+/// Младшие 8 бит номера кадра из УЖЕ взятой сетки (та же логика, что в
+/// [`read_counters`], но без повторного сэмплирования).
+fn counter_from_grid(grid: &[[f64; 3]]) -> u8 {
+    let cy = RING + INTERIOR - 1;
+    let g_ref = grid[cy * GRID + RING + INTERIOR / 2][1];
+    let mut v = 0u8;
+    for k in 0..COUNTER_BITS {
+        let g = grid[cy * GRID + RING + k][1];
+        v = (v << 1) | (g > g_ref) as u8;
+    }
+    v
+}
+
+/// Дисперсия плоскости (для отбраковки постоянных каналов).
+fn plane_var(v: &[f64]) -> f64 {
+    let n = v.len() as f64;
+    let m = v.iter().sum::<f64>() / n;
+    v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n
+}
+
+/// Демодуляция Mode A с ЛИНЕЙНЫМ выравниванием межклеточной интерференции.
+///
+/// # Порядок операций и почему он такой
+///
+/// ```text
+/// сэмпл клетки -> развязка каналов N·s+q -> [ВЫРАВНИВАТЕЛЬ] -> обращение γ -> решение
+/// ```
+///
+/// Свёртка (расфокус оптики + низкочастотный фильтр ISP) линейна ПО СВЕТУ, а
+/// светолинейная величина в этом тракте — ровно `t = N·s + q`. Ставить
+/// выравниватель после обращения гаммы было бы ошибкой моделирования: там
+/// величина уже нелинейна по свету. Поле освещённости входит в `t`
+/// мультипликативно, общим множителем на все три канала, поэтому проходит
+/// выравниватель насквозь и снимается ниже — §5.1-CL делением на ИЗМЕРЕННУЮ
+/// сумму каналов, яркостный путь — локальным порогом.
+///
+/// # Откуда берётся ядро
+///
+/// По решениям ПЕРВОГО прохода: они переизлучаются в идеальную сетку драйвов
+/// ([`build_symbol_cells`], включая заведомо известные ЗЧ-кольцо, референсную
+/// строку и строку счётчика), и ядро решается МНК против измеренной сетки.
+/// Смещение от ошибочных пробных решений мало: ядро оценивается по 3721 клетке
+/// при SER первого прохода порядка процента, и ошибки входят как некоррелированный
+/// шум отклика, а не как систематика.
+///
+/// Ядро можно передать готовым (`cfg.kernel`) — оно является свойством связки
+/// «дисплей + оптика + ISP», а не кадра, и потому кэшируемо (см. измерение
+/// повторяемости в `psicode-rx/examples/isi_eq.rs`).
+///
+/// # Почему ЛИНЕЙНЫЙ, а не с обратной связью
+///
+/// Страйп несёт CRC-16 на 399 клеток: одна ошибка убивает страйп целиком.
+/// Обратная связь по решениям распространяет ошибки, а линейное обращение —
+/// нет. При измеренной силе ядра усиление шума линейным обращением равно
+/// `1 + Σ_{k≠0} h_k²` — доли процента, то есть обычный аргумент «деконволюция
+/// усиливает шум» здесь не работает: ядро слишком слабое.
+pub fn demod_symbol_isi(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    m: Option<&ChannelMatrix>,
+    cfg: &IsiConfig,
+) -> IsiDemod {
+    let (black_255, white_255) = levels(p);
+    let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    let solve = match m {
+        Some(mm) => ChannelSolve::Matrix { n: mm.n, q: mm.q },
+        None => ChannelSolve::from_reference_row(
+            p,
+            black_255,
+            white_255,
+            &gammas,
+            map,
+            sample,
+            p.chroma_mode.is_const_luma(),
+        ),
+    };
+    let codec = CellCodec::new(p, black_255, white_255);
+    let s_grid = sample_symbol_grid(p, map, sample);
+    let n = GRID * GRID;
+    let mut t: [Vec<f64>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    for (i, s) in s_grid.iter().enumerate() {
+        let l = solve.linear(*s);
+        for c in 0..3 {
+            t[c][i] = l[c];
+        }
+    }
+    let decode_from = |planes: &[Vec<f64>; 3]| -> Vec<u8> {
+        let mut out = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+        for pr in 0..PAYLOAD_ROWS {
+            for pc in 0..PAYLOAD_COLS {
+                let gi = (RING + 1 + pr) * GRID + (RING + pc);
+                let tv = [planes[0][gi], planes[1][gi], planes[2][gi]];
+                out[pr * PAYLOAD_COLS + pc] = codec.decode(drive_from_linear(&tv, &gammas));
+            }
+        }
+        out
+    };
+    let base_cells = decode_from(&t);
+    let counter = counter_from_grid(&s_grid);
+
+    let mut kernels = [IsiKernel::identity(cfg.radius); 3];
+    let mut cells = base_cells.clone();
+    let mut applied = false;
+    for _ in 0..cfg.passes.max(1) {
+        let mut k_new = [IsiKernel::identity(cfg.radius); 3];
+        match cfg.kernel {
+            Some(kk) => k_new = kk,
+            None => {
+                // идеальная светолинейная сетка при ТЕКУЩИХ решениях
+                let ideal_d = build_symbol_cells(p, &cells, counter);
+                for c in 0..3 {
+                    let ideal: Vec<f64> = ideal_d
+                        .iter()
+                        .map(|d| (d[c] as f64 / 255.0).powf(gammas[c]))
+                        .collect();
+                    if plane_var(&ideal) < ISI_MIN_IDEAL_VAR {
+                        continue; // постоянный канал — ядро не определено
+                    }
+                    let est = isi::estimate_kernel(
+                        &Grid {
+                            v: &t[c],
+                            rows: GRID,
+                            cols: GRID,
+                        },
+                        &Grid {
+                            v: &ideal,
+                            rows: GRID,
+                            cols: GRID,
+                        },
+                        cfg.radius,
+                        ISI_FIT_MARGIN,
+                        cfg.shape,
+                    );
+                    if let Some(k) = est {
+                        if k.strength() <= ISI_MAX_STRENGTH {
+                            k_new[c] = k;
+                        }
+                    }
+                }
+            }
+        }
+        kernels = k_new;
+        let mut planes = t.clone();
+        for c in 0..3 {
+            isi::equalise(&mut planes[c], GRID, GRID, &kernels[c], cfg.iters);
+        }
+        cells = decode_from(&planes);
+        applied = true;
+    }
+    let changed = cells
+        .iter()
+        .zip(&base_cells)
+        .filter(|(a, b)| a != b)
+        .count();
+    IsiDemod {
+        cells,
+        base_cells,
+        kernels,
+        changed,
+        applied,
+    }
+}
+
+/// [LIVE] 1-битный яркостный путь ([`demod_symbol_local`]) с выравнивателем ISI.
+///
+/// Отличия от [`demod_symbol_isi`]: работа идёт по ОДНОЙ плоскости яркости
+/// (зелёный канал), без развязки каналов и без обращения гаммы, потому что
+/// двоичное решение монотонно и ни то, ни другое на него не влияет. Ядро
+/// оценивается против идеальной сетки ДРАЙВОВ (не света): линейная модель по
+/// узору соседей — ровно та, для которой замер канального шума и дал R² = 0.516.
+///
+/// # Взаимодействие с двухмасштабным порогом
+///
+/// Тонкое окно 3×3 существующего порога — само по себе грубая коррекция ISI:
+/// оно вычитает среднее ближайших соседей, то есть применяет ядро с ОДНИМ
+/// отсчётом −1/8 во всех восьми направлениях, независимо от измеренной
+/// асимметрии. Оставлять его вместе с выравнивателем — значит корректировать
+/// дважды, поэтому `cfg.fine_threshold = false` переводит порог на ОДНО грубое
+/// окно (поле освещённости), а всю работу по соседям отдаёт выравнивателю.
+/// Какая из двух конфигураций выигрывает на реальном канале — меряет
+/// `psicode-rx/examples/isi_eq.rs`.
+///
+/// Для не-1-битных или хромо-режимов делегирует в [`demod_symbol_isi`].
+pub fn demod_symbol_local_isi(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    cfg: &IsiConfig,
+) -> IsiDemod {
+    if p.luma_bits != 1 || p.chroma_bits() != 0 {
+        return demod_symbol_isi(p, map, sample, None, cfg);
+    }
+    let s_grid = sample_symbol_grid(p, map, sample);
+    let n = GRID * GRID;
+    let g: Vec<f64> = s_grid.iter().map(|s| s[1]).collect();
+
+    // решение по сетке яркости: двухмасштабный порог (§ demod_symbol_local),
+    // посчитанный на сетке GRID×GRID.
+    let decide = |plane: &[f64], fine: bool| -> Vec<u8> {
+        let mcoarse = box_mean(plane, GRID, LOCAL_COARSE_RADIUS);
+        let mfine = if fine {
+            box_mean(plane, GRID, LOCAL_FINE_RADIUS)
+        } else {
+            mcoarse.clone()
+        };
+        let aw = if fine { LOCAL_COARSE_WEIGHT } else { 0.0 };
+        let mut out = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+        for pr in 0..PAYLOAD_ROWS {
+            for pc in 0..PAYLOAD_COLS {
+                let gi = (RING + 1 + pr) * GRID + (RING + pc);
+                let score = (plane[gi] - mfine[gi]) + aw * (plane[gi] - mcoarse[gi]);
+                out[pr * PAYLOAD_COLS + pc] = (score > 0.0) as u8;
+            }
+        }
+        out
+    };
+    let base_cells = decide(&g, true);
+    let counter = counter_from_grid(&s_grid);
+
+    let mut kernels = [IsiKernel::identity(cfg.radius); 3];
+    let mut cells = base_cells.clone();
+    let mut applied = false;
+    for _ in 0..cfg.passes.max(1) {
+        let k = match cfg.kernel {
+            Some(kk) => kk[1],
+            None => {
+                let ideal_d = build_symbol_cells(p, &cells, counter);
+                let ideal: Vec<f64> = ideal_d.iter().map(|d| d[1] as f64 / 255.0).collect();
+                match isi::estimate_kernel(
+                    &Grid {
+                        v: &g,
+                        rows: GRID,
+                        cols: GRID,
+                    },
+                    &Grid {
+                        v: &ideal,
+                        rows: GRID,
+                        cols: GRID,
+                    },
+                    cfg.radius,
+                    ISI_FIT_MARGIN,
+                    cfg.shape,
+                ) {
+                    Some(k) if k.strength() <= ISI_MAX_STRENGTH => k,
+                    _ => break,
+                }
+            }
+        };
+        kernels = [k; 3];
+        let mut plane = g.clone();
+        isi::equalise(&mut plane, GRID, GRID, &k, cfg.iters);
+        cells = decide(&plane, cfg.fine_threshold);
+        applied = true;
+    }
+    let _ = n;
+    let changed = cells
+        .iter()
+        .zip(&base_cells)
+        .filter(|(a, b)| a != b)
+        .count();
+    IsiDemod {
+        cells,
+        base_cells,
+        kernels,
+        changed,
+        applied,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +1356,17 @@ impl CellCodec {
         };
         sym as u8
     }
+}
+
+/// ИДЕАЛЬНАЯ сетка драйвов всего символа `GRID×GRID` при заданных payload-
+/// символах и счётчике кадра — ровно то, что рисует передатчик.
+///
+/// Публична, потому что любое сравнение «снимок против экрана» (оценка ядра
+/// [`crate::isi`], измерения «до/после» на реальных дампах) обязано сравниваться
+/// с ПОЛНЫМ изображением, включая ЗЧ-рамку, референсную строку и строку
+/// счётчика: именно они подмешиваются в крайние payload-клетки.
+pub fn ideal_symbol_drives(p: &CalibProfile, cells: &[u8], counter: u8) -> Vec<[u8; 3]> {
+    build_symbol_cells(p, cells, counter)
 }
 
 /// Сборка клеточной решётки символа GRID×GRID в drive-RGB. `counter` — младшие
@@ -1825,5 +2285,255 @@ mod tests {
             e_loc < 0.02,
             "локальный порог не удержал градиент: SER {e_loc:.4} (глоб {e_glob:.4})"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Выравниватель ISI
+    // -----------------------------------------------------------------
+
+    /// Псевдослучайная нагрузка payload для профиля (xorshift, без зависимостей).
+    fn payload_for(p: &CalibProfile, seed: u64) -> Vec<u8> {
+        let bits = bits_per_cell(p);
+        let mask = if bits >= 8 { 0xFFu32 } else { (1u32 << bits) - 1 };
+        let mut x = seed;
+        (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x as u32 & mask) as u8
+            })
+            .collect()
+    }
+
+    /// Синтетический канал с ISI РОВНО НА СЕТКЕ КЛЕТОК: идеальные драйвы
+    /// линеаризуются, свёртываются с заданным ядром и отдаются сэмплеру как
+    /// «сенсорный» сигнал. Модель, в которой правильный ответ известен точно,
+    /// поэтому годится в закрепляющий тест.
+    fn isi_channel(p: &CalibProfile, cells: &[u8], k: &IsiKernel) -> [Vec<f64>; 3] {
+        let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        let ideal = ideal_symbol_drives(p, cells, 0);
+        let mut out = [vec![], vec![], vec![]];
+        for c in 0..3 {
+            let lin: Vec<f64> = ideal
+                .iter()
+                .map(|d| (d[c] as f64 / 255.0).powf(gam[c]))
+                .collect();
+            let mut o = vec![0.0f64; GRID * GRID];
+            let g = Grid {
+                v: &lin,
+                rows: GRID,
+                cols: GRID,
+            };
+            let r = k.radius as i32;
+            for rr in 0..GRID as i32 {
+                for cc in 0..GRID as i32 {
+                    let mut a = 0.0;
+                    for dr in -r..=r {
+                        for dc in -r..=r {
+                            a += k.tap(dr, dc) * g.at(rr - dr, cc - dc);
+                        }
+                    }
+                    o[rr as usize * GRID + cc as usize] = a;
+                }
+            }
+            out[c] = o;
+        }
+        out
+    }
+
+    /// Сэмплер, отдающий значение КЛЕТКИ, в которую попала точка.
+    fn cell_sampler<'a>(
+        p: &CalibProfile,
+        ch: &'a [Vec<f64>; 3],
+    ) -> impl Fn(f64, f64) -> [f32; 3] + 'a {
+        let quiet = p.quiet_zone_cells() as isize;
+        let cell = p.cell_size_px as f64;
+        move |x: f64, y: f64| {
+            let cx = ((x / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+            let cy = ((y / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+            let i = cy * GRID + cx;
+            [ch[0][i] as f32, ch[1][i] as f32, ch[2][i] as f32]
+        }
+    }
+
+    /// Асимметричное ядро в масштабе ИЗМЕРЕННОГО на живом цветном канале.
+    fn measured_like_kernel() -> IsiKernel {
+        let mut k = IsiKernel::identity(1);
+        k.set_neighbour(0, -1, 0.104);
+        k.set_neighbour(0, 1, 0.104);
+        k.set_neighbour(-1, 0, 0.056);
+        k.set_neighbour(1, 0, 0.126);
+        for &(a, b) in &[(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+            k.set_neighbour(a, b, 0.018);
+        }
+        k
+    }
+
+    /// Гауссов шум с фиксированным зерном (Бокс-Мюллер поверх LCG).
+    fn gauss(state: &mut u64) -> f64 {
+        let mut u = || {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*state >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        };
+        let (a, b) = (u(), u());
+        (-2.0 * a.ln()).sqrt() * (core::f64::consts::TAU * b).cos()
+    }
+
+    /// РЕГРЕССИЯ: впрыснутое ядро известной силы + шум ломают демодуляцию, а
+    /// выравниватель возвращает почти всё.
+    ///
+    /// Ядро асимметрично и по величине равно ИЗМЕРЕННОМУ на живом цветном
+    /// канале (горизонтальные соседи неравны, нижний сильнее верхнего):
+    /// симметричное снималось бы и обычным сглаживанием окрестности, и тест не
+    /// отличал бы выравниватель от размытия.
+    ///
+    /// # Почему в канале ОБЯЗАН быть шум
+    ///
+    /// При одном бите на ось полуразнос равен 1.0, а суммарная внецентральная
+    /// энергия ядра — 0.46. Даже когда ВСЕ восемь соседей выстроены против
+    /// клетки, помеха не дотягивает до порога: **ISI сама по себе на двоичном
+    /// созвездии не даёт ни одной ошибки**. Она съедает ЗАПАС, а в ошибки его
+    /// переводит шум — ровно это и наблюдается на живом канале (яркостный путь
+    /// с ISI 0.05 держит SER 0, цветной с ISI 0.46 сыплется). Поэтому канал
+    /// теста — ISI ПЛЮС шум, а проверяется отношение SER до/после.
+    #[test]
+    fn isi_equaliser_recovers_injected_kernel_through_full_demod() {
+        let p = prof(1, ChromaMode::ConstLuma1, 12, 0);
+        let cells = payload_for(&p, 0x51C0_DE01);
+        let k = measured_like_kernel();
+        let map = |u: f64, v: f64| (u, v);
+        let err = |got: &[u8]| got.iter().zip(&cells).filter(|(a, b)| a != b).count();
+
+        // размах линеаризованного драйва задаёт масштаб шума
+        let clean = isi_channel(&p, &cells, &IsiKernel::identity(1));
+        let swing = {
+            let g = &clean[1];
+            let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+            for &v in g {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            hi - lo
+        };
+        const NOISE: f64 = 0.09;
+        let mut ch = isi_channel(&p, &cells, &k);
+        let mut st = 0x15EED_u64;
+        for c in 0..3 {
+            for v in ch[c].iter_mut() {
+                *v += NOISE * swing * gauss(&mut st);
+            }
+        }
+        let samp = cell_sampler(&p, &ch);
+
+        // контроль: тот же шум БЕЗ ISI — столько ошибок даёт один шум
+        let mut ch0 = clean.clone();
+        let mut st0 = 0x15EED_u64;
+        for c in 0..3 {
+            for v in ch0[c].iter_mut() {
+                *v += NOISE * swing * gauss(&mut st0);
+            }
+        }
+        let e_noise_only = err(&demod_symbol(&p, &map, &cell_sampler(&p, &ch0)));
+
+        let base = demod_symbol(&p, &map, &samp);
+        let eq = demod_symbol_isi(&p, &map, &samp, None, &IsiConfig::default());
+        let (e_base, e_eq) = (err(&base), err(&eq.cells));
+        eprintln!("[isi] база {e_base}, один шум {e_noise_only}, после {e_eq}, откл ядра {:.4}", eq.kernels[1].max_tap_diff(&k));
+        assert!(
+            e_base > 20 && e_base > 4 * e_noise_only.max(1),
+            "ISI обязана доминировать над шумом: база {e_base}, один шум {e_noise_only}"
+        );
+        // Выравниватель не может опуститься НИЖЕ шумового пола — он снимает
+        // вклад соседей, а не шум. Поэтому проверяются два неравенства: он
+        // отыграл кратно и подошёл к полу.
+        assert!(
+            e_eq * 3 <= e_base,
+            "выравниватель не отыграл втрое: {e_base} -> {e_eq} (пол шума {e_noise_only})"
+        );
+        assert!(
+            e_eq <= 4 * e_noise_only.max(1),
+            "остаток {e_eq} далёк от шумового пола {e_noise_only}"
+        );
+        assert!(
+            eq.kernels[1].max_tap_diff(&k) < 0.03,
+            "ядро восстановлено неточно: сила {:.4} против {:.4}, откл {:.4}",
+            eq.kernels[1].strength(),
+            k.strength(),
+            eq.kernels[1].max_tap_diff(&k)
+        );
+    }
+
+    /// Выравниватель БЕЗВРЕДЕН на чистом канале: без ISI решения не меняются,
+    /// а оценённое ядро вырождается в дельту.
+    #[test]
+    fn isi_equaliser_is_neutral_on_a_clean_channel() {
+        for (bits, mode) in [
+            (1u8, ChromaMode::Mono),
+            (1, ChromaMode::ConstLuma1),
+            (2, ChromaMode::Chroma2),
+        ] {
+            let p = prof(bits, mode, 12, 2);
+            let cells = payload_for(&p, 0x0BAD_F00D);
+            let ch = isi_channel(&p, &cells, &IsiKernel::identity(1));
+            let samp = cell_sampler(&p, &ch);
+            let map = |u: f64, v: f64| (u, v);
+            let eq = demod_symbol_isi(&p, &map, &samp, None, &IsiConfig::default());
+            assert_eq!(eq.cells, cells, "{mode:?}: выравниватель испортил чистый канал");
+            assert!(
+                eq.kernels[1].strength() < 1e-6,
+                "{mode:?}: на чистом канале ядро обязано быть дельтой, сила {:.6}",
+                eq.kernels[1].strength()
+            );
+        }
+    }
+
+    /// Старый путь НЕ ТРОНУТ: с ядром-дельтой решения выравнивателя совпадают с
+    /// [`demod_symbol`] клетка-в-клетку. Страховка от того, что вынос обращения
+    /// гаммы отдельным шагом изменил арифметику.
+    #[test]
+    fn isi_path_with_delta_kernel_equals_legacy_demod() {
+        for mode in [
+            ChromaMode::Mono,
+            ChromaMode::GreenOnly,
+            ChromaMode::ConstLuma1,
+        ] {
+            let p = prof(1, mode, 12, 4);
+            let cells = payload_for(&p, 0xFEED_BEEF);
+            let ch = isi_channel(&p, &cells, &measured_like_kernel());
+            let samp = cell_sampler(&p, &ch);
+            let map = |u: f64, v: f64| (u, v);
+            let cfg = IsiConfig {
+                kernel: Some([IsiKernel::identity(1); 3]),
+                ..IsiConfig::default()
+            };
+            let eq = demod_symbol_isi(&p, &map, &samp, None, &cfg);
+            let legacy = demod_symbol(&p, &map, &samp);
+            assert_eq!(eq.cells, legacy, "{mode:?}: путь с дельтой разошёлся с v0");
+            assert_eq!(eq.base_cells, legacy, "{mode:?}: базовые решения разошлись");
+        }
+    }
+
+    /// 1-битный яркостный путь с выравнивателем: ISI снимается и там, а
+    /// `demod_symbol_local` при этом остаётся нетронутым (сравниваем ОБА).
+    #[test]
+    fn isi_local_path_beats_two_scale_threshold_under_injected_isi() {
+        let p = prof(1, ChromaMode::Mono, 12, 4);
+        let cells = payload_for(&p, 0x1234_5678);
+        let ch = isi_channel(&p, &cells, &measured_like_kernel());
+        let samp = cell_sampler(&p, &ch);
+        let map = |u: f64, v: f64| (u, v);
+        let err = |got: &[u8]| got.iter().zip(&cells).filter(|(a, b)| a != b).count();
+        let loc = demod_symbol_local(&p, &map, &samp);
+        let eq = demod_symbol_local_isi(&p, &map, &samp, &IsiConfig::default());
+        assert!(
+            err(&eq.cells) <= err(&loc),
+            "выравниватель хуже голого локального порога: {} против {}",
+            err(&eq.cells),
+            err(&loc)
+        );
+        assert_eq!(err(&eq.cells), 0, "яркостный путь не снял впрыснутое ISI");
     }
 }

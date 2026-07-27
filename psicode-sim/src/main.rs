@@ -28,6 +28,7 @@ mod pipeline;
 mod probe;
 mod report;
 mod rng;
+mod shape;
 mod tprobe;
 mod transfer;
 
@@ -762,9 +763,10 @@ fn main() {
         Some("probe") => probe::cmd_probe(),
         Some("tprobe") => tprobe::cmd_tprobe(),
         Some("finder") => finder::cmd_finder(),
+        Some("shape") => shape::cmd_shape(),
         _ => {
             eprintln!(
-                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | l3live | modeb | transfer | exp | probe | tprobe>"
+                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | l3live | modeb | transfer | exp | probe | tprobe | finder | shape>"
             );
             std::process::exit(2);
         }
