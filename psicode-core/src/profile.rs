@@ -34,8 +34,8 @@
 //! | crosstalk_gb_q      |  4  | утечка G<->B, q * 2 %                             |
 //! | quiet_zone          |  2  | пресет тихой зоны (значим только при border = 0)  |
 //! | fec_overhead        |  3  | пресет избыточности RaptorQ                       |
-//! | border              |  1  | редакция ЗЧ-рамки (§3.2): 0 = v0, 1 = v1          |
-//! | reserved            |  3  | нули; поле для будущих версий                     |
+//! | border              |  2  | редакция ЗЧ-рамки (§3.2), см. BorderMode          |
+//! | reserved            |  2  | нули; поле для будущих версий                     |
 //! | ----- итого         |  72 |                                                   |
 //! | crc8                |  8  | CRC-8 (poly 0x07) по 9 байтам полей               |
 
@@ -116,7 +116,7 @@ impl ChromaMode {
 
 /// Редакция ЗЧ-рамки (§3.2).
 ///
-/// Занимает ОДИН бит из прежнего 4-битного поля `reserved`, поэтому 160-битная
+/// Занимает ДВА бита из прежнего 4-битного поля `reserved`, поэтому 160-битная
 /// раскладка кода не меняется (тот же приём, что у `ChromaMode` 5..7), а
 /// значение 0 побитово совпадает с прежним нулевым `reserved` — эталонная
 /// строка §7.4 и байт-в-байт живые передачи остаются валидными.
@@ -127,21 +127,45 @@ pub enum BorderMode {
     #[default]
     LegacyInverted = 0,
     /// v1: четыре ЭКСТРУДИРОВАННЫЕ полосы N×2 (оба ряда одинаковы), корни по
-    /// сторонам [3,1,4,2], тихой зоны НЕТ.
+    /// сторонам [3,1,4,2], носитель — ЯРКОСТЬ (чёрно-белые клетки), тихой зоны
+    /// НЕТ. **Штатная редакция v1.**
     ///
-    /// Тихая зона в этой редакции бессмысленна: границу локализует сам
-    /// корреляционный пик рамки, а поле стоило 13 % линейного размера клетки
-    /// (69 клеток полотна против 61) при том же экранном габарите.
+    /// Тихая зона здесь бессмысленна: границу локализует сам корреляционный пик
+    /// рамки, а поле стоило 13 % линейного размера клетки (69 клеток полотна
+    /// против 61) при том же экранном габарите.
     ExtrudedStrips = 1,
+    /// v1 с носителем в ЦВЕТНОСТИ: те же полосы, но клетка несёт КОМПЛЕКСНОЕ
+    /// значение ЗЧ через отображение постоянной яркости (§5.1-CL).
+    ///
+    /// Даёт +9.2 дБ на РАЗДЕЛЕНИЕ КОРНЕЙ (замерено: 0.4227 -> 0.1468), то есть
+    /// на определение оси и поворота, — но НЕ на устойчивость к расфокусу
+    /// (0.697 против 0.702) и НЕ на подавление загромождения. Взамен рамка
+    /// становится нечитаемой на аппарате с испорченной цветностью. Поэтому
+    /// НЕ является умолчанием, см. документацию [`BorderMode::ExtrudedStrips`]
+    /// и отчёт по несущей.
+    ExtrudedStripsChroma = 2,
 }
 
 impl BorderMode {
-    fn from_raw(v: u32) -> Self {
-        if v == 0 {
-            Self::LegacyInverted
-        } else {
-            Self::ExtrudedStrips
-        }
+    /// Кодовая точка 3 не определена: это НЕ «на что-нибудь похожее», а испорченный
+    /// код — пусть честно провалится в [`ProfileError::BadField`].
+    fn from_raw(v: u32) -> Option<Self> {
+        Some(match v {
+            0 => Self::LegacyInverted,
+            1 => Self::ExtrudedStrips,
+            2 => Self::ExtrudedStripsChroma,
+            _ => return None,
+        })
+    }
+
+    /// Старая рамка v0 (два кольца с инверсией, тихая зона значима).
+    pub fn is_legacy(self) -> bool {
+        matches!(self, Self::LegacyInverted)
+    }
+
+    /// Носитель значения — ЦВЕТНОСТЬ (комплексная ЗЧ), а не яркость.
+    pub fn is_chroma_carrier(self) -> bool {
+        matches!(self, Self::ExtrudedStripsChroma)
     }
 }
 
@@ -275,9 +299,10 @@ impl CalibProfile {
     /// стороне вместо 69, что при том же экранном габарите даёт +13 % на
     /// линейный размер клетки и +28 % на площадь.
     pub fn quiet_zone_cells(&self) -> u8 {
-        match self.border {
-            BorderMode::LegacyInverted => 2 * (self.quiet_zone + 1),
-            BorderMode::ExtrudedStrips => 0,
+        if self.border.is_legacy() {
+            2 * (self.quiet_zone + 1)
+        } else {
+            0
         }
     }
     /// число бит хромы на ячейку для текущего `chroma_mode` (§5.1):
@@ -362,8 +387,8 @@ impl CalibProfile {
         w.write(self.crosstalk_gb_q as u32, 4);
         w.write(self.quiet_zone as u32, 2);
         w.write(self.fec_overhead as u32, 3);
-        w.write(self.border as u32, 1); // редакция рамки §3.2
-        w.write(0, 3); // reserved
+        w.write(self.border as u32, 2); // редакция рамки §3.2
+        w.write(0, 2); // reserved
         w.write(0, 8); // место CRC, заполним ниже
         w.finish()
     }
@@ -407,8 +432,8 @@ impl CalibProfile {
         let crosstalk_gb_q = r.read(4) as u8;
         let quiet_zone = r.read(2) as u8;
         let fec_overhead = r.read(3) as u8;
-        let border = BorderMode::from_raw(r.read(1));
-        let _reserved = r.read(3); // 3 бита, игнорируем
+        let border = BorderMode::from_raw(r.read(2)).ok_or(ProfileError::BadField("border"))?;
+        let _reserved = r.read(2); // 2 бита, игнорируем
 
         let p = Self {
             version,
@@ -633,7 +658,11 @@ mod tests {
     /// `ChromaMode` 5..7. Регресс на расширение формата провалит этот тест.
     #[test]
     fn border_mode_roundtrips_in_existing_field() {
-        for m in [BorderMode::LegacyInverted, BorderMode::ExtrudedStrips] {
+        for m in [
+            BorderMode::LegacyInverted,
+            BorderMode::ExtrudedStrips,
+            BorderMode::ExtrudedStripsChroma,
+        ] {
             let mut p = sample();
             p.border = m;
             let s = p.encode_string().unwrap();

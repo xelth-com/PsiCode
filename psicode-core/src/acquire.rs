@@ -56,7 +56,7 @@
 //!   лево↔право (1↔2). То есть пер-осевые пары корней не украшение, а несущая
 //!   конструкция — без них ориентация была бы двузначной.
 
-use crate::zcborder::{corr_complex, side_reference, BorderSpec, RING};
+use crate::zcborder::{corr_complex, side_reference, BorderSpec, Carrier, RING};
 use alloc::vec::Vec;
 
 /// Отладочный вывод стадий захвата (переменная окружения PSICODE_ACQ_DEBUG).
@@ -77,11 +77,43 @@ const ANGLE_STEP_DEG: f64 = 3.5;
 /// Полудиапазон наклона в плоскости, градусы.
 const TILT_MAX_DEG: f64 = 10.5;
 /// Сколько затравок несём в отращивание (после подавления немаксимумов).
-const MAX_SEEDS: usize = 48;
+///
+/// Верная затравка практически всегда в первой десятке по корреляции (на живых
+/// снимках она и есть максимум), а каждая лишняя стоит полного отращивания с
+/// доводкой по четырём сторонам. 48 -> 32 заметно срезает время захвата, не меняя
+/// ни одного исхода на замеренных сценах.
+const MAX_SEEDS: usize = 32;
 /// Порог затравочной корреляции.
 const SEED_MIN: f64 = 0.55;
 /// Порог принятия итогового захвата (средняя корреляция четырёх сторон).
-pub const ACQUIRE_MIN: f64 = 0.40;
+///
+/// ИЗМЕРЕНО на живых кадрах, а не выбрано круглым числом. Распределения:
+/// * символ ЕСТЬ (рамка v1, реальная сцена): 0.951..0.968;
+/// * символа НЕТ (реальные экраны с Excel/терминалом): 0.206..0.268.
+///
+/// Порог ставится в середину зазора по логарифму: 0.55 даёт запас 2.1× снизу
+/// от истинных и 2.05× сверху от мусора. Прежние 0.40 отстояли от мусора всего
+/// на 0.13 и на живом телефоне были пробиты (score 0.4359 на кадре без символа).
+pub const ACQUIRE_MIN: f64 = 0.55;
+/// Порог для КАЖДОЙ стороны в отдельности.
+///
+/// Среднее по четырём сторонам — плохая одиночная статистика: «одна сильная
+/// сторона + три шумовых» даёт ровно 0.25·1.0 + 0.75·0.25 ≈ 0.44, то есть
+/// садится точно на старый порог. У настоящей рамки v1 стороны РОВНЫЕ
+/// (0.94..0.97), у мусора минимальная сторона 0.09..0.27.
+pub const SIDE_MIN: f64 = 0.55;
+/// Минимальное структурное отношение полосы ([`Acquisition::strip_ratio`]).
+///
+/// ИЗМЕРЕНО на живых кадрах:
+/// * символ ЕСТЬ (рамка v1): 8.6..13.0;
+/// * символа НЕТ (реальные экраны): 1.05..1.92.
+///
+/// Это самый сильный из трёх признаков, и понятно почему: он проверяет ровно то,
+/// что рамку ОПРЕДЕЛЯЕТ, — одну и ту же последовательность на двух соседних
+/// рядах и её ОТСУТСТВИЕ на клетку наружу и на клетку вглубь. Текст и таблицы
+/// такой структуры не имеют ни при каком масштабе, поэтому у них отношение ~1.
+/// Порог 3.0 стоит в зазоре: 1.6× над мусором, 2.9× под истинными.
+pub const STRIP_RATIO_MIN: f64 = 3.0;
 /// Минимальный отрыв лучшей ориентации от второй.
 pub const ORIENT_MARGIN: f64 = 0.10;
 /// Глубина щупа внутри полосы, в клетках от внешнего края.
@@ -207,6 +239,21 @@ pub struct Acquisition {
     pub margin: f64,
     /// Оценка px на клетку.
     pub px_per_cell: f64,
+    /// Найденная раскладка — вход для дешёвого [`track`] на следующем кадре.
+    pub place: Placement,
+    /// Корреляция КАЖДОЙ стороны по отдельности (в каноническом порядке).
+    ///
+    /// Среднее скрывает форму отказа: ложное срабатывание на тексте обычно даёт
+    /// одну сильную сторону и три слабых, а настоящий символ — четыре ровных.
+    pub sides: [f64; 4],
+    /// СТРУКТУРНАЯ проверка полосы: во сколько раз корреляция ВНУТРИ полосы
+    /// сильнее корреляции на клетку НАРУЖУ и на клетку ВГЛУБЬ от неё.
+    ///
+    /// Определяющее свойство рамки v1 — одна и та же последовательность на двух
+    /// соседних рядах и НЕ на соседях этих рядов. Загромождение (текст, таблицы)
+    /// такой структуры не имеет, поэтому отношение у него около единицы, а у
+    /// настоящей рамки — заметно больше.
+    pub strip_ratio: f64,
 }
 
 /// Затравка: гипотеза о положении КАНОНИЧЕСКОЙ ВЕРХНЕЙ стороны.
@@ -245,6 +292,16 @@ pub struct AcquireOpts {
     pub probe_depth: f64,
     /// Порог затравочной корреляции.
     pub seed_min: f64,
+    /// Сколько потоков пустить на затравочный скан; `None` — по числу ядер.
+    /// `Some(1)` принудительно возвращает однопоточный путь (для замеров).
+    pub threads: Option<usize>,
+    /// Приёмочный гейт: (средняя корреляция, минимальная сторона, отношение полосы).
+    ///
+    /// Пороги — свойство РАМКИ, а не алгоритма: у полосы v1 стороны ровные и
+    /// гейт можно ставить высоко, у кольца v0 под реальным расфокусом стороны
+    /// заведомо неровные (замерено 0.99 / 0.19 / 0.33 / 0.37 на одном символе),
+    /// и тот же гейт отверг бы настоящий символ. Поэтому это параметр вызова.
+    pub gate: (f64, f64, f64),
 }
 
 impl Default for AcquireOpts {
@@ -256,6 +313,8 @@ impl Default for AcquireOpts {
             scale_ratio: SCALE_RATIO,
             probe_depth: PROBE_DEPTH_STRIP,
             seed_min: SEED_MIN,
+            threads: None,
+            gate: (ACQUIRE_MIN, SIDE_MIN, STRIP_RATIO_MIN),
         }
     }
 }
@@ -263,20 +322,168 @@ impl Default for AcquireOpts {
 /// Захват символа по корреляции ЗЧ-рамки. `field` — поле корреляции (яркость
 /// или цветность как комплексная величина).
 pub fn acquire(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Option<Acquisition> {
+    acquire_inner(spec, field, opts).filter(|a| accepted(a, opts.gate))
+}
+
+fn acquire_inner(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Option<Acquisition> {
     let seeds = seed_scan(spec, field, opts);
+    // Отращивание и проверка независимы по затравкам, поэтому раскладываются по
+    // потокам так же, как затравочный скан. После распараллеливания скана именно
+    // эта стадия стала узким местом (у затравок разная судьба: часть отсеивается
+    // сразу, часть доходит до полной 4-сторонней проверки), поэтому чередующийся
+    // шаг здесь тоже важнее блочного.
+    let want = opts
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |v| v.get()));
+    let nthreads = want.clamp(1, MAX_THREADS).min(seeds.len().max(1));
+    let best = if nthreads <= 1 {
+        best_of_seeds(spec, field, opts, &seeds, 0, 1)
+    } else {
+        let seeds = &seeds;
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..nthreads)
+                .map(|t| sc.spawn(move || best_of_seeds(spec, field, opts, seeds, t, nthreads)))
+                .collect();
+            let mut acc: Option<Acquisition> = None;
+            for h in handles {
+                if let Ok(Some(a)) = h.join() {
+                    acc = Some(pick_better(acc, a));
+                }
+            }
+            acc
+        })
+    };
+    best
+}
+
+/// Проходит ли гипотеза приёмочный гейт (§3.2).
+///
+/// Гейт СОСТАВНОЙ, и это существенно. Средняя корреляция четырёх сторон одна
+/// по себе плохо отделяет символ от загромождённого экрана: текст и таблицы
+/// дают одну-две сильные стороны, среднее подтягивается, и порог по нему
+/// приходится ставить так низко, что мимо проходит мусор (замер на живом
+/// телефоне: score 0.4359 при пороге 0.40 на кадре, где символа НЕ БЫЛО).
+/// Поэтому проверяются ещё две вещи, которых у мусора нет по построению:
+/// РОВНОСТЬ сторон и СТРУКТУРА полосы (см. [`Acquisition::strip_ratio`]).
+pub fn accepted(a: &Acquisition, gate: (f64, f64, f64)) -> bool {
+    a.score >= gate.0
+        && a.margin >= ORIENT_MARGIN
+        && a.sides.iter().cloned().fold(f64::INFINITY, f64::min) >= gate.1
+        && a.strip_ratio >= gate.2
+}
+
+/// ДИАГНОСТИКА: лучшая гипотеза БЕЗ приёмочного гейта.
+///
+/// Существует ради измерения ЗАЗОРА между «символ есть» и «символа нет»: порог
+/// имеет смысл только как зазор, и увидеть его можно лишь глядя на отвергнутое.
+pub fn acquire_best_unfiltered(
+    spec: &BorderSpec,
+    field: &Field,
+    opts: &AcquireOpts,
+) -> Option<Acquisition> {
+    acquire_inner(spec, field, opts)
+}
+
+/// Лучшая гипотеза среди затравок `seeds[t], seeds[t+step], ...`.
+fn best_of_seeds(
+    spec: &BorderSpec,
+    field: &Field,
+    opts: &AcquireOpts,
+    seeds: &[Seed],
+    t: usize,
+    step: usize,
+) -> Option<Acquisition> {
     let mut best: Option<Acquisition> = None;
-    for seed in seeds {
-        let grown = match grow(spec, field, opts.probe_depth, seed) {
-            Some(g) => g,
-            None => continue,
-        };
-        if let Some(a) = verify(spec, field, opts.probe_depth, &grown) {
-            if best.as_ref().map_or(true, |b| a.score > b.score) {
-                best = Some(a);
+    let mut k = t;
+    while k < seeds.len() {
+        if let Some(grown) = grow(spec, field, opts.probe_depth, seeds[k]) {
+            if let Some(a) = verify(spec, field, opts.probe_depth, &grown) {
+                best = Some(pick_better(best, a));
+            }
+        }
+        k += step;
+    }
+    best
+}
+
+/// Выбор лучшей из двух гипотез с ДЕТЕРМИНИРОВАННЫМ доразрешением ничьих:
+/// иначе число потоков могло бы менять исход на равных score.
+fn pick_better(cur: Option<Acquisition>, a: Acquisition) -> Acquisition {
+    match cur {
+        None => a,
+        Some(b) => {
+            if a.score > b.score || (a.score == b.score && key(&a.place) < key(&b.place)) {
+                a
+            } else {
+                b
             }
         }
     }
-    best.filter(|a| a.score >= ACQUIRE_MIN && a.margin >= ORIENT_MARGIN)
+}
+
+/// СЛЕЖЕНИЕ: дешёвая доводка от раскладки предыдущего кадра.
+///
+/// Захват стоит сотни миллисекунд, потому что перебирает масштаб, угол и
+/// положение. На соседнем кадре всё это уже известно с точностью до дрожания
+/// руки, поэтому достаточно того же совместного паттерн-поиска по четырём
+/// сторонам, что завершает захват ([`refine_all`]): 4 × (N−2) щупов на
+/// вычисление цели, десятки вычислений — единицы миллисекунд.
+///
+/// `None` — доводка не удержала порог; вызывающий обязан перезахватить.
+pub fn track(
+    spec: &BorderSpec,
+    field: &Field,
+    opts: &AcquireOpts,
+    prev: &Placement,
+) -> Option<Acquisition> {
+    // Сперва МАЛЕНЬКИЙ ИСЧЕРПЫВАЮЩИЙ поиск трансляции, потом мелкая доводка.
+    //
+    // Одним только жадным покоординатным спуском тут не обойтись: корреляция
+    // вдоль стороны периодична с периодом в клетку, поэтому у цели есть рябь, и
+    // спуск из точки прошлого кадра садится в соседний локальный максимум в
+    // полклетки от истины (замерено: сдвиг (3, 2) px восстанавливался как
+    // (5.0, 0.0)). Сетка ±1 клетка с шагом 0.25 накрывает межкадровое дрожание
+    // целиком и выбирает ПРАВИЛЬНЫЙ бассейн — 81 вычисление цели, единицы
+    // миллисекунд, всё ещё на два порядка дешевле захвата.
+    let mut best = *prev;
+    let mut bs = f64::MIN;
+    for gy in -4i32..=4 {
+        for gx in -4i32..=4 {
+            let cand = Placement {
+                origin: (
+                    prev.origin.0 + gx as f64 * 0.25 * prev.scale,
+                    prev.origin.1 + gy as f64 * 0.25 * prev.scale,
+                ),
+                ..*prev
+            };
+            let v = side_score(spec, field, opts.probe_depth, &cand);
+            if v > bs {
+                bs = v;
+                best = cand;
+            }
+        }
+    }
+    let place = refine_all(spec, field, opts.probe_depth, best, REFINE_STEP_TRACK);
+    verify(spec, field, opts.probe_depth, &place).filter(|a| accepted(a, opts.gate))
+}
+
+/// Средняя корреляция четырёх сторон при данной раскладке — цель доводки.
+fn side_score(spec: &BorderSpec, field: &Field, probe_depth: f64, p: &Placement) -> f64 {
+    let n = spec.n;
+    let mut acc = 0.0;
+    for j in 0..4 {
+        let pr = side_probes(spec, j, probe_depth, n);
+        let got: Vec<(f64, f64)> = pr
+            .iter()
+            .map(|&(cu, cv, _)| {
+                let (x, y) = p.map(cu, cv);
+                field.bilin(x, y)
+            })
+            .collect();
+        let want: Vec<(f64, f64)> = pr.iter().map(|&(_, _, w)| w).collect();
+        acc += corr_slice(&got, &want);
+    }
+    acc / 4.0
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +507,9 @@ fn seed_scan(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Vec<Seed> 
         })
         .collect();
 
-    let mut out: Vec<Seed> = Vec::new();
+    // Перечисляем ГИПОТЕЗЫ (масштаб, угол) заранее: так их можно разложить по
+    // потокам, а порядок обхода перестаёт влиять на результат.
+    let mut hyps: Vec<(f64, f64)> = Vec::new();
     let mut scale = opts.px_per_cell.0;
     while scale <= opts.px_per_cell.1 * 1.0001 {
         let steps = (opts.tilt_max_deg / opts.angle_step_deg).floor() as i32;
@@ -309,34 +518,49 @@ fn seed_scan(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Vec<Seed> 
             // две оси: θ и θ+90° — вместе с обоими направлениями обхода они
             // покрывают все четыре поворота снимка.
             for axis in 0..2 {
-                let theta = theta0 + axis as f64 * core::f64::consts::FRAC_PI_2;
-                scan_axis(
-                    field, scale, theta, probe_depth, &tmpl, i0, n, opts.seed_min, &mut out,
-                );
+                hyps.push((scale, theta0 + axis as f64 * core::f64::consts::FRAC_PI_2));
             }
         }
         scale *= opts.scale_ratio;
     }
+    let mut out = scan_hypotheses(field, &hyps, probe_depth, &tmpl, i0, n, opts);
 
     // подавление немаксимумов: затравки, стоящие ближе половины окна и с близким
     // масштабом, — одна и та же гипотеза.
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(core::cmp::Ordering::Equal));
+    // Сортировка с ДЕТЕРМИНИРОВАННЫМ доразрешением: при равных score порядок
+    // должен зависеть только от геометрии, иначе число потоков меняло бы, какая
+    // из равных затравок переживёт подавление немаксимумов.
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then(key(&a.place).partial_cmp(&key(&b.place)).unwrap_or(core::cmp::Ordering::Equal))
+    });
     let mut keep: Vec<Seed> = Vec::new();
     for s in out {
+        // Подавление немаксимумов идёт в пространстве РАСКЛАДКИ, а не «где-то
+        // рядом на картинке». Затравка — это (origin, масштаб, угол) целиком, и
+        // две затравки на ОДНОЙ линии, различающиеся тем, какому индексу
+        // последовательности сопоставлен отсчёт, дают origin, разнесённые на
+        // целое число клеток ВДОЛЬ стороны. Это РАЗНЫЕ гипотезы: у одной лаг
+        // нулевой, у другой — целая клетка, и отращивание лаг не вытянет.
+        //
+        // Дедупликация по «середине стороны» их сливала (радиус в полокна ≈ 8
+        // клеток), и какая из них выживет, решал порядок сортировки — на
+        // бесшумной сцене, где десятки затравок имеют score ровно 1.0, это
+        // означало лотерею и потерю поворота на 180°.
+        //
+        // Направление обхода тоже входит в ключ: последовательность палиндромна,
+        // поэтому две гипотезы одной линии различаются ровно им (см. док модуля).
         let dup = keep.iter().any(|k| {
-            let a = s.place.map(n as f64 / 2.0, probe_depth);
-            let b = k.place.map(n as f64 / 2.0, probe_depth);
-            let d = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
-            // В ключ подавления ОБЯЗАТЕЛЬНО входит направление обхода: две
-            // палиндромные гипотезы одной линии дают ОДНУ И ТУ ЖЕ середину
-            // стороны и различаются ровно направлением (на 180°). Без этого
-            // условия верная из них подавляется ложной, и символ, повёрнутый
-            // на 180°, не находится вовсе.
+            let d = ((s.place.origin.0 - k.place.origin.0).powi(2)
+                + (s.place.origin.1 - k.place.origin.1).powi(2))
+            .sqrt();
             let dth = (s.place.theta - k.place.theta).abs() % core::f64::consts::TAU;
             let dth = dth.min(core::f64::consts::TAU - dth);
-            d < SEED_TAPS as f64 * 0.5 * s.place.scale
-                && (s.place.scale / k.place.scale - 1.0).abs() < 0.3
-                && dth < 0.5
+            d < 0.75 * s.place.scale
+                && (s.place.scale / k.place.scale - 1.0).abs() < 0.1
+                && dth < 0.1
         });
         if !dup {
             keep.push(s);
@@ -356,6 +580,74 @@ fn seed_scan(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Vec<Seed> 
         }
     }
     keep
+}
+
+/// Ключ детерминированного доразрешения ничьих (только геометрия).
+fn key(p: &Placement) -> f64 {
+    p.origin.0 * 4096.0 + p.origin.1 * 16.0 + p.theta
+}
+
+/// Верхняя граница числа рабочих потоков захвата.
+///
+/// Захват идёт на телефоне вперемешку с камерой и ISP; забирать все ядра
+/// невежливо и на практике не ускоряет — упирается в память.
+const MAX_THREADS: usize = 8;
+
+/// Прогон всех гипотез (масштаб, угол). Гипотезы независимы, поэтому раскладка
+/// по потокам тривиальна; чередующийся шаг (`step_by`) выравнивает нагрузку —
+/// стоимость гипотезы ~1/масштаб², и подряд идущие сильно разнятся.
+///
+/// `psicode-core` — no_std + alloc, но модуль захвата и так собирается только
+/// под фичей `std` (нужна вещественная математика), поэтому потоки здесь
+/// доступны безусловно; при `available_parallelism() == 1` остаётся ровно
+/// прежний однопоточный путь.
+#[allow(clippy::too_many_arguments)]
+fn scan_hypotheses(
+    field: &Field,
+    hyps: &[(f64, f64)],
+    probe_depth: f64,
+    tmpl: &[(f64, f64)],
+    i0: usize,
+    n: usize,
+    opts: &AcquireOpts,
+) -> Vec<Seed> {
+    let want = opts
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |v| v.get()));
+    let nthreads = want.clamp(1, MAX_THREADS).min(hyps.len().max(1));
+    if nthreads <= 1 {
+        let mut out = Vec::new();
+        for &(scale, theta) in hyps {
+            scan_axis(field, scale, theta, probe_depth, tmpl, i0, n, opts.seed_min, &mut out);
+        }
+        return out;
+    }
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|t| {
+                sc.spawn(move || {
+                    let mut local = Vec::new();
+                    let mut k = t;
+                    while k < hyps.len() {
+                        let (scale, theta) = hyps[k];
+                        scan_axis(
+                            field, scale, theta, probe_depth, tmpl, i0, n, opts.seed_min,
+                            &mut local,
+                        );
+                        k += nthreads;
+                    }
+                    local
+                })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for h in handles {
+            if let Ok(v) = h.join() {
+                out.extend(v);
+            }
+        }
+        out
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -558,40 +850,56 @@ fn grow(spec: &BorderSpec, field: &Field, probe_depth: f64, seed: Seed) -> Optio
     // Четыре стороны фиксируют её совместно: продольная координата одной пары —
     // это поперечная координата другой. Никаких дополнительных щупов (наружу от
     // рамки или внутрь, в payload) для этого не нужно.
-    Some(refine_all(spec, field, probe_depth, place))
+    Some(refine_all(spec, field, probe_depth, place, REFINE_STEP_ACQUIRE))
 }
 
+/// Начальный шаг доводки при ЗАХВАТЕ, в клетках.
+///
+/// Ровно полутолщина полосы: поперечная координата после подгонки по одной
+/// стороне определена лишь с точностью ±1 клетка (полоса однородна по глубине),
+/// и шаг обязан этот разброс перекрывать.
+const REFINE_STEP_ACQUIRE: f64 = 1.0;
+/// Начальный шаг доводки при СЛЕЖЕНИИ, в клетках.
+///
+/// Здесь поперечная координата УЖЕ известна с прошлого кадра, и крупный шаг не
+/// нужен, а ВРЕДЕН: клетка — это ровно период последовательности вдоль стороны,
+/// поэтому шаг в клетку способен перескочить в соседнее выравнивание, которое
+/// коррелирует почти так же хорошо. Полклетки перекрывают дрожание руки между
+/// кадрами (при 10 fps это единицы пикселей) и перескочить не дают.
+const REFINE_STEP_TRACK: f64 = 0.5;
+
 /// Доводка по всем четырём сторонам: паттерн-поиск по (origin, масштаб, угол),
-/// максимизирующий среднюю корреляцию сторон.
-fn refine_all(spec: &BorderSpec, field: &Field, probe_depth: f64, start: Placement) -> Placement {
+/// максимизирующий среднюю корреляцию сторон. `coarse` — начальный шаг в клетках.
+fn refine_all(
+    spec: &BorderSpec,
+    field: &Field,
+    probe_depth: f64,
+    start: Placement,
+    coarse: f64,
+) -> Placement {
     let n = spec.n;
-    let wants: Vec<Vec<(f64, f64)>> = (0..4)
-        .map(|k| {
-            side_reference(spec, k)
-                .iter()
-                .map(|&(_, re, im)| (re, im))
-                .collect()
-        })
-        .collect();
+    let probes: Vec<Vec<(f64, f64, (f64, f64))>> =
+        (0..4).map(|k| side_probes(spec, k, probe_depth, n)).collect();
     let eval = |p: &Placement| -> f64 {
         let mut acc = 0.0;
         for j in 0..4 {
-            let got: Vec<(f64, f64)> = (2..n)
-                .map(|i| {
-                    let (cu, cv) = side_probe(j, i, probe_depth, n);
+            let got: Vec<(f64, f64)> = probes[j]
+                .iter()
+                .map(|&(cu, cv, _)| {
                     let (x, y) = p.map(cu, cv);
                     field.bilin(x, y)
                 })
                 .collect();
-            acc += corr_slice(&got, &wants[j]);
+            let want: Vec<(f64, f64)> = probes[j].iter().map(|&(_, _, w)| w).collect();
+            acc += corr_slice(&got, &want);
         }
         acc / 4.0
     };
     let mut best = start;
     let mut bs = eval(&best);
-    // Поперечная неопределённость — до ±1 клетки (полутолщина полосы), поэтому
-    // старт с шага в клетку; дальше вниз до сотых.
-    for &step in &[1.0f64, 0.5, 0.25, 0.1, 0.04] {
+    // Лестница шагов от `coarse` вниз до сотых долей клетки.
+    let ladder = [coarse, coarse * 0.5, coarse * 0.25, coarse * 0.1, coarse * 0.04];
+    for &step in &ladder {
         let d = step * best.scale;
         let ds = step * 0.01; // относительный шаг масштаба
         let dt = step * 0.004; // шаг угла, радианы
@@ -707,10 +1015,67 @@ fn refine(
 // 3. проверка и ориентация
 // ---------------------------------------------------------------------------
 
-/// Позиция клетки `i` СТОРОНЫ `side` на глубине щупа, в канонических координатах.
+/// Щупы стороны `side` для ДОВОДКИ и ПРОВЕРКИ: позиции и ожидаемые значения.
+///
+/// Для экструдированной полосы читаются ОБА её ряда (глубины `probe_depth ∓ 0.5`,
+/// то есть центры клеток), а не одна серединная линия. Это не про SNR:
+///
+/// * полоса однородна ПОПЕРЁК, поэтому корреляция одной серединной линии почти
+///   не чувствует поперечного сдвига в пределах ±1 клетки — плато;
+/// * из-за плато масштаб оказывался определён лишь до ~0.3 %, а это ±0.2 клетки
+///   набега на 61 клетку, и вместе с поперечным сдвигом крайние строки payload
+///   уезжали за границу клетки: замерено — рамка коррелирует на 1.000, а
+///   payload читается с 28 % ошибок;
+/// * два ряда РАЗНОСЯТ эти степени свободы: сдвиг внутрь ухудшает дальний ряд
+///   (он попадает в payload), наружу — ближний (он уходит из символа).
+///
+/// Для рамки v0 глубина одна: там внутреннее кольцо — ИНВЕРСИЯ внешнего, и
+/// второй ряд нёс бы противоположный знак.
+fn side_probes(
+    spec: &BorderSpec,
+    side: usize,
+    probe_depth: f64,
+    n: usize,
+) -> Vec<(f64, f64, (f64, f64))> {
+    // Полоса v1 (толщина RING, оба ряда одинаковы) допускает и второй ряд, и
+    // приграничные щупы. Кольцо v0 — одна клетка толщиной, и под реальным
+    // расфокусом приграничный щуп попадает в размытый край: замерено, что с
+    // тангенциальными смещениями захват v0 на живых снимках падает с 18/28 до
+    // 8/28. Поэтому для v0 остаётся ОДИН центральный щуп, как и было.
+    let strip = spec.carrier == Carrier::ComplexChroma || probe_depth >= 0.99;
+    let depths: &[f64] = if strip { &[-0.5, 0.5] } else { &[0.0] };
+    let tang: &[f64] = if strip { TANG } else { &[0.0] };
+    let mut out = Vec::with_capacity(depths.len() * tang.len() * (n - 2));
+    for (i, re, im) in side_reference(spec, side) {
+        for &d in depths {
+            for &t in tang {
+                let (cu, cv) = side_probe_at(side, i as f64 + t, probe_depth + d, n);
+                out.push((cu, cv, (re, im)));
+            }
+        }
+    }
+    out
+}
+
+/// Тангенциальные смещения щупа ВДОЛЬ стороны, в клетках.
+///
+/// Без них геометрия определена лишь с точностью до ПОЛКЛЕТКИ: щуп в центре
+/// клетки даёт ровно её значение при любом сдвиге в пределах ±0.5, поэтому у
+/// цели ПЛОСКОЕ плато, и жадный поиск останавливается где угодно на нём. На
+/// реальном снимке плато сглаживает расфокус, но опираться на расфокус как на
+/// источник точности нельзя: на резком снимке (крупная клетка, хорошая оптика)
+/// плато возвращается, и замер это показал — рамка коррелирует на 1.000, а
+/// payload читается с 28 % ошибок из-за 0.27 клетки сдвига.
+///
+/// Щупы у КРАЁВ клетки (±0.3) переходят в соседнюю, как только рассогласование
+/// превышает 0.2 клетки, и тем сужают плато с ±0.5 до ±0.2. Тот же приём
+/// использует выравниватель рамки v0 (`detect::TANG`).
+const TANG: &[f64] = &[-0.3, 0.0, 0.3];
+
+/// Как [`side_probe`], но позиция вдоль стороны — ДРОБНАЯ (в клетках от начала).
 #[inline]
-fn side_probe(side: usize, i: usize, depth: f64, n: usize) -> (f64, f64) {
-    let a = i as f64 + 0.5;
+fn side_probe_at(side: usize, along_cells: f64, depth: f64, n: usize) -> (f64, f64) {
+    let a = along_cells + 0.5;
     let g = n as f64;
     match side & 3 {
         0 => (a, depth),
@@ -732,18 +1097,18 @@ fn verify(
     // стороне, поэтому «сторона снимка j» здесь — просто j-я сторона квадрата.
     let mut m = [[0.0f64; 4]; 4];
     for j in 0..4 {
-        let got: Vec<(f64, f64)> = (2..n)
-            .map(|i| {
-                let (cu, cv) = side_probe(j, i, probe_depth, n);
+        let pr = side_probes(spec, j, probe_depth, n);
+        let got: Vec<(f64, f64)> = pr
+            .iter()
+            .map(|&(cu, cv, _)| {
                 let (x, y) = place.map(cu, cv);
                 field.bilin(x, y)
             })
             .collect();
         for k in 0..4 {
-            let want: Vec<(f64, f64)> = side_reference(spec, k)
-                .iter()
-                .map(|&(_, re, im)| (re, im))
-                .collect();
+            // эталон берётся у СТОРОНЫ k, но на тех же щупах (та же длина)
+            let kr = side_probes(spec, k, probe_depth, n);
+            let want: Vec<(f64, f64)> = kr.iter().map(|&(_, _, w)| w).collect();
             m[j][k] = corr_slice(&got, &want);
         }
     }
@@ -752,6 +1117,31 @@ fn verify(
     // даёт r = 0, а всё прочее означает, что затравка села на чужую сторону или
     // на алиас — такую гипотезу отбрасываем, не пытаясь «починить» поворотом.
     let (r, score, margin) = crate::zcborder::orientation_from_matrix(&m);
+    // Структурная проверка: та же корреляция, но щупы сдвинуты на клетку НАРУЖУ
+    // (depth − 1) и на клетку ВГЛУБЬ (depth + 1). У настоящей полосы там уже не
+    // её последовательность, поэтому корреляция падает.
+    let mut off = 0.0f64;
+    for j in 0..4 {
+        // Смещение на ДВЕ клетки, не на одну: полоса занимает глубины 0..RING,
+        // а щупы берутся парой `depth ∓ 0.5`, поэтому при смещении на клетку
+        // половина «внешних» щупов остаётся ВНУТРИ полосы и отношение вырождается
+        // (замерено: у настоящего символа 1.4, у мусора 1.06..1.54 — не
+        // разделяет вовсе). При смещении на две обе пары уходят наружу.
+        for d in [-2.0f64, 2.0] {
+            let pr = side_probes(spec, j, probe_depth + d, n);
+            let got: Vec<(f64, f64)> = pr
+                .iter()
+                .map(|&(cu, cv, _)| {
+                    let (x, y) = place.map(cu, cv);
+                    field.bilin(x, y)
+                })
+                .collect();
+            let want: Vec<(f64, f64)> = pr.iter().map(|&(_, _, w)| w).collect();
+            off += corr_slice(&got, &want);
+        }
+    }
+    off /= 8.0;
+    let strip_ratio = if off > 1e-6 { score / off } else { f64::INFINITY };
     if dbg_on() {
         std::eprintln!(
             "[acq] verify o=({:.2},{:.2}) s={:.4} th={:.3}° диагональ [{:.3} {:.3} {:.3} {:.3}] r={r} score {score:.3}",
@@ -780,12 +1170,19 @@ fn verify(
     // снимок повёрнут на r четвертей; согласовано с detect::finalize_detection,
     // который читает ZC_ROOTS[(side + 4 − r) % 4].
     let rot = ((4 - tl) % 4) as u8;
+    let mut sides = [0.0f64; 4];
+    for (j, sd) in sides.iter_mut().enumerate() {
+        *sd = m[j][j];
+    }
     Some(Acquisition {
         corners,
         rotation_quadrants: rot,
         score,
         margin,
         px_per_cell: place.scale,
+        place: *place,
+        sides,
+        strip_ratio,
     })
 }
 
@@ -929,6 +1326,141 @@ mod tests {
         }
     }
 
+    /// Распараллеливание НЕ должно менять исход: захват на 1 и на 8 потоках
+    /// обязан дать побитово ту же геометрию.
+    ///
+    /// Это не педантизм: затравки на чистой сцене сплошь имеют score ровно 1.0,
+    /// и без детерминированного доразрешения ничьих (и без подавления
+    /// немаксимумов в пространстве раскладки) число потоков решало бы, какая из
+    /// равных гипотез выживет.
+    #[test]
+    fn threading_does_not_change_the_answer() {
+        let spec = BorderSpec { n: 61, roots: [3, 1, 4, 2], carrier: Carrier::ComplexChroma };
+        let (w, h) = (900usize, 700usize);
+        for rot in 0..4usize {
+            let (re, im) = scene(&spec, w, h, 10.0, 0.0, rot, (120.0, 90.0), 0xACC0_0000 + rot as u64);
+            let f = Field { w, h, re: &re, im: Some(&im) };
+            let base = AcquireOpts {
+                px_per_cell: (9.0, 11.5),
+                tilt_max_deg: 3.5,
+                ..Default::default()
+            };
+            let one = acquire(&spec, &f, &AcquireOpts { threads: Some(1), ..base })
+                .expect("однопоточный захват");
+            let many = acquire(&spec, &f, &AcquireOpts { threads: Some(8), ..base })
+                .expect("многопоточный захват");
+            assert_eq!(one.rotation_quadrants, many.rotation_quadrants, "поворот {rot}");
+            assert_eq!(one.score.to_bits(), many.score.to_bits(), "score, поворот {rot}");
+            for k in 0..4 {
+                assert_eq!(
+                    one.corners[k].0.to_bits(), many.corners[k].0.to_bits(),
+                    "угол {k}.x, поворот {rot}"
+                );
+                assert_eq!(
+                    one.corners[k].1.to_bits(), many.corners[k].1.to_bits(),
+                    "угол {k}.y, поворот {rot}"
+                );
+            }
+        }
+    }
+
+    /// Слежение подхватывает раскладку прошлого кадра и обязано отдать
+    /// геометрию, по которой payload ЧИТАЕТСЯ ТОЧНО.
+    ///
+    /// Проверяется именно декодирование, а не смещение углов: цель доводки —
+    /// корреляция рамки, и требовать от неё восстановления сдвига до пикселя
+    /// значило бы фиксировать в тесте поведение оптимизатора, а не свойство
+    /// системы. Значимо ровно одно — читается ли кадр.
+    #[test]
+    fn track_yields_decodable_geometry_on_the_next_frame() {
+        use crate::profile::{BorderMode, CalibProfile, ChromaMode};
+        use crate::symbol::{self, PAYLOAD_COLS, PAYLOAD_ROWS};
+
+        let p = CalibProfile {
+            version: CalibProfile::VERSION,
+            cell_size_px: 12,
+            frame_hold_periods: 6,
+            luma_bits: 1,
+            chroma_mode: ChromaMode::Mono,
+            gamma_g_q: 28,
+            gamma_r_delta_q: 8,
+            gamma_b_delta_q: 10,
+            white_level_q: 15,
+            black_level_q: 2,
+            noise_sigma_q: 12,
+            mtf_limit_px: 6,
+            torn_frames_q: 0,
+            crosstalk_rg_q: 0,
+            crosstalk_gb_q: 0,
+            quiet_zone: 1,
+            fec_overhead: 2,
+            border: BorderMode::ExtrudedStrips,
+        };
+        let spec = crate::zcborder::spec_for(&p).expect("v1");
+        let mut rng = XorShift64(0x0BAD_F00D_1234_5678);
+        let cells: Vec<u8> = (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+            .map(|_| (rng.next() & 1) as u8)
+            .collect();
+        let frame = symbol::render_symbol(&p, &cells);
+        let sz = frame.size_px;
+        let cw = 1000usize;
+        let opts = AcquireOpts { px_per_cell: (8.0, 17.0), ..Default::default() };
+
+        // кадр N и кадр N+1, символ сместился на (5, 3) px (дрожание руки)
+        let build = |ox: usize, oy: usize| -> Vec<f32> {
+            let mut img = vec![0.0f32; cw * cw];
+            for y in 0..cw {
+                for x in 0..cw {
+                    img[y * cw + x] =
+                        if (y / 11) % 3 == 0 && (x / 8) % 2 == 0 { 0.85 } else { 0.12 };
+                }
+            }
+            let gg = p.gamma_g() as f64;
+            for y in 0..sz {
+                for x in 0..sz {
+                    let d = frame.rgb[y * sz + x][1] as f64 / 255.0;
+                    img[(oy + y) * cw + ox + x] = d.powf(gg) as f32;
+                }
+            }
+            img
+        };
+        let img0 = build(140, 130);
+        let img1 = build(145, 133);
+
+        let f0 = Field { w: cw, h: cw, re: &img0, im: None };
+        let a0 = acquire(&spec, &f0, &opts).expect("захват кадра N");
+        let f1 = Field { w: cw, h: cw, re: &img1, im: None };
+        let a1 = track(&spec, &f1, &opts, &a0.place).expect("слежение на кадре N+1");
+        assert!(a1.score > 0.9, "слежение: score {:.3}", a1.score);
+        assert_eq!(a1.rotation_quadrants, 0);
+
+        // главное: по геометрии слежения payload читается точно
+        let det = crate::detect::detection_from_corners(&a1.corners, a1.rotation_quadrants, a1.score)
+            .expect("невырожденная гомография");
+        let map = crate::detect::frame_map(&p, &det);
+        let sample = |x: f64, y: f64| -> [f32; 3] {
+            let fx = (x - 0.5).clamp(0.0, (cw - 1) as f64);
+            let fy = (y - 0.5).clamp(0.0, (cw - 1) as f64);
+            let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+            let (x1, y1) = ((x0 + 1).min(cw - 1), (y0 + 1).min(cw - 1));
+            let (tx, ty) = (fx - x0 as f64, fy - y0 as f64);
+            let g = |ix: usize, iy: usize| img1[iy * cw + ix] as f64;
+            let top = g(x0, y0) + (g(x1, y0) - g(x0, y0)) * tx;
+            let bot = g(x0, y1) + (g(x1, y1) - g(x0, y1)) * tx;
+            let v = (top + (bot - top) * ty) as f32;
+            [v, v, v]
+        };
+        let got = symbol::demod_symbol_local(&p, &map, &sample);
+        let errs = got.iter().zip(&cells).filter(|(a, b)| a != b).count();
+        eprintln!(
+            "[track] a0 o=({:.2},{:.2}) s={:.4} th={:.4}°  a1 o=({:.2},{:.2}) s={:.4} th={:.4}°               истина o=(145,133) s=12  score {:.3} ошибок {errs}/{}",
+            a0.place.origin.0, a0.place.origin.1, a0.place.scale, a0.place.theta.to_degrees(),
+            a1.place.origin.0, a1.place.origin.1, a1.place.scale, a1.place.theta.to_degrees(),
+            a1.score, cells.len()
+        );
+        assert_eq!(errs, 0, "по геометрии слежения payload прочитан неточно");
+    }
+
     /// Негатив: то же загромождение БЕЗ символа не должно давать захвата.
     #[test]
     fn clutter_alone_is_not_acquired() {
@@ -965,6 +1497,188 @@ mod tests {
             "загромождение без символа принято за захват: score {:?}",
             got.map(|a| a.score)
         );
+        // И ЗАПАС до гейта, а не просто «не прошло»: порог имеет смысл только
+        // как зазор. На живых кадрах без символа лучший кандидат набирает
+        // 0.206..0.268 при пороге 0.55, отношение полосы 1.05..1.92 при пороге
+        // 3.0. Регресс, съевший запас, провалит этот тест ДО того, как отказ
+        // всплывёт на телефоне (а он всплыл: score 0.4359 при пороге 0.40).
+        let raw = acquire_best_unfiltered(&spec, &f, &opts).expect("кандидат есть всегда");
+        assert!(
+            raw.score < 0.5 * opts.gate.0 + 0.5,
+            "лучший кандидат на мусоре {:.4} подобрался к порогу {:.2}",
+            raw.score,
+            opts.gate.0
+        );
+        assert!(
+            raw.strip_ratio < opts.gate.2,
+            "структура полосы у мусора {:.2} дошла до порога {:.2}",
+            raw.strip_ratio,
+            opts.gate.2
+        );
+    }
+
+    /// СКВОЗНОЙ круг: рендер символа v1 -> ИЗМЕРЕННЫЙ канал -> захват -> демод,
+    /// точное восстановление payload при всех четырёх поворотах.
+    ///
+    /// Канал ровно тот, что снят с живого телефона (см. отчёт):
+    /// шум 1.79 кода из 255, поле освещённости 0.62..0.86 по кадру,
+    /// расфокус σ = 2 камерных px. Символ рендерится штатным
+    /// [`crate::symbol::render_symbol`] с `BorderMode::ExtrudedStrips`, то есть
+    /// БЕЗ тихой зоны, и вкладывается в загромождённое поле.
+    #[test]
+    fn v1_round_trip_through_measured_channel() {
+        use crate::profile::{BorderMode, CalibProfile, ChromaMode};
+        use crate::symbol::{self, PAYLOAD_COLS, PAYLOAD_ROWS};
+
+        // живой профиль приёмника: 1 бит/клетку, Mono, рамка v1
+        let mut p = CalibProfile {
+            version: CalibProfile::VERSION,
+            cell_size_px: 12,
+            frame_hold_periods: 6,
+            luma_bits: 1,
+            chroma_mode: ChromaMode::Mono,
+            gamma_g_q: 28,
+            gamma_r_delta_q: 8,
+            gamma_b_delta_q: 10,
+            white_level_q: 15,
+            black_level_q: 2,
+            noise_sigma_q: 12,
+            mtf_limit_px: 6,
+            torn_frames_q: 0,
+            crosstalk_rg_q: 0,
+            crosstalk_gb_q: 0,
+            quiet_zone: 1,
+            fec_overhead: 2,
+            border: BorderMode::ExtrudedStrips,
+        };
+        p.border = BorderMode::ExtrudedStrips;
+        // тихой зоны в v1 нет — это и есть проверяемое свойство формата
+        assert_eq!(p.quiet_zone_cells(), 0);
+
+        let mut rng = XorShift64(0x1234_5678_9ABC_DEF0);
+        let cells: Vec<u8> = (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+            .map(|_| (rng.next() & 1) as u8)
+            .collect();
+        let frame = symbol::render_symbol(&p, &cells);
+        let sz = frame.size_px;
+        assert_eq!(sz, 61 * 12, "полотно v1 = 61 клетка, без тихой зоны");
+
+        // холст с загромождением, символ вложен со смещением
+        let cw = 1000usize;
+        let (ox, oy) = (140usize, 130usize);
+        assert!(ox + sz <= cw && oy + sz <= cw);
+        for rot in 0..4u8 {
+            let mut img = vec![0.0f32; cw * cw];
+            for y in 0..cw {
+                for x in 0..cw {
+                    // «терминал»: строки текста + плавный фон
+                    let text = if (y / 11) % 3 == 0 && (x / 8) % 2 == 0 { 0.85 } else { 0.12 };
+                    img[y * cw + x] = text as f32;
+                }
+            }
+            // гамма дисплея -> линейная яркость, как это видит камера
+            let gg = p.gamma_g() as f64;
+            for y in 0..sz {
+                for x in 0..sz {
+                    let d = frame.rgb[y * sz + x][1] as f64 / 255.0;
+                    img[(oy + y) * cw + ox + x] = d.powf(gg) as f32;
+                }
+            }
+            // поворот холста на rot четвертей по часовой
+            for _ in 0..rot {
+                let mut out = vec![0.0f32; cw * cw];
+                for y in 0..cw {
+                    for x in 0..cw {
+                        out[y * cw + x] = img[(cw - 1 - x) * cw + y];
+                    }
+                }
+                img = out;
+            }
+            // поле освещённости 0.62..0.86 (блик в центре + виньетка)
+            for y in 0..cw {
+                for x in 0..cw {
+                    let dx = (x as f64 / cw as f64) - 0.45;
+                    let dy = (y as f64 / cw as f64) - 0.40;
+                    let f = 0.62 + 0.24 * (-(dx * dx + dy * dy) * 4.0).exp();
+                    img[y * cw + x] *= f as f32;
+                }
+            }
+            // расфокус σ = 2 камерных px (сепарабельный гауссиан)
+            let sigma = 2.0f64;
+            let r = (3.0 * sigma).ceil() as isize;
+            let kk: Vec<f64> = (-r..=r)
+                .map(|i| (-((i * i) as f64) / (2.0 * sigma * sigma)).exp())
+                .collect();
+            let ks: f64 = kk.iter().sum();
+            let kk: Vec<f64> = kk.iter().map(|v| v / ks).collect();
+            let cl = |v: isize, n: usize| v.clamp(0, n as isize - 1) as usize;
+            let mut tmp = img.clone();
+            for y in 0..cw {
+                for x in 0..cw {
+                    let mut a = 0.0;
+                    for (t, &kv) in kk.iter().enumerate() {
+                        a += kv * img[y * cw + cl(x as isize + t as isize - r, cw)] as f64;
+                    }
+                    tmp[y * cw + x] = a as f32;
+                }
+            }
+            for y in 0..cw {
+                for x in 0..cw {
+                    let mut a = 0.0;
+                    for (t, &kv) in kk.iter().enumerate() {
+                        a += kv * tmp[cl(y as isize + t as isize - r, cw) * cw + x] as f64;
+                    }
+                    img[y * cw + x] = a as f32;
+                }
+            }
+            // сенсорный шум 1.79 кода из 255
+            let mut nrng = XorShift64(0x9E37_79B9_7F4A_7C15u64 ^ (rot as u64 + 1));
+            for v in img.iter_mut() {
+                let g = {
+                    let u1 = (nrng.unit()).max(1e-12);
+                    let u2 = nrng.unit();
+                    (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos()
+                };
+                *v = (*v as f64 + g * (1.79 / 255.0)).clamp(0.0, 1.0) as f32;
+            }
+
+            // --- захват ---
+            let spec = crate::zcborder::spec_for(&p).expect("v1 -> есть spec");
+            let f = Field { w: cw, h: cw, re: &img, im: None };
+            let opts = AcquireOpts {
+                px_per_cell: (8.0, 17.0),
+                ..Default::default()
+            };
+            let a = acquire(&spec, &f, &opts)
+                .unwrap_or_else(|| panic!("поворот {rot}: символ не найден"));
+            assert_eq!(a.rotation_quadrants, rot, "поворот определён неверно");
+
+            // --- демодуляция через мост detect ---
+            let det = crate::detect::detection_from_corners(&a.corners, a.rotation_quadrants, a.score)
+                .expect("невырожденная гомография");
+            let map = crate::detect::frame_map(&p, &det);
+            let sample = |x: f64, y: f64| -> [f32; 3] {
+                let fx = (x - 0.5).clamp(0.0, (cw - 1) as f64);
+                let fy = (y - 0.5).clamp(0.0, (cw - 1) as f64);
+                let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+                let (x1, y1) = ((x0 + 1).min(cw - 1), (y0 + 1).min(cw - 1));
+                let (tx, ty) = (fx - x0 as f64, fy - y0 as f64);
+                let g = |ix: usize, iy: usize| img[iy * cw + ix] as f64;
+                let top = g(x0, y0) + (g(x1, y0) - g(x0, y0)) * tx;
+                let bot = g(x0, y1) + (g(x1, y1) - g(x0, y1)) * tx;
+                let v = (top + (bot - top) * ty) as f32;
+                [v, v, v]
+            };
+            let got = symbol::demod_symbol_local(&p, &map, &sample);
+            let errs = got.iter().zip(&cells).filter(|(a, b)| a != b).count();
+            eprintln!(
+                "[e2e] поворот {rot}: score {:.3} px/клетку {:.2} ошибок {errs}/{}",
+                a.score,
+                a.px_per_cell,
+                cells.len()
+            );
+            assert_eq!(errs, 0, "поворот {rot}: payload восстановлен неточно");
+        }
     }
 
     /// Диагностика: корреляция каждой стороны при ТОЧНОЙ (ground-truth) геометрии.
@@ -983,7 +1697,7 @@ mod tests {
             for j in 0..4 {
                 let got: Vec<(f64, f64)> = (2..spec.n)
                     .map(|i| {
-                        let (cu, cv) = side_probe(j, i, depth, spec.n);
+                        let (cu, cv) = side_probe_at(j, i as f64, depth, spec.n);
                         let (x, y) = place.map(cu, cv);
                         f.bilin(x, y)
                     })

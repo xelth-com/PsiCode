@@ -228,10 +228,15 @@ fn main() {
     });
 
     let spec = legacy_spec();
+    // PSICODE_ACQ_THREADS=1 принудительно возвращает однопоточный путь (замеры).
+    let threads = std::env::var("PSICODE_ACQ_THREADS").ok().and_then(|v| v.parse().ok());
     let opts = AcquireOpts {
         // «Ничего не знаем о дистанции»: полный рабочий диапазон приёмника.
         px_per_cell: (8.0, 17.0),
         probe_depth: PROBE_DEPTH_LEGACY,
+        threads,
+        // кольцо v0: стороны под расфокусом неровные, гейт ослаблен (см. acquire)
+        gate: (0.40, 0.05, 1.0),
         ..Default::default()
     };
 
@@ -325,10 +330,14 @@ fn main() {
                 let o2 = AcquireOpts {
                     px_per_cell: (8.0, 17.0),
                     probe_depth: PROBE_DEPTH_STRIP,
+                    threads,
+                    seed_min: std::env::var("PSICODE_SEED_MIN").ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(AcquireOpts::default().seed_min),
                     ..Default::default()
                 };
                 let t2 = Instant::now();
-                let r2 = acquire(&v1_spec(), &f2, &o2);
+                let r2 = psicode_core::acquire::acquire_best_unfiltered(&v1_spec(), &f2, &o2);
                 let dt2 = t2.elapsed().as_secs_f64() * 1000.0;
                 v1_ms += dt2;
                 extra = match r2 {
@@ -336,8 +345,9 @@ fn main() {
                         v1_ok += 1;
                         v1_score += a.score;
                         format!(
-                            " | v1 НАЙДЕН {:.3} {:.2}px (истина {:.2}, {:.0}мс)",
-                            a.score, a.px_per_cell, cell, dt2
+                            " | v1 {:.3} стороны[{:.2} {:.2} {:.2} {:.2}] полоса {:.1} отрыв {:.2} {:.2}px (истина {:.2})",
+                            a.score, a.sides[0], a.sides[1], a.sides[2], a.sides[3],
+                            a.strip_ratio, a.margin, a.px_per_cell, cell
                         )
                     }
                     None => format!(" | v1 нет ({dt2:.0}мс)"),

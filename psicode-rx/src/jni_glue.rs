@@ -16,6 +16,7 @@ use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use crate::session::RxSession;
+use psicode_core::profile::BorderMode;
 
 /// Безопасный JSON-статус на случай паники/битого хэндла (совпадает по схеме с
 /// [`crate::session::FrameStatus::to_json`]).
@@ -39,6 +40,38 @@ pub extern "system" fn Java_com_xelth_psicode_PsiCodeCore_rxInit<'local>(
             12
         };
         Box::into_raw(Box::new(RxSession::with_cell_mode(cell, chromatic != 0))) as jlong
+    })
+    .unwrap_or(0)
+}
+
+/// `PsiCodeCore.rxInitBorder(profileCellPx: Int, chromatic: Int, border: Int): Long`
+/// — то же, что [`Java_com_xelth_psicode_PsiCodeCore_rxInit`], но с явным
+/// выбором РЕДАКЦИИ ЗЧ-РАМКИ (§3.2): 0 = v0 (тихая зона есть), 1 = v1
+/// (экструдированные полосы, тихой зоны нет), 2 = v1 с носителем в цветности.
+///
+/// Отдельная точка входа, а не новый аргумент у `rxInit`: подпись `rxInit`
+/// зафиксирована в приложении, и менять её ради флага — ломать существующий
+/// вызов на ровном месте. Неизвестное значение трактуется как 0.
+#[no_mangle]
+pub extern "system" fn Java_com_xelth_psicode_PsiCodeCore_rxInitBorder<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    profile_cell_px: jint,
+    chromatic: jint,
+    border: jint,
+) -> jlong {
+    catch_unwind(|| {
+        let cell = if (8..256).contains(&profile_cell_px) {
+            profile_cell_px as u8
+        } else {
+            12
+        };
+        let b = match border {
+            1 => BorderMode::ExtrudedStrips,
+            2 => BorderMode::ExtrudedStripsChroma,
+            _ => BorderMode::LegacyInverted,
+        };
+        Box::into_raw(Box::new(RxSession::with_cell_border(cell, chromatic != 0, b))) as jlong
     })
     .unwrap_or(0)
 }

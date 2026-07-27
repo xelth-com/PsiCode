@@ -31,6 +31,13 @@ object PsiCodeCore {
     external fun rxInit(profileCellPx: Int, chromatic: Int): Long
 
     /**
+     * То же плюс явный выбор редакции ЗЧ-рамки (§3.2):
+     * 0 = v0 (тихая зона есть), 1 = v1 (полосы, зоны нет), 2 = v1 в цветности.
+     * Рамка НЕ определяется автоматически — приёмник ищет ту, что ему назвали.
+     */
+    external fun rxInitBorder(profileCellPx: Int, chromatic: Int, border: Int): Long
+
+    /**
      * Скормить один YUV_420_888 кадр. Плоскости передаются как есть (с row padding);
      * strides из [android.media.Image.Plane]. Возвращает JSON-статус (см. MainActivity).
      */

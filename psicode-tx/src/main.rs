@@ -13,15 +13,15 @@
 //!     счётчик кадров сверху/снизу для оценки rolling-shutter). C или закрытие
 //!     окна -> консольный запрос кода профиля с телефона.
 //!
-//! psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--calib] [--smoke]
+//! psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--calib] [--v1] [--smoke]
 //!     Стриминг файла кадрами L3 (§6.1/§6.2). Профиль: --code, иначе
 //!     psicode-tx.profile из cwd, иначе эталон §6/§7.4. Цикл бесконечен, Esc — выход.
 //!
-//! psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]
+//! psicode-tx single [--counter N] [--cell N] [--chroma] [--v1] [--smoke]
 //!     Один статический кадр с детерминированной псевдослучайной нагрузкой —
 //!     навести камеру, проверить детекцию ЗЧ на живом экране.
 //!
-//! psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--smoke]
+//! psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--v1] [--smoke]
 //!     [ДИАГНОСТИКА] Лестница масштабов §5.1-CL (см. psicode_core::swatch):
 //!     штатная геометрия символа, но payload заменён на n×n КРУПНЫХ блоков
 //!     известной цветности. Кадр анимирован (счётчик §3.3 несёт его номер),
@@ -38,6 +38,12 @@
 //! поле освещённости приёмника сокращается в поклеточном отношении каналов.
 //! Флаг применяется ПОВЕРХ разрешённого профиля (--code / файл / эталон), то
 //! есть меняет только отображение цвета, не трогая геометрию и тайминг.
+//!
+//! `--v1` включает редакцию ЗЧ-рамки v1 (§3.2, `BorderMode::ExtrudedStrips`):
+//! четыре ЭКСТРУДИРОВАННЫЕ полосы вместо двух колец, ТИХОЙ ЗОНЫ НЕТ — полотно
+//! ровно 61 клетка вместо 69 (при quiet=1), что при том же экранном габарите
+//! даёт крупнее клетку (+13 % на линейный размер). Применяется ПОВЕРХ
+//! разрешённого профиля (--code / файл / эталон) и ортогонален `--chroma`.
 //!
 //! `--smoke` автозакрывает окно после ~20 кадров (для CI и быстрой проверки).
 //!
@@ -59,6 +65,7 @@ use frames::{
     calibration_counter_frame, calibration_frame, chromatic_profile, reference_profile,
     single_frame, swatch_frame, to_const_luma, RgbFrame, Streamer, SYMBOLS_PER_FRAME,
 };
+use psicode_core::profile::BorderMode;
 use psicode_core::swatch;
 use psicode_core::CalibProfile;
 
@@ -71,6 +78,13 @@ use winit::window::{Window, WindowId};
 
 /// Смоук-режим: автозакрытие после стольких кадров.
 const SMOKE_FRAMES: u64 = 20;
+/// Сторона символьного полотна БЕЗ тихой зоны, в клетках (§3.2). Совпадает с
+/// `psicode_core::symbol::GRID`/`calibrate::GRID`.
+const SYMBOL_GRID_CELLS: usize = 61;
+/// Наименьший размер клетки показа в px: ниже него демодулятор §symbol теряет
+/// 2×2 субсэмплинг (`sample_cell` субсэмплит только при cell >= 8). Опускаться
+/// ниже нельзя — вместо обрезки символа мы отказываемся показывать (§bug).
+const MIN_DISPLAY_CELL: usize = 8;
 /// Файл нормализованного кода профиля рядом с exe/cwd.
 const PROFILE_FILE: &str = "psicode-tx.profile";
 /// Средне-серый фон окна (§3.1), softbuffer-формат 0x00RRGGBB.
@@ -95,9 +109,9 @@ fn main() {
 /// Разобранная команда CLI.
 enum Command {
     Calibrate { cell: usize, smoke: bool },
-    Stream { file: String, code: Option<String>, cell: Option<usize>, chroma: bool, calib: bool, smoke: bool },
-    Single { counter: u8, cell: Option<usize>, chroma: bool, smoke: bool },
-    Swatch { n: usize, sweep: bool, cell: Option<usize>, smoke: bool },
+    Stream { file: String, code: Option<String>, cell: Option<usize>, chroma: bool, calib: bool, v1: bool, smoke: bool },
+    Single { counter: u8, cell: Option<usize>, chroma: bool, v1: bool, smoke: bool },
+    Swatch { n: usize, sweep: bool, cell: Option<usize>, v1: bool, smoke: bool },
 }
 
 fn print_usage() {
@@ -106,15 +120,18 @@ fn print_usage() {
          \n\
          Использование:\n\
          \x20 psicode-tx calibrate [--cell N] [--smoke]\n\
-         \x20 psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--calib] [--smoke]\n\
-         \x20 psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]\n\
-         \x20 psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--smoke]\n\
+         \x20 psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--calib] [--v1] [--smoke]\n\
+         \x20 psicode-tx single [--counter N] [--cell N] [--chroma] [--v1] [--smoke]\n\
+         \x20 psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--v1] [--smoke]\n\
          \n\
          \x20 swatch:   [ДИАГНОСТИКА] лестница масштабов — n×n крупных однородных\n\
          \x20           блоков вместо payload; --sweep даёт плотную развёртку всей\n\
          \x20           плоскости цветности за 256 кадров.\n\
          \x20 --chroma: отображение ПОСТОЯННОЙ ЯРКОСТИ §5.1-CL (ConstLuma1,\n\
          \x20           2 бит/клетку) — символ целиком в цветности, R+G+B ≡ const.\n\
+         \x20 --v1:     редакция ЗЧ-рамки v1 §3.2 (ExtrudedStrips): тихой зоны\n\
+         \x20           нет, полотно ровно 61 клетка (у v0 — 69 при quiet=1);\n\
+         \x20           ортогонален --chroma, применяется ПОВЕРХ профиля.\n\
          \x20 --calib:  вплетать ВНУТРИПОЛОСНЫЕ калибровочные кадры §4-IB по\n\
          \x20           расписанию удвоения 0,1,2,4,...,128 и далее каждые 128\n\
          \x20           (0.78 % в установившемся режиме). Приёмник снимает с них\n\
@@ -132,6 +149,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut counter: u8 = 0;
     let mut chroma = false;
     let mut calib = false;
+    let mut v1 = false;
     let mut smoke = false;
     let mut n = 1usize;
     let mut sweep = false;
@@ -180,6 +198,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 calib = true;
                 i += 1;
             }
+            "--v1" => {
+                v1 = true;
+                i += 1;
+            }
             "--smoke" => {
                 smoke = true;
                 i += 1;
@@ -204,10 +226,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 .into_iter()
                 .next()
                 .ok_or("stream требует <file>")?;
-            Ok(Command::Stream { file, code, cell, chroma, calib, smoke })
+            Ok(Command::Stream { file, code, cell, chroma, calib, v1, smoke })
         }
-        "single" => Ok(Command::Single { counter, cell, chroma, smoke }),
-        "swatch" => Ok(Command::Swatch { n, sweep, cell, smoke }),
+        "single" => Ok(Command::Single { counter, cell, chroma, v1, smoke }),
+        "swatch" => Ok(Command::Swatch { n, sweep, cell, v1, smoke }),
         other => Err(format!("неизвестный режим: {other}")),
     }
 }
@@ -219,13 +241,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 fn run(cmd: Command) {
     match cmd {
         Command::Calibrate { cell, smoke } => run_calibrate(cell, smoke),
-        Command::Stream { file, code, cell, chroma, calib, smoke } => {
-            run_stream(file, code, cell, chroma, calib, smoke)
+        Command::Stream { file, code, cell, chroma, calib, v1, smoke } => {
+            run_stream(file, code, cell, chroma, calib, v1, smoke)
         }
-        Command::Single { counter, cell, chroma, smoke } => {
-            run_single(counter, cell, chroma, smoke)
+        Command::Single { counter, cell, chroma, v1, smoke } => {
+            run_single(counter, cell, chroma, v1, smoke)
         }
-        Command::Swatch { n, sweep, cell, smoke } => run_swatch(n, sweep, cell, smoke),
+        Command::Swatch { n, sweep, cell, v1, smoke } => run_swatch(n, sweep, cell, v1, smoke),
     }
 }
 
@@ -256,6 +278,7 @@ fn run_stream(
     cell: Option<usize>,
     chroma: bool,
     calib: bool,
+    v1: bool,
     smoke: bool,
 ) {
     let bytes = match std::fs::read(&file) {
@@ -270,10 +293,13 @@ fn run_stream(
         std::process::exit(1);
     }
 
-    let profile = apply_chroma(resolve_profile(code.as_deref()), chroma);
+    let profile = apply_v1(apply_chroma(resolve_profile(code.as_deref()), chroma), v1);
     let session_id = make_session_id();
     let streamer = Streamer::new(&bytes, profile, session_id).with_calibration(calib);
     let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
+    if v1 {
+        announce_v1(display_cell);
+    }
 
     // Печать «на старте» (§8): K, symbol_size, кадров/проход, оценка goodput.
     println!("psicode-tx stream — файл {file} ({} байт)", bytes.len());
@@ -326,17 +352,33 @@ fn run_stream(
     }
 }
 
-fn run_single(counter: u8, cell: Option<usize>, chroma: bool, smoke: bool) {
-    let profile = if chroma {
-        announce_const_luma(chromatic_profile())
-    } else {
-        reference_profile()
-    };
+fn run_single(counter: u8, cell: Option<usize>, chroma: bool, v1: bool, smoke: bool) {
+    let profile = apply_v1(
+        if chroma {
+            announce_const_luma(chromatic_profile())
+        } else {
+            reference_profile()
+        },
+        v1,
+    );
     let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
+    if v1 {
+        announce_v1(display_cell);
+    }
     println!("psicode-tx single — статический кадр, counter={counter}, cell={display_cell} px. Esc — выход.");
     let source = single_frame(&profile, counter, Some(display_cell));
     let side = (61 + 2 * profile.quiet_zone_cells() as usize) * display_cell;
-    let mut app = App::new(ModeState::Single, source, display_cell, display_cell, side, side, smoke, false, "PsiCode TX — single");
+    let mut app = App::new(
+        ModeState::Single { profile, counter },
+        source,
+        display_cell,
+        display_cell,
+        side,
+        side,
+        smoke,
+        false,
+        "PsiCode TX — single",
+    );
     launch(&mut app);
     if app.window_failed {
         report_no_window();
@@ -350,9 +392,12 @@ fn run_single(counter: u8, cell: Option<usize>, chroma: bool, smoke: bool) {
 /// известной цветности, разделённых средне-серым рвом. Кадр анимирован с тем же
 /// удержанием, что и stream, а строка счётчика §3.3 несёт его номер — поэтому
 /// анализатору хватает ОДНОГО снимка, чтобы точно знать, что было послано.
-fn run_swatch(n: usize, sweep: bool, cell: Option<usize>, smoke: bool) {
-    let profile = chromatic_profile();
+fn run_swatch(n: usize, sweep: bool, cell: Option<usize>, v1: bool, smoke: bool) {
+    let profile = apply_v1(chromatic_profile(), v1);
     let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
+    if v1 {
+        announce_v1(display_cell);
+    }
     let nb = n * n;
     println!(
         "psicode-tx swatch — {n}×{n} = {nb} блок(ов), режим {}, cell {display_cell} px, \
@@ -405,6 +450,34 @@ fn frames_grid_side(cell: usize) -> usize {
     61 * cell
 }
 
+/// Сторона СИМВОЛЬНОГО полотна в КЛЕТКАХ для профиля `p` (§3.2): `61 + 2·quiet`.
+/// В редакции рамки v1 тихой зоны нет -> ровно 61. Та же геометрия, что у рендера
+/// (`frames::Streamer::render`, `single_frame`, `swatch_frame`), — не «зашитая» 61.
+fn symbol_side_cells(p: &CalibProfile) -> usize {
+    SYMBOL_GRID_CELLS + 2 * p.quiet_zone_cells() as usize
+}
+
+/// Наибольший размер клетки показа, при котором квадрат `side_in_cells` клеток
+/// целиком помещается в клиентскую область `win_w × win_h` (§bug: никогда не
+/// обрезаем). `None`, если не помещается даже при `min_cell` — окно слишком мало,
+/// рисовать нельзя. Вынесено из окна ради юнит-тестов (арифметика 2a/2b).
+fn max_display_cell(
+    win_w: usize,
+    win_h: usize,
+    side_in_cells: usize,
+    min_cell: usize,
+) -> Option<usize> {
+    if side_in_cells == 0 || win_w == 0 || win_h == 0 {
+        return None;
+    }
+    let cell = win_w.min(win_h) / side_in_cells;
+    if cell >= min_cell {
+        Some(cell)
+    } else {
+        None
+    }
+}
+
 /// `--chroma`: перевести профиль в режим постоянной яркости §5.1-CL. Флаг
 /// применяется ПОВЕРХ разрешённого профиля, поэтому меняет только отображение
 /// цвета (и bits_per_cell), не трогая геометрию/тайминг/FEC.
@@ -414,6 +487,28 @@ fn apply_chroma(p: CalibProfile, chroma: bool) -> CalibProfile {
     } else {
         p
     }
+}
+
+/// `--v1`: перевести профиль в редакцию ЗЧ-рамки v1 (§3.2,
+/// [`BorderMode::ExtrudedStrips`]). Флаг применяется ПОВЕРХ разрешённого профиля
+/// (--code / файл / эталон) и ортогонален `--chroma`: меняет только геометрию
+/// рамки (тихая зона исчезает -> полотно 61 клетка вместо 69), не трогая цвет,
+/// тайминг и FEC. При `v1 == false` профиль возвращается без изменений.
+fn apply_v1(mut p: CalibProfile, v1: bool) -> CalibProfile {
+    if v1 {
+        p.border = BorderMode::ExtrudedStrips;
+    }
+    p
+}
+
+/// Печать того, что сделал `--v1` (профиль уже с изменённой рамкой). Стиль —
+/// как у [`announce_const_luma`]: сторона полотна в v1 ровно `61·cell`.
+fn announce_v1(display_cell: usize) {
+    println!(
+        "--v1: рамка §3.2 ExtrudedStrips — ТИХАЯ ЗОНА ОТКЛЮЧЕНА, полотно ровно \
+         61 клетка = {} px в стороне (вместо 69 клеток v0)",
+        SYMBOL_GRID_CELLS * display_cell,
+    );
 }
 
 /// Печать того, что именно сделал `--chroma` (профиль возвращается как есть).
@@ -565,7 +660,12 @@ enum ModeState {
         file_len: usize,
         hold_periods: u8,
     },
-    Single,
+    /// Один статический кадр (§4.5). Несёт профиль и счётчик, чтобы кадр можно
+    /// было перерисовать при изменении размера клетки показа (2a, fit_display_cell).
+    Single {
+        profile: CalibProfile,
+        counter: u8,
+    },
     /// [ДИАГНОСТИКА] Лестница масштабов: анимированный swatch-паттерн.
     Swatch {
         profile: CalibProfile,
@@ -602,6 +702,8 @@ struct App {
     refresh_hz: f64,
     frames_drawn: u64,
     printed_refresh: bool,
+    /// 2c: печатаем сообщение «окно слишком мало» ровно один раз (redraw-путь).
+    printed_too_small: bool,
     window_failed: bool,
 }
 
@@ -635,6 +737,7 @@ impl App {
             refresh_hz: 60.0,
             frames_drawn: 0,
             printed_refresh: false,
+            printed_too_small: false,
             window_failed: false,
         }
     }
@@ -658,7 +761,7 @@ impl App {
                 *seq = seq.wrapping_add(1);
                 Some(streamer.render(*seq, Some(display_cell)))
             }
-            ModeState::Single => None,
+            ModeState::Single { .. } => None, // статичен: содержимое не меняется во времени
             ModeState::Swatch { profile, frame, n, sweep, .. } => {
                 *frame = frame.wrapping_add(1);
                 Some(swatch_frame(profile, *n, *frame, *sweep, Some(display_cell)))
@@ -683,15 +786,25 @@ impl App {
 
     /// Блит `source` в буфер окна: фон средне-серый, целочисленный зум, по центру.
     fn present(&mut self) {
-        let (window, surface) = match (&self.window, &mut self.surface) {
-            (Some(w), Some(s)) => (w, s),
-            _ => return,
+        let size = match &self.window {
+            Some(w) => w.inner_size(),
+            None => return,
         };
-        let size = window.inner_size();
-        let (win_w, win_h) = (size.width as usize, size.height as usize);
         let (nw, nh) = match (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
             (Some(w), Some(h)) => (w, h),
             _ => return, // минимизировано
+        };
+        let (win_w, win_h) = (size.width as usize, size.height as usize);
+
+        // 2a/2b: подгон размера клетки показа под РЕАЛЬНУЮ клиентскую область.
+        // Может перерисовать `source` под новую клетку или (если не помещается
+        // даже при MIN_DISPLAY_CELL) напечатать причину и завершить процесс —
+        // лучше честно отказать, чем показать обрезанный (нечитаемый) символ.
+        self.fit_display_cell(win_w, win_h);
+
+        let surface = match &mut self.surface {
+            Some(s) => s,
+            None => return,
         };
         if surface.resize(nw, nh).is_err() {
             return;
@@ -702,6 +815,73 @@ impl App {
         };
         blit(&mut buffer, win_w, win_h, &self.source);
         let _ = buffer.present();
+    }
+
+    /// 2a/2b: подгоняет `display_cell` под клиент `win_w × win_h` для СИМВОЛЬНЫХ
+    /// режимов (stream/single/swatch). Берёт наибольшую клетку, при которой
+    /// полотно `61 + 2·quiet` клеток целиком помещается, но не ниже
+    /// [`MIN_DISPLAY_CELL`]. Если изменилась — обновляет клетку и перерисовывает
+    /// `source`. Если не помещается даже при минимуме — печатает подробную
+    /// причину и выходит (§bug: НИКОГДА не обрезаем символ). Для калибровки —
+    /// no-op (иная геометрия, отдельный паттерн; см. `run_calibrate`).
+    fn fit_display_cell(&mut self, win_w: usize, win_h: usize) {
+        let side_in_cells = match &self.mode {
+            ModeState::Calibrate { .. } => return,
+            ModeState::Stream { streamer, .. } => symbol_side_cells(streamer.profile()),
+            ModeState::Single { profile, .. } | ModeState::Swatch { profile, .. } => {
+                symbol_side_cells(profile)
+            }
+        };
+        match max_display_cell(win_w, win_h, side_in_cells, MIN_DISPLAY_CELL) {
+            Some(cell) => {
+                // Печать только при ФАКТИЧЕСКОМ изменении (не каждый кадр): смена
+                // размера клетки происходит лишь на ресайзе окна, не в цикле.
+                if cell != self.display_cell {
+                    eprintln!(
+                        "окно {win_w}×{win_h} px: клетка показа {} -> {cell} px, \
+                         чтобы символ ({side_in_cells} клеток = {} px) не обрезался",
+                        self.display_cell,
+                        side_in_cells * cell,
+                    );
+                    self.display_cell = cell;
+                    self.rerender_current();
+                }
+            }
+            None => {
+                if !self.printed_too_small {
+                    self.printed_too_small = true;
+                    let need = side_in_cells * MIN_DISPLAY_CELL;
+                    eprintln!(
+                        "Окно слишком мало: клиентская область {win_w}×{win_h} px. \
+                         Символ — {side_in_cells} клеток; при минимально допустимой \
+                         клетке {MIN_DISPLAY_CELL} px (демодулятор §symbol требует \
+                         >=8 px/клетку для 2×2 субсэмплинга) нужна клиентская область \
+                         не меньше {need}×{need} px. Увеличьте окно и перезапустите."
+                    );
+                }
+                // НЕ рисуем обрезанный символ — выходим (§bug).
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// Перерисовать `source` из текущего состояния режима под текущий
+    /// `display_cell`, БЕЗ продвижения кадра (для 2a после смены размера клетки).
+    fn rerender_current(&mut self) {
+        let cell = self.display_cell;
+        let new_source: Option<RgbFrame> = match &self.mode {
+            ModeState::Stream { streamer, seq, .. } => Some(streamer.render(*seq, Some(cell))),
+            ModeState::Single { profile, counter } => {
+                Some(single_frame(profile, *counter, Some(cell)))
+            }
+            ModeState::Swatch { profile, frame, n, sweep, .. } => {
+                Some(swatch_frame(profile, *n, *frame, *sweep, Some(cell)))
+            }
+            ModeState::Calibrate { .. } => None,
+        };
+        if let Some(s) = new_source {
+            self.source = s;
+        }
     }
 }
 
@@ -758,6 +938,7 @@ impl ApplicationHandler for App {
 
         if !self.printed_refresh {
             self.printed_refresh = true;
+            self.print_startup_geometry(event_loop);
             self.print_refresh_info();
         }
 
@@ -828,6 +1009,23 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// 2d: печать геометрии показа на старте — запрошенная клетка, сторона кадра
+    /// в px и размер основного монитора, чтобы рассинхрон было видно ДО того, как
+    /// он «укусит» (окно может оказаться меньше кадра — тогда 2a уменьшит клетку).
+    fn print_startup_geometry(&self, event_loop: &ActiveEventLoop) {
+        let mon = match event_loop.primary_monitor() {
+            Some(m) => {
+                let s = m.size();
+                format!("{}×{} px", s.width, s.height)
+            }
+            None => "неизвестен".to_string(),
+        };
+        println!(
+            "показ: клетка {} px, кадр {}×{} px; основной монитор {}",
+            self.display_cell, self.init_w, self.init_h, mon,
+        );
+    }
+
     /// Печать фактической частоты/удержания/goodput после определения монитора.
     fn print_refresh_info(&self) {
         if let ModeState::Stream { file_len, hold_periods, streamer, .. } = &self.mode {
@@ -869,6 +1067,19 @@ fn blit(buf: &mut [u32], win_w: usize, win_h: usize, src: &RgbFrame) {
     if src.w == 0 || src.h == 0 || win_w == 0 || win_h == 0 {
         return;
     }
+    // §bug: источник КРУПНЕЕ окна — рисовать нельзя, иначе скопируем лишь
+    // верхне-левый угол и молча выдадим обрезанный (нечитаемый) символ.
+    // `App::fit_display_cell` (2a/2b) обязана это предотвращать для символьных
+    // режимов; сюда попадаем только при рассинхроне — оставляем чистый фон
+    // (центр-кроп НЕ допустим).
+    if src.w > win_w || src.h > win_h {
+        debug_assert!(
+            false,
+            "blit: источник {}×{} крупнее окна {}×{} — обрезка запрещена (§bug)",
+            src.w, src.h, win_w, win_h
+        );
+        return;
+    }
     let zoom = (win_w / src.w).min(win_h / src.h).max(1);
     let draw_w = (src.w * zoom).min(win_w);
     let draw_h = (src.h * zoom).min(win_h);
@@ -889,5 +1100,75 @@ fn blit(buf: &mut [u32], win_w: usize, win_h: usize, src: &RgbFrame) {
             let c = src.px[row_src + sx];
             buf[row_dst + dx] = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2a: наибольшая помещающаяся клетка. Числа боевого сбоя 1536×864, --cell 12,
+    /// клиент ≈ 662 px: v0 (полотно 61+2·4=69 клеток) даёт 9 px (621 px в стороне),
+    /// v1 (61 клетка) даёт 10 px (610 px) — крупнее, т.к. тихой зоны нет.
+    #[test]
+    fn max_display_cell_picks_largest_that_fits() {
+        // v0: 662 / 69 = 9 (9·69=621 ≤ 662, 10·69=690 > 662)
+        assert_eq!(max_display_cell(662, 662, 69, MIN_DISPLAY_CELL), Some(9));
+        assert!(9 * 69 <= 662 && 10 * 69 > 662);
+        // v1: 662 / 61 = 10 (10·61=610 ≤ 662, 11·61=671 > 662)
+        assert_eq!(max_display_cell(662, 662, 61, MIN_DISPLAY_CELL), Some(10));
+        assert!(10 * 61 <= 662 && 11 * 61 > 662);
+        // прямоугольный клиент: правит МЕНЬШАЯ сторона (символ квадратный)
+        assert_eq!(max_display_cell(1536, 662, 69, MIN_DISPLAY_CELL), Some(9));
+        assert_eq!(max_display_cell(662, 1536, 61, MIN_DISPLAY_CELL), Some(10));
+        // точное деление: клиент ровно под запрошенную клетку 12 (v1)
+        assert_eq!(max_display_cell(61 * 12, 61 * 12, 61, MIN_DISPLAY_CELL), Some(12));
+    }
+
+    /// 2b: отказ ниже пола (8 px). Иначе демодулятор §symbol теряет 2×2
+    /// субсэмплинг — лучше явный отказ, чем нечитаемый кадр.
+    #[test]
+    fn max_display_cell_refuses_below_floor() {
+        // ровно на полу: 8·69 = 552 помещается -> Some(8)
+        assert_eq!(max_display_cell(552, 552, 69, MIN_DISPLAY_CELL), Some(8));
+        // на 1 px меньше: 551/69 = 7 < 8 -> None (отказ, НЕ обрезаем)
+        assert_eq!(max_display_cell(551, 551, 69, MIN_DISPLAY_CELL), None);
+        // крохотное окно -> None
+        assert_eq!(max_display_cell(400, 400, 69, MIN_DISPLAY_CELL), None);
+        // v1-пол: 8·61 = 488 -> Some(8); 487 -> None
+        assert_eq!(max_display_cell(488, 488, 61, MIN_DISPLAY_CELL), Some(8));
+        assert_eq!(max_display_cell(487, 487, 61, MIN_DISPLAY_CELL), None);
+        // вырожденная геометрия/нулевой клиент
+        assert_eq!(max_display_cell(1000, 1000, 0, MIN_DISPLAY_CELL), None);
+        assert_eq!(max_display_cell(0, 1000, 61, MIN_DISPLAY_CELL), None);
+    }
+
+    /// `symbol_side_cells` следует геометрии рендера: v0 (quiet=1) -> 69 клеток,
+    /// v1 (ExtrudedStrips, тихой зоны нет) -> ровно 61.
+    #[test]
+    fn symbol_side_cells_tracks_border_mode() {
+        let v0 = reference_profile();
+        assert_eq!(v0.quiet_zone_cells(), 4); // пресет quiet_zone=1 -> 4 клетки
+        assert_eq!(symbol_side_cells(&v0), 69);
+
+        let v1 = apply_v1(reference_profile(), true);
+        assert_eq!(v1.border, BorderMode::ExtrudedStrips);
+        assert_eq!(v1.quiet_zone_cells(), 0);
+        assert_eq!(symbol_side_cells(&v1), SYMBOL_GRID_CELLS);
+        assert_eq!(symbol_side_cells(&v1), 61);
+    }
+
+    /// `apply_v1` ставит рамку v1 только при `v1 == true`; ортогонален прочим
+    /// полям профиля (меняет ТОЛЬКО `border`).
+    #[test]
+    fn apply_v1_only_touches_border() {
+        let base = reference_profile();
+        assert_eq!(apply_v1(base, false), base); // no-op
+        let got = apply_v1(base, true);
+        assert_eq!(got.border, BorderMode::ExtrudedStrips);
+        // всё остальное не тронуто
+        let mut expect = base;
+        expect.border = BorderMode::ExtrudedStrips;
+        assert_eq!(got, expect);
     }
 }

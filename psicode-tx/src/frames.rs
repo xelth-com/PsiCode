@@ -375,6 +375,11 @@ impl Streamer {
         }
     }
 
+    /// Профиль потока (для геометрии показа §8: тихая зона -> сторона полотна).
+    pub fn profile(&self) -> &CalibProfile {
+        &self.profile
+    }
+
     /// Число source-символов K.
     pub fn k(&self) -> u32 {
         self.k

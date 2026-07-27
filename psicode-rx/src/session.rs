@@ -21,14 +21,19 @@
 
 use std::collections::HashMap;
 
+use psicode_core::acquire::{self, AcquireOpts, Field, Placement, PROBE_DEPTH_STRIP};
 use psicode_core::calframe::{self, CalibCache};
-use psicode_core::detect::{detect_symbol_acquire, frame_map, track_symbol, Detection};
+use psicode_core::detect::{
+    detect_symbol_acquire, detection_from_corners, frame_map, track_symbol, Detection,
+};
+use psicode_core::zcborder;
 use psicode_core::fountain::FountainDecoder;
 use psicode_core::l3::{self, FrameHeader, ParsedFrame};
 use psicode_core::symbol::{
     self, demod_symbol, demod_symbol_local, demod_symbol_matrix, read_counters,
 };
 use psicode_core::tone;
+use psicode_core::profile::BorderMode;
 use psicode_core::{CalibProfile, ChromaMode};
 
 use crate::yuv::YuvFrame;
@@ -61,6 +66,13 @@ const REPAIR_EVERY: u32 = 4;
 /// Поэтому детектим по сути в полном разрешении (кап только для огромных фото,
 /// чтобы ограничить единственную размер-зависимую часть — coarse_candidates).
 const DETECT_MAX_DIM: usize = 4096;
+
+/// Диапазон поиска px на клетку для КОРРЕЛЯЦИОННОГО захвата рамки v1 (§3.2).
+///
+/// Нижняя граница — измеренный порог читаемости (ниже ~6 px/клетку корреляция
+/// рассыпается), верхняя — «символ во весь кадр». Сужать диапазон дешевле всего:
+/// стоимость затравки ~ сумма 1/масштаб², и мелкий конец её и определяет.
+const V1_PX_PER_CELL: (f64, f64) = (7.0, 20.0);
 
 /// Профиль tx по умолчанию (§8): σ=1-оптимум BENCHMARKS §6 — luma 2 + Chroma1 =
 /// 3 бит/клетку. Идентичен transfer.rs/live.rs. `cell_size_px` — display-масштаб;
@@ -143,6 +155,17 @@ pub struct FrameStatus {
     /// Кэш калибровки устарел (по возрасту или по деградации декодирования):
     /// приёмник ЖДЁТ следующего запланированного калибровочного кадра.
     pub calib_stale: bool,
+    /// [ДИАГНОСТИКА, рамка v1] Минимальная из четырёх пер-сторонних корреляций.
+    ///
+    /// Одного `score` мало, чтобы понять отказ: среднее «одна сильная сторона +
+    /// три шумовых» выглядит как посредственный, но правдоподобный лок. Живой
+    /// отказ (score 0.4359 на кадре, где символа не было) читался бы сразу,
+    /// будь видно, что минимальная сторона ~0.1.
+    pub side_min: f64,
+    /// [ДИАГНОСТИКА, рамка v1] Структурное отношение полосы: во сколько раз
+    /// корреляция ВНУТРИ полосы сильнее, чем на две клетки в стороны.
+    /// Символ ЕСТЬ: 8.6..13.0. Символа НЕТ: 1.05..1.92.
+    pub strip_ratio: f64,
 }
 
 impl FrameStatus {
@@ -162,6 +185,8 @@ impl FrameStatus {
             calibration: false,
             calib_age: 0,
             calib_stale: true,
+            side_min: 0.0,
+            strip_ratio: 0.0,
         }
     }
 
@@ -170,7 +195,7 @@ impl FrameStatus {
         format!(
             "{{\"detected\":{},\"score\":{:.4},\"rotation\":{},\"px_per_cell\":{:.2},\
              \"stripes_ok\":{},\"symbols_new\":{},\"k\":{},\"symbols_have\":{},\
-             \"done\":{},\"crc_ok\":{},\"calibration\":{},\"calib_age\":{},\"calib_stale\":{}}}",
+             \"done\":{},\"crc_ok\":{},\"calibration\":{},\"calib_age\":{},\"calib_stale\":{},             \"side_min\":{:.4},\"strip_ratio\":{:.2}}}",
             self.detected,
             self.score,
             self.rotation,
@@ -184,6 +209,8 @@ impl FrameStatus {
             self.calibration,
             self.calib_age,
             self.calib_stale,
+            self.side_min,
+            self.strip_ratio,
         )
     }
 }
@@ -200,6 +227,12 @@ pub struct RxSession {
     /// Геометрия прошлого кадра в УМЕНЬШЕННЫХ координатах детекции (§8): пока
     /// есть — идём дешёвым `track_symbol`; None — Searching, нужен захват.
     last_detection: Option<Detection>,
+    /// [ДИАГНОСТИКА] (минимальная сторона, отношение полосы) последнего захвата.
+    last_diag: (f64, f64),
+    /// То же для рамки v1: раскладка прошлого кадра — вход дешёвого
+    /// [`acquire::track`]. Своё поле, а не `last_detection`, потому что
+    /// `track_symbol` умеет только рамку v0 (щупы кольца и штраф тихой зоны).
+    last_place: Option<Placement>,
     /// Текущая сессия передачи (первый увиденный session_id побеждает, §6.2).
     session_id: Option<u32>,
     /// Декодер фонтана (создаётся при первом TransferInfo текущей сессии).
@@ -234,6 +267,8 @@ impl RxSession {
             bpc,
             gammas: None,
             last_detection: None,
+            last_diag: (0.0, 0.0),
+            last_place: None,
             session_id: None,
             decoder: None,
             k: 0,
@@ -278,6 +313,23 @@ impl RxSession {
         Self::new(p)
     }
 
+    /// То же, но с явным выбором РЕДАКЦИИ ЗЧ-РАМКИ (§3.2).
+    ///
+    /// Редакция обязана совпадать с тем, что рисует передатчик (`psicode-tx
+    /// --v1`): у v1 нет тихой зоны и другая рамка, и захват для неё идёт
+    /// корреляционным трактом. Ошибиться здесь — значит просто не найти символ,
+    /// поэтому параметр явный, а не угадываемый.
+    pub fn with_cell_border(cell_px: u8, chromatic: bool, border: BorderMode) -> Self {
+        let mut p = if chromatic {
+            tx_chromatic_profile()
+        } else {
+            tx_default_profile()
+        };
+        p.cell_size_px = if cell_px >= 8 { cell_px } else { 12 };
+        p.border = border;
+        Self::new(p)
+    }
+
     /// Текущее состояние сессии.
     pub fn state(&self) -> RxState {
         self.state
@@ -292,6 +344,68 @@ impl RxSession {
     fn progress(&self) -> (u32, usize) {
         let have = self.decoder.as_ref().map_or(0, |d| d.n_seen());
         (self.k, have)
+    }
+
+    /// Геометрия по КОРРЕЛЯЦИИ ЗЧ-рамки (редакция v1): дешёвое слежение от
+    /// прошлой раскладки, иначе полный захват.
+    ///
+    /// Носитель рамки берётся из профиля: яркостной коррелируется по плоскости Y
+    /// (она уже уменьшена и посчитана вызывающим), цветностной — по (U−128,
+    /// V−128) как по комплексной величине. Для цветностного носителя плоскости
+    /// строятся ЗДЕСЬ и только здесь: платить за них на каждом кадре яркостного
+    /// тракта незачем.
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_v1(
+        &mut self,
+        yf: &YuvFrame,
+        dw: usize,
+        dh: usize,
+        ds: usize,
+        luma: &[f32],
+    ) -> Option<Detection> {
+        let spec = zcborder::spec_for(&self.profile)?;
+        let chroma = self.profile.border.is_chroma_carrier();
+        // плоскости цветности строим только когда они действительно нужны
+        let (cre, cim) = if chroma {
+            let mut re = vec![0.0f32; dw * dh];
+            let mut im = vec![0.0f32; dw * dh];
+            let half = ds / 2;
+            for j in 0..dh {
+                let sy = (j * ds + half).min(yf.h - 1);
+                for i in 0..dw {
+                    let sx = (i * ds + half).min(yf.w - 1);
+                    let ci = (sy >> 1) * yf.uv_stride + (sx >> 1) * yf.uv_pixel_stride;
+                    let u = yf.u.get(ci).copied().unwrap_or(128) as f32;
+                    let v = yf.v.get(ci).copied().unwrap_or(128) as f32;
+                    re[j * dw + i] = (u - 128.0) / 128.0;
+                    im[j * dw + i] = (v - 128.0) / 128.0;
+                }
+            }
+            (Some(re), Some(im))
+        } else {
+            (None, None)
+        };
+        let field = match (&cre, &cim) {
+            (Some(r), Some(i)) => Field { w: dw, h: dh, re: r, im: Some(i) },
+            _ => Field { w: dw, h: dh, re: luma, im: None },
+        };
+        let opts = AcquireOpts {
+            px_per_cell: V1_PX_PER_CELL,
+            probe_depth: PROBE_DEPTH_STRIP,
+            ..Default::default()
+        };
+        // Слежение сначала: оно на два порядка дешевле захвата. Провал слежения
+        // — не повод терять кадр, поэтому сразу пробуем полный захват.
+        let got = self
+            .last_place
+            .and_then(|prev| acquire::track(&spec, &field, &opts, &prev))
+            .or_else(|| acquire::acquire(&spec, &field, &opts))?;
+        self.last_place = Some(got.place);
+        self.last_diag = (
+            got.sides.iter().cloned().fold(f64::INFINITY, f64::min),
+            got.strip_ratio,
+        );
+        detection_from_corners(&got.corners, got.rotation_quadrants, got.score)
     }
 
     /// Обработать один кадр камеры YUV_420_888 (§8). Возвращает статус кадра.
@@ -336,22 +450,38 @@ impl RxSession {
                 luma[j * dw + i] = yf.y_norm(sx, sy);
             }
         }
-        // Acquire/track split (§8): Locked -> дешёвый track от прошлой геометрии;
-        // Searching -> ограниченный acquire. Track/acquire в УМЕНЬШЕННЫХ координатах.
-        let det = if let Some(prev) = self.last_detection.as_ref() {
-            match track_symbol(dw, dh, &luma, prev) {
-                Ok(d) => d,
-                Err(_) => {
-                    // потеря слежения -> сброс лока и тона; следующий кадр захватит.
-                    self.last_detection = None;
-                    self.gammas = None;
-                    return FrameStatus::empty(k, have, self.state);
+        // Геометрия кадра. Редакция рамки выбирает ТРАКТ целиком:
+        //   v0 — прежний блоб-захват + `track_symbol` (кольца с инверсией,
+        //        штраф тихой зоны);
+        //   v1 — корреляционный `acquire` + дешёвый `acquire::track`.
+        // Смешивать нельзя: `track_symbol` знает только раскладку v0.
+        let det = if self.profile.border.is_legacy() {
+            // Acquire/track split (§8): Locked -> дешёвый track от прошлой геометрии;
+            // Searching -> ограниченный acquire. В УМЕНЬШЕННЫХ координатах.
+            if let Some(prev) = self.last_detection.as_ref() {
+                match track_symbol(dw, dh, &luma, prev) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // потеря слежения -> сброс лока и тона; следующий кадр захватит.
+                        self.last_detection = None;
+                        self.gammas = None;
+                        return FrameStatus::empty(k, have, self.state);
+                    }
+                }
+            } else {
+                match detect_symbol_acquire(dw, dh, &luma) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        self.gammas = None;
+                        return FrameStatus::empty(k, have, self.state);
+                    }
                 }
             }
         } else {
-            match detect_symbol_acquire(dw, dh, &luma) {
-                Ok(d) => d,
-                Err(_) => {
+            match self.acquire_v1(&yf, dw, dh, ds, &luma) {
+                Some(d) => d,
+                None => {
+                    self.last_place = None;
                     self.gammas = None;
                     return FrameStatus::empty(k, have, self.state);
                 }
@@ -421,6 +551,8 @@ impl RxSession {
                 calibration: true,
                 calib_age: 0,
                 calib_stale: self.calib.stale(),
+                side_min: self.last_diag.0,
+                strip_ratio: self.last_diag.1,
             };
         }
 
@@ -511,6 +643,8 @@ impl RxSession {
             calibration: false,
             calib_age: self.calib.age().min(u32::MAX as u64) as u32,
             calib_stale: self.calib.stale(),
+            side_min: self.last_diag.0,
+            strip_ratio: self.last_diag.1,
         }
     }
 

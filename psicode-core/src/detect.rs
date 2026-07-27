@@ -179,6 +179,27 @@ pub fn detect_symbol(w: usize, h: usize, luma: &[f32]) -> Result<Detection, Dete
     finalize_detection(luma, w, h, &ac, best_r).ok_or(DetectError::NotFound)
 }
 
+/// Собирает [`Detection`] из ЧЕТЫРЁХ УГЛОВ и ориентации, минуя грубую детекцию.
+///
+/// Мост для корреляционного захвата ([`crate::acquire`]): тот находит символ по
+/// корреляции ЗЧ, а не по блобу, и отдаёт углы напрямую. Порядок углов — тот же,
+/// что у всего модуля: `[tl, tr, br, bl]` в ЧТЕНИИ СНИМКА, а `rotation_quadrants`
+/// говорит, на сколько четвертей снимок повёрнут относительно канона. `score`
+/// передаётся как есть — считать его повторно нечем и незачем.
+///
+/// `None` — вырожденная четвёрка (гомография не строится).
+pub fn detection_from_corners(
+    corners: &[(f64, f64); 4],
+    rotation_quadrants: u8,
+    score: f64,
+) -> Option<Detection> {
+    Some(Detection {
+        homography: build_h(corners)?,
+        rotation_quadrants: rotation_quadrants % 4,
+        score,
+    })
+}
+
 /// Число кандидатов, выравниваемых при ЗАХВАТЕ (§8): топ по сырому orient-score.
 const ACQUIRE_CANDS: usize = 3;
 

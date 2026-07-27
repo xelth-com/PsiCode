@@ -145,10 +145,12 @@ class MainActivity : AppCompatActivity() {
         // Инициализация Rust-ядра (или "no core" баннер).
         if (PsiCodeCore.available) {
             handle = try {
-                // Цветной режим включается запуском: --ez chroma true
+                // Цветной режим:      --ez chroma true
+                // Редакция рамки:     --ei border 1   (0 = v0, 1 = v1 полосы, 2 = v1 хрома)
                 val chroma = if (intent?.getBooleanExtra("chroma", false) == true) 1 else 0
-                android.util.Log.d("PsiCodeRX", "rxInit chromatic=$chroma")
-                PsiCodeCore.rxInit(PROFILE_CELL_PX, chroma)
+                val border = intent?.getIntExtra("border", 0) ?: 0
+                android.util.Log.d("PsiCodeRX", "rxInit chromatic=$chroma border=$border")
+                PsiCodeCore.rxInitBorder(PROFILE_CELL_PX, chroma, border)
             } catch (t: Throwable) {
                 0L
             }

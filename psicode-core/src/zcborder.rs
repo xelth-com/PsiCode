@@ -66,6 +66,7 @@
 //! То есть потеря двух членов из 61 стоит копейки, и платить за циклический
 //! префикс лишними клетками нечем.
 
+use crate::profile::CalibProfile;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -114,6 +115,32 @@ pub const V1_61: BorderSpec = BorderSpec {
     roots: [3, 1, 4, 2],
     carrier: Carrier::ComplexChroma,
 };
+
+/// Корни по сторонам редакции v1 в каноническом порядке [верх, право, низ, лево].
+///
+/// Ось X (горизонтальные стороны) несёт БОЛЬШУЮ пару {3, 4}, ось Y —
+/// МЕНЬШУЮ {1, 2}, разрыв между группами — единица. Ось читается по тому, из
+/// какой пары корень стороны; поворот на 180° — по тому, какой член пары где.
+/// Второе — не украшение: последовательность ЗЧ палиндромна, и одна сторона
+/// поворот на 180° не различает В ПРИНЦИПЕ (см. док [`crate::acquire`]).
+pub const V1_ROOTS: [u32; 4] = [3, 1, 4, 2];
+
+/// Описание рамки для профиля; `None` — профиль просит рамку v0, которую этот
+/// модуль не описывает (её рендерит `symbol::build_symbol_cells` по-старому).
+pub fn spec_for(p: &CalibProfile) -> Option<BorderSpec> {
+    if p.border.is_legacy() {
+        return None;
+    }
+    Some(BorderSpec {
+        n: crate::symbol::GRID,
+        roots: V1_ROOTS,
+        carrier: if p.border.is_chroma_carrier() {
+            Carrier::ComplexChroma
+        } else {
+            Carrier::BinaryLuma
+        },
+    })
+}
 
 /// Комплексное значение ЗЧ: `z[i] = exp(−jπ·q·i·(i+1)/N)`.
 ///

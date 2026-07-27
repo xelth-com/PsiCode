@@ -4,7 +4,8 @@
 //! Модуль доступен только с фичей `std` (нужна вещественная математика с
 //! transcendental-функциями для гамма-коррекции).
 
-use crate::profile::{CalibProfile, ChromaMode};
+use crate::profile::{BorderMode, CalibProfile, ChromaMode};
+use crate::zcborder;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -916,47 +917,10 @@ fn build_symbol_cells(p: &CalibProfile, cells: &[u8], counter: u8) -> Vec<[u8; 3
     let black = [black_255; 3];
     let mut sym = vec![[0u8; 3]; GRID * GRID];
 
-    // --- внешнее ЗЧ-кольцо (§3.2) ---
-    // Булева карта белизны кольца. Порядок покраски: лево, низ, право, верх —
-    // приоритет углов «верх > право > низ > лево» получается автоматически,
-    // так как верх красится последним (§3.2, задача).
-    let last = GRID - 1;
-    let mut owhite = vec![false; GRID * GRID];
-    for n in 0..GRID {
-        owhite[(last - n) * GRID] = zc_binary(4, n); // лево: (0, 60−n), корень 4
-    }
-    for n in 0..GRID {
-        owhite[last * GRID + (last - n)] = zc_binary(3, n); // низ: (60−n, 60), корень 3
-    }
-    for n in 0..GRID {
-        owhite[n * GRID + last] = zc_binary(2, n); // право: (60, n), корень 2
-    }
-    for n in 0..GRID {
-        owhite[n] = zc_binary(1, n); // верх: (n, 0), корень 1
-    }
-    // покраска внешнего кольца из карты
-    for x in 0..GRID {
-        sym[x] = pick(owhite[x], white, black);
-        sym[last * GRID + x] = pick(owhite[last * GRID + x], white, black);
-    }
-    for y in 0..GRID {
-        sym[y * GRID] = pick(owhite[y * GRID], white, black);
-        sym[y * GRID + last] = pick(owhite[y * GRID + last], white, black);
-    }
-
-    // --- внутреннее кольцо: инверсия примыкающей внешней клетки (§3.2) ---
-    // Тот же приоритет углов: лево, низ, право, верх (верх красится последним).
-    for y in 1..last {
-        sym[y * GRID + 1] = pick(!owhite[y * GRID], white, black); // лево, примыкает (0, y)
-    }
-    for x in 1..last {
-        sym[(last - 1) * GRID + x] = pick(!owhite[last * GRID + x], white, black); // низ, (x, 60)
-    }
-    for y in 1..last {
-        sym[y * GRID + (last - 1)] = pick(!owhite[y * GRID + last], white, black); // право, (60, y)
-    }
-    for x in 1..last {
-        sym[GRID + x] = pick(!owhite[x], white, black); // верх, примыкает (x, 0)
+    // --- ЗЧ-рамка (§3.2), редакция по профилю ---
+    match p.border {
+        BorderMode::LegacyInverted => paint_border_v0(&mut sym, white, black),
+        _ => paint_border_v1(p, &mut sym, black_255, white_255, white, black),
     }
 
     // --- внутренняя область: смещения [2..58] (§3.3) ---
@@ -993,6 +957,93 @@ fn build_symbol_cells(p: &CalibProfile, cells: &[u8], counter: u8) -> Vec<[u8; 3
     }
 
     sym
+}
+
+/// Рамка v0 (§3.2): внешнее ЗЧ-кольцо + внутреннее кольцо-ИНВЕРСИЯ.
+///
+/// Побитово путь v0 — на нём висят замороженный формат и три байт-в-байт живых
+/// передачи, поэтому код перенесён СЮДА БЕЗ ИЗМЕНЕНИЙ, включая порядок покраски:
+/// лево, низ, право, верх. Приоритет углов «верх > право > низ > лево»
+/// получается из этого порядка сам (верх красится последним).
+fn paint_border_v0(sym: &mut [[u8; 3]], white: [u8; 3], black: [u8; 3]) {
+    let last = GRID - 1;
+    let mut owhite = vec![false; GRID * GRID];
+    for n in 0..GRID {
+        owhite[(last - n) * GRID] = zc_binary(4, n); // лево: (0, 60−n), корень 4
+    }
+    for n in 0..GRID {
+        owhite[last * GRID + (last - n)] = zc_binary(3, n); // низ: (60−n, 60), корень 3
+    }
+    for n in 0..GRID {
+        owhite[n * GRID + last] = zc_binary(2, n); // право: (60, n), корень 2
+    }
+    for n in 0..GRID {
+        owhite[n] = zc_binary(1, n); // верх: (n, 0), корень 1
+    }
+    for x in 0..GRID {
+        sym[x] = pick(owhite[x], white, black);
+        sym[last * GRID + x] = pick(owhite[last * GRID + x], white, black);
+    }
+    for y in 0..GRID {
+        sym[y * GRID] = pick(owhite[y * GRID], white, black);
+        sym[y * GRID + last] = pick(owhite[y * GRID + last], white, black);
+    }
+    for y in 1..last {
+        sym[y * GRID + 1] = pick(!owhite[y * GRID], white, black); // лево, примыкает (0, y)
+    }
+    for x in 1..last {
+        sym[(last - 1) * GRID + x] = pick(!owhite[last * GRID + x], white, black); // низ, (x, 60)
+    }
+    for y in 1..last {
+        sym[y * GRID + (last - 1)] = pick(!owhite[y * GRID + last], white, black); // право, (60, y)
+    }
+    for x in 1..last {
+        sym[GRID + x] = pick(!owhite[x], white, black); // верх, примыкает (x, 0)
+    }
+}
+
+/// Рамка v1 (§3.2): четыре ЭКСТРУДИРОВАННЫЕ полосы GRID×RING.
+///
+/// Раскладка целиком берётся из [`crate::zcborder::render_cells`] — того же
+/// источника, которым пользуется коррелятор захвата, поэтому рендерер и детектор
+/// не могут разойтись (согласие закреплено тестами `zcborder`).
+///
+/// Геометрия payload НЕ меняется: полосы занимают ровно те же клетки, что и два
+/// кольца v0 (полоса толщины RING), значит INTERIOR = 57, payload 57×55 и вся
+/// разметка L3 остаются прежними. Меняется ТОЛЬКО содержимое рамки и то, что
+/// тихой зоны больше нет (`quiet_zone_cells()` = 0).
+fn paint_border_v1(
+    p: &CalibProfile,
+    sym: &mut [[u8; 3]],
+    black_255: u8,
+    white_255: u8,
+    white: [u8; 3],
+    black: [u8; 3],
+) {
+    let spec = match zcborder::spec_for(p) {
+        Some(s) => s,
+        None => return, // недостижимо: сюда попадают только не-legacy профили
+    };
+    debug_assert_eq!(spec.n, GRID, "сторона рамки обязана совпасть с GRID");
+    debug_assert_eq!(zcborder::RING, RING, "толщина полосы обязана совпасть с RING");
+    // Отображение постоянной яркости — только для цветностного носителя.
+    // ВАЖНО: масштаб созвездия здесь 1.0, а НЕ CL_LATTICE_SCALE. Тот множитель
+    // ужимает ПРЯМОУГОЛЬНУЮ решётку payload в гамут по углу; значения ЗЧ лежат
+    // на ЕДИНИЧНОЙ ОКРУЖНОСТИ, а она и есть граница гамута на диске, поэтому
+    // рамке достаётся полная амплитуда — на 37 % больше, чем клетке payload.
+    let clm = const_luma_from_levels(black_255 as f64, white_255 as f64);
+    for (idx, cell) in zcborder::render_cells(&spec).iter().enumerate() {
+        let (re, im) = match cell {
+            Some(v) => *v,
+            None => continue, // внутренняя область — не наша забота
+        };
+        sym[idx] = if spec.carrier == zcborder::Carrier::ComplexChroma {
+            let d = clm.drive(re, im);
+            [quant(d[0]), quant(d[1]), quant(d[2])]
+        } else {
+            pick(re > 0.0, white, black)
+        };
+    }
 }
 
 /// Считывает обе копии счётчика кадров из строки счётчика снимка (§3.3/§6.3):
@@ -1092,6 +1143,133 @@ fn pick(white: bool, w: [u8; 3], k: [u8; 3]) -> [u8; 3] {
         w
     } else {
         k
+    }
+}
+
+#[cfg(test)]
+mod frozen_render {
+    use super::*;
+    use crate::profile::BorderMode;
+    use crate::ChromaMode;
+
+    fn fnv1a(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+    }
+
+    /// Сторож БАЙТ-В-БАЙТ пути v0: агрегатный хэш 90 отрендеренных символов
+    /// (5 хромо-режимов × 3 тихих зоны × 3 размера клетки × 2 счётчика).
+    ///
+    /// На этом пути висят замороженный формат §7.4 и живые байт-точные передачи,
+    /// поэтому добавление рамки v1 обязано было оставить его НЕТРОНУТЫМ. Значение
+    /// снято на ревизии ДО правки рендерера и совпало ПОСЛЕ (проверено сверкой
+    /// хэшей на двух ревизиях, см. `examples/render_hash.rs`).
+    const V0_RENDER_FNV1A: u64 = 0x3e64_9479_058a_7d85;
+
+    #[test]
+    fn legacy_render_is_byte_frozen() {
+        let modes = [
+            (ChromaMode::Mono, 1u8),
+            (ChromaMode::GreenOnly, 2),
+            (ChromaMode::Chroma2, 3),
+            (ChromaMode::ConstLuma1, 1),
+            (ChromaMode::ConstLuma3, 2),
+        ];
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for (mode, luma_bits) in modes {
+            for &quiet in &[0u8, 1, 3] {
+                for &cell in &[8u8, 12, 16] {
+                    for &counter in &[0u8, 7] {
+                        let p = CalibProfile {
+                            version: CalibProfile::VERSION,
+                            cell_size_px: cell,
+                            frame_hold_periods: 6,
+                            luma_bits,
+                            chroma_mode: mode,
+                            gamma_g_q: 28,
+                            gamma_r_delta_q: 8,
+                            gamma_b_delta_q: 10,
+                            white_level_q: 15,
+                            black_level_q: 2,
+                            noise_sigma_q: 12,
+                            mtf_limit_px: 6,
+                            torn_frames_q: 5,
+                            crosstalk_rg_q: 3,
+                            crosstalk_gb_q: 4,
+                            quiet_zone: quiet,
+                            fec_overhead: 2,
+                            border: BorderMode::LegacyInverted,
+                        };
+                        let bits = bits_per_cell(&p);
+                        let mask = if bits >= 8 { 0xFFu32 } else { (1u32 << bits) - 1 };
+                        let mut rng = Xs(0xDEAD_BEEF ^ (cell as u64) ^ ((quiet as u64) << 8));
+                        let cells: Vec<u8> = (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+                            .map(|_| (rng.next() as u32 & mask) as u8)
+                            .collect();
+                        let f = render_symbol_counter(&p, &cells, counter);
+                        for c in &f.rgb {
+                            fnv1a(&mut h, c);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[frozen] агрегатный хэш рендера v0 = {h:#018x}");
+        assert_eq!(h, V0_RENDER_FNV1A, "путь v0 изменился побайтово");
+    }
+
+    /// Рамка v1 обязана ОТЛИЧАТЬСЯ от v0 и не иметь тихой зоны.
+    #[test]
+    fn v1_render_differs_and_has_no_quiet_zone() {
+        let mut p = CalibProfile {
+            version: CalibProfile::VERSION,
+            cell_size_px: 12,
+            frame_hold_periods: 6,
+            luma_bits: 1,
+            chroma_mode: ChromaMode::Mono,
+            gamma_g_q: 28,
+            gamma_r_delta_q: 8,
+            gamma_b_delta_q: 10,
+            white_level_q: 15,
+            black_level_q: 2,
+            noise_sigma_q: 12,
+            mtf_limit_px: 6,
+            torn_frames_q: 0,
+            crosstalk_rg_q: 0,
+            crosstalk_gb_q: 0,
+            quiet_zone: 1,
+            fec_overhead: 2,
+            border: BorderMode::LegacyInverted,
+        };
+        let cells = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+        let v0 = render_symbol(&p, &cells);
+        assert_eq!(v0.size_px, (GRID + 8) * 12, "v0: 61 + 2·4 клетки");
+        p.border = BorderMode::ExtrudedStrips;
+        let v1 = render_symbol(&p, &cells);
+        assert_eq!(v1.size_px, GRID * 12, "v1: ровно 61 клетка, тихой зоны нет");
+        assert_eq!(v1.quiet_cells, 0);
+        // payload-геометрия НЕ изменилась
+        assert_eq!(PAYLOAD_COLS, GRID - 2 * RING);
+        assert_eq!(PAYLOAD_ROWS, GRID - 2 * RING - 2);
+        // а цветностный носитель отличается от яркостного
+        p.border = BorderMode::ExtrudedStripsChroma;
+        let v1c = render_symbol(&p, &cells);
+        assert_eq!(v1c.size_px, GRID * 12);
+        assert_ne!(v1c.rgb, v1.rgb, "цветностная рамка совпала с яркостной");
     }
 }
 
