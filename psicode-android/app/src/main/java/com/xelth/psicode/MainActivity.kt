@@ -786,7 +786,10 @@ class MainActivity : AppCompatActivity() {
     companion object {
         // cell_size_px из эталонного профиля §7.4 (16 px). Rust rxInit подстраивается сам.
         private const val PROFILE_CELL_PX = 16
-        private const val PROC_INTERVAL_MS = 120L    // ~8 fps
+        // Декод кадра живьём — 29..50 мс. При hold=6 экран меняет кадр каждые 100 мс,
+        // поэтому throttle 120 мс опрашивал МЕДЛЕННЕЕ передатчика и часть кадров
+        // терялась (17.9 кбит/с при номинале 58.9). 50 мс -> ~2 захвата на кадр tx.
+        private const val PROC_INTERVAL_MS = 50L     // ~20 fps
         // Замер шума канала: сколько подряд захватов СТАТИЧНОГО кадра дампить.
         // Разброс одной клетки по этой серии = шум одного захвата (codes/255),
         // он же порог применимости гладкого временного базиса (RESEARCH).
