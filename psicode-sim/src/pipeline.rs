@@ -655,6 +655,7 @@ mod e2e {
             crosstalk_gb_q: 4,
             quiet_zone: 1,
             fec_overhead: 2,
+            border: psicode_core::profile::BorderMode::LegacyInverted,
         }
     }
 
@@ -766,6 +767,7 @@ mod spec_claims {
             crosstalk_gb_q: 4,
             quiet_zone: 1,
             fec_overhead: 2,
+            border: psicode_core::profile::BorderMode::LegacyInverted,
         }
     }
 

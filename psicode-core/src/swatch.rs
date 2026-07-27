@@ -223,6 +223,7 @@ mod tests {
             crosstalk_gb_q: 0,
             quiet_zone: 1,
             fec_overhead: 2,
+            border: crate::profile::BorderMode::LegacyInverted,
         }
     }
 

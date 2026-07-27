@@ -32,9 +32,10 @@
 //! | torn_frames_q       |  4  | доля рваных кадров, лог-шкала (см. torn_pct)      |
 //! | crosstalk_rg_q      |  4  | утечка R<->G, q * 2 %                             |
 //! | crosstalk_gb_q      |  4  | утечка G<->B, q * 2 %                             |
-//! | quiet_zone          |  2  | пресет тихой зоны                                 |
+//! | quiet_zone          |  2  | пресет тихой зоны (значим только при border = 0)  |
 //! | fec_overhead        |  3  | пресет избыточности RaptorQ                       |
-//! | reserved            |  4  | нули; поле для будущих версий                     |
+//! | border              |  1  | редакция ЗЧ-рамки (§3.2): 0 = v0, 1 = v1          |
+//! | reserved            |  3  | нули; поле для будущих версий                     |
 //! | ----- итого         |  72 |                                                   |
 //! | crc8                |  8  | CRC-8 (poly 0x07) по 9 байтам полей               |
 
@@ -113,6 +114,37 @@ impl ChromaMode {
     }
 }
 
+/// Редакция ЗЧ-рамки (§3.2).
+///
+/// Занимает ОДИН бит из прежнего 4-битного поля `reserved`, поэтому 160-битная
+/// раскладка кода не меняется (тот же приём, что у `ChromaMode` 5..7), а
+/// значение 0 побитово совпадает с прежним нулевым `reserved` — эталонная
+/// строка §7.4 и байт-в-байт живые передачи остаются валидными.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderMode {
+    /// v0: два КОНЦЕНТРИЧЕСКИХ кольца, внутреннее — инверсия внешнего, корни по
+    /// сторонам [1,2,3,4], тихая зона по полю `quiet_zone`.
+    #[default]
+    LegacyInverted = 0,
+    /// v1: четыре ЭКСТРУДИРОВАННЫЕ полосы N×2 (оба ряда одинаковы), корни по
+    /// сторонам [3,1,4,2], тихой зоны НЕТ.
+    ///
+    /// Тихая зона в этой редакции бессмысленна: границу локализует сам
+    /// корреляционный пик рамки, а поле стоило 13 % линейного размера клетки
+    /// (69 клеток полотна против 61) при том же экранном габарите.
+    ExtrudedStrips = 1,
+}
+
+impl BorderMode {
+    fn from_raw(v: u32) -> Self {
+        if v == 0 {
+            Self::LegacyInverted
+        } else {
+            Self::ExtrudedStrips
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CalibProfile {
     pub version: u8,
@@ -130,8 +162,10 @@ pub struct CalibProfile {
     pub torn_frames_q: u8,  // 0..=15
     pub crosstalk_rg_q: u8, // 0..=15
     pub crosstalk_gb_q: u8, // 0..=15
-    pub quiet_zone: u8,     // 0..=3
+    pub quiet_zone: u8,     // 0..=3 (значим только при border = LegacyInverted)
     pub fec_overhead: u8,   // 0..=7
+    /// Редакция ЗЧ-рамки (§3.2). Хранится в 1 бите бывшего `reserved`.
+    pub border: BorderMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,9 +268,17 @@ impl CalibProfile {
     pub fn effective_fps_at(&self, hz: u32) -> f32 {
         hz as f32 / self.frame_hold_periods as f32
     }
-    /// ширина тихой зоны в ячейках (§3.1): пресеты 0..3 -> 2,4,6,8 ячеек.
+    /// Ширина тихой зоны в ячейках (§3.1): пресеты 0..3 -> 2,4,6,8 ячеек.
+    ///
+    /// В редакции рамки v1 ([`BorderMode::ExtrudedStrips`]) тихой зоны НЕТ, и
+    /// поле `quiet_zone` игнорируется: символ рендерится ровно 61 клетку в
+    /// стороне вместо 69, что при том же экранном габарите даёт +13 % на
+    /// линейный размер клетки и +28 % на площадь.
     pub fn quiet_zone_cells(&self) -> u8 {
-        2 * (self.quiet_zone + 1)
+        match self.border {
+            BorderMode::LegacyInverted => 2 * (self.quiet_zone + 1),
+            BorderMode::ExtrudedStrips => 0,
+        }
     }
     /// число бит хромы на ячейку для текущего `chroma_mode` (§5.1):
     /// Mono и GreenOnly несут 0 бит хромы, Chroma1..3 — 1..3 бита.
@@ -320,7 +362,8 @@ impl CalibProfile {
         w.write(self.crosstalk_gb_q as u32, 4);
         w.write(self.quiet_zone as u32, 2);
         w.write(self.fec_overhead as u32, 3);
-        w.write(0, 4); // reserved
+        w.write(self.border as u32, 1); // редакция рамки §3.2
+        w.write(0, 3); // reserved
         w.write(0, 8); // место CRC, заполним ниже
         w.finish()
     }
@@ -364,7 +407,8 @@ impl CalibProfile {
         let crosstalk_gb_q = r.read(4) as u8;
         let quiet_zone = r.read(2) as u8;
         let fec_overhead = r.read(3) as u8;
-        let _reserved = r.read(4); // 4 бита, игнорируем
+        let border = BorderMode::from_raw(r.read(1));
+        let _reserved = r.read(3); // 3 бита, игнорируем
 
         let p = Self {
             version,
@@ -384,6 +428,7 @@ impl CalibProfile {
             crosstalk_gb_q,
             quiet_zone,
             fec_overhead,
+            border,
         };
         p.validate()?;
         Ok(p)
@@ -465,6 +510,7 @@ mod tests {
             crosstalk_gb_q: 4,
             quiet_zone: 1,
             fec_overhead: 2,
+            border: BorderMode::LegacyInverted,
         }
     }
 
@@ -515,6 +561,12 @@ mod tests {
         assert!((p.effective_fps_at(60) - p.effective_fps()).abs() < 1e-6);
         // quiet_zone=1 -> 4 ячейки (§3.1)
         assert_eq!(p.quiet_zone_cells(), 4);
+        // редакция рамки v1: тихой зоны нет независимо от пресета
+        let mut v1 = p;
+        v1.border = BorderMode::ExtrudedStrips;
+        assert_eq!(v1.quiet_zone_cells(), 0);
+        v1.quiet_zone = 3;
+        assert_eq!(v1.quiet_zone_cells(), 0);
         // Chroma2 -> 2 бита хромы (§5.1)
         assert_eq!(p.chroma_bits(), 2);
         // fec_overhead=2 -> repair каждые 4 исходных символа (§6.1)
@@ -574,6 +626,27 @@ mod tests {
         let (r, fixed2) = CalibProfile::decode_string(mangled).unwrap();
         assert_eq!(fixed2, 0);
         assert_eq!(p, r);
+    }
+
+    /// Редакция рамки живёт в СПАРЕ существующего поля: 160-битная раскладка не
+    /// меняется, длина строки та же, round-trip точен — как это сделано для
+    /// `ChromaMode` 5..7. Регресс на расширение формата провалит этот тест.
+    #[test]
+    fn border_mode_roundtrips_in_existing_field() {
+        for m in [BorderMode::LegacyInverted, BorderMode::ExtrudedStrips] {
+            let mut p = sample();
+            p.border = m;
+            let s = p.encode_string().unwrap();
+            assert_eq!(s.len(), CODE_CHARS_GROUPED, "{m:?}: {s}");
+            let (q, fixed) = CalibProfile::decode_string(&s).unwrap();
+            assert_eq!(fixed, 0, "{m:?}");
+            assert_eq!(p, q, "{m:?}");
+        }
+        // v0 обязан кодироваться РОВНО в эталонную строку §7.4: бит рамки = 0
+        // побитово совпадает с прежним нулевым reserved.
+        let mut p = sample();
+        p.border = BorderMode::LegacyInverted;
+        assert_eq!(p.encode_string().unwrap(), REFERENCE_CODE);
     }
 
     #[test]

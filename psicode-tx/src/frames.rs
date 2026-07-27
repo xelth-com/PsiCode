@@ -115,6 +115,7 @@ pub fn reference_profile() -> CalibProfile {
         crosstalk_gb_q: 4,
         quiet_zone: 1,
         fec_overhead: 2,
+        border: psicode_core::profile::BorderMode::LegacyInverted,
     }
 }
 

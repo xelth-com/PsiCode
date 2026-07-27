@@ -28,6 +28,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "std")]
+pub mod acquire;
 pub mod base32;
 pub mod bits;
 #[cfg(feature = "std")]
@@ -47,5 +49,7 @@ pub mod swatch;
 pub mod symbol;
 #[cfg(feature = "std")]
 pub mod tone;
+#[cfg(feature = "std")]
+pub mod zcborder;
 
 pub use profile::{CalibProfile, ChromaMode, ProfileError};

@@ -190,6 +190,7 @@ mod tests {
             crosstalk_gb_q: 0,
             quiet_zone: 1,
             fec_overhead: 0,
+            border: crate::profile::BorderMode::LegacyInverted,
         }
     }
 
