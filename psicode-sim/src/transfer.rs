@@ -545,6 +545,9 @@ fn chroma_name(m: ChromaMode) -> &'static str {
         ChromaMode::Chroma2 => "Chroma2",
         ChromaMode::Chroma3 => "Chroma3",
         ChromaMode::GreenOnly => "GreenOnly",
+        ChromaMode::ConstLuma1 => "ConstLuma1",
+        ChromaMode::ConstLuma2 => "ConstLuma2",
+        ChromaMode::ConstLuma3 => "ConstLuma3",
     }
 }
 

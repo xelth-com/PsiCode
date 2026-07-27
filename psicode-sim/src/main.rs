@@ -11,15 +11,23 @@
 //!   readback [dir] — декод из PPM-файлов (через 8-битное квантование)
 //!   goodput      — модель goodput с выживанием полос (§6.2) по пространству
 //!                  конфигураций (luma_bits × chroma × blur σ)
+//!   exp          — экспериментальные студии для решений по спеке: ISP temporal
+//!                  mixing (SER/выживаемость vs α) и детектируемость рамки/маяков
+//!                  под блюром (matched-filter SNR)
 
 mod channel;
+mod exp;
 mod framed;
+mod gprobe;
 mod image;
+mod l3live;
 mod live;
 mod modeb;
 mod pipeline;
+mod probe;
 mod report;
 mod rng;
+mod tprobe;
 mod transfer;
 
 use channel::{ChannelParams, Geometry, IDENTITY};
@@ -495,6 +503,9 @@ fn chroma_short(m: ChromaMode) -> &'static str {
         ChromaMode::Chroma2 => "C2",
         ChromaMode::Chroma3 => "C3",
         ChromaMode::GreenOnly => "G",
+        ChromaMode::ConstLuma1 => "CL1",
+        ChromaMode::ConstLuma2 => "CL2",
+        ChromaMode::ConstLuma3 => "CL3",
     }
 }
 
@@ -724,6 +735,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("sweep") => cmd_sweep(),
         Some("framed") => cmd_framed(),
+        Some("l3live") => l3live::cmd_l3live(),
         Some("modeb") => modeb::cmd_modeb(),
         Some("transfer") => transfer::cmd_transfer(),
         Some("live") => {
@@ -743,9 +755,13 @@ fn main() {
             cmd_readback(Path::new(dir));
         }
         Some("goodput") => cmd_goodput(),
+        Some("exp") => exp::cmd_exp(),
+        Some("gprobe") => gprobe::cmd_gprobe(),
+        Some("probe") => probe::cmd_probe(),
+        Some("tprobe") => tprobe::cmd_tprobe(),
         _ => {
             eprintln!(
-                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | modeb | transfer>"
+                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | l3live | modeb | transfer | exp | probe | tprobe>"
             );
             std::process::exit(2);
         }
