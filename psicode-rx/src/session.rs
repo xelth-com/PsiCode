@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use psicode_core::acquire::{self, AcquireOpts, Field, Placement, PROBE_DEPTH_STRIP};
+use psicode_core::acquire::{self, AcquireOpts, Field, Quad, PROBE_DEPTH_STRIP};
 use psicode_core::calframe::{self, CalibCache};
 use psicode_core::detect::{
     detect_symbol_acquire, detection_from_corners, frame_map, track_symbol, Detection,
@@ -232,7 +232,7 @@ pub struct RxSession {
     /// То же для рамки v1: раскладка прошлого кадра — вход дешёвого
     /// [`acquire::track`]. Своё поле, а не `last_detection`, потому что
     /// `track_symbol` умеет только рамку v0 (щупы кольца и штраф тихой зоны).
-    last_place: Option<Placement>,
+    last_place: Option<Quad>,
     /// Текущая сессия передачи (первый увиденный session_id побеждает, §6.2).
     session_id: Option<u32>,
     /// Декодер фонтана (создаётся при первом TransferInfo текущей сессии).
@@ -400,7 +400,7 @@ impl RxSession {
             .last_place
             .and_then(|prev| acquire::track(&spec, &field, &opts, &prev))
             .or_else(|| acquire::acquire(&spec, &field, &opts))?;
-        self.last_place = Some(got.place);
+        self.last_place = Some(got.quad);
         self.last_diag = (
             got.sides.iter().cloned().fold(f64::INFINITY, f64::min),
             got.strip_ratio,

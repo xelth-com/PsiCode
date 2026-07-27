@@ -89,7 +89,7 @@ fn main() {
             Some(a) => {
                 if accepted(&a, opts.gate) { acc.push(a.score); }
                 best.push(a.score);
-                let o = a.place.origin;
+                let o = a.quad.corners[0];
                 println!(
                     "{idx:>4} {:>7.4} {:>7.3} {:>7.2} [{:.3} {:.3} {:.3} {:.3}] {:>7.2} ({:>6.0},{:>6.0}) {ms:.0}мс {}",
                     a.score, a.margin, a.strip_ratio,

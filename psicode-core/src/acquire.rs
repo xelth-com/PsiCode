@@ -225,6 +225,293 @@ impl Placement {
     }
 }
 
+/// Раскладка символа ЧЕТЫРЬМЯ УГЛАМИ — проективная, в отличие от [`Placement`].
+///
+/// # Почему подобия не хватает
+///
+/// [`Placement`] — модель ЗАТРАВКИ: при неизвестной дистанции масштаб и угол
+/// перебираются по лестнице, и четырёх степеней свободы для перебора довольно.
+/// Моделью СНИМКА подобие не является. Телефон в руке смотрит на монитор под
+/// углом, и квадрат символа приходит на матрицу ТРАПЕЦИЕЙ.
+///
+/// Замерено на первых живых кадрах v1 (Note 10 Lite, 61 клетка, ~10 px/клетку,
+/// ручная фиксация фокуса): верхняя сторона 616 px, нижняя 664 px — 7.8 %, то
+/// есть 4.7 клетки набега на 61. Корреляция такой длины ломается уже от 1.6 %
+/// (см. док модуля), поэтому подогнанное ПОДОБИЕ давало стороны
+/// [0.56 0.87 0.20 0.33] при гейте 0.55 — ноль захватов на всех кадрах, — тогда
+/// как ГОМОГРАФИЯ на тех же кадрах даёт [0.99 0.99 0.99 0.99].
+///
+/// # Почему углы, а не восемь коэффициентов матрицы
+///
+/// Углы — ровно то, что ждёт [`crate::detect::detection_from_corners`], и ровно
+/// то, что каждая сторона определяет своими двумя концами: подгонка стороны
+/// двигает ДВА угла, и её результат ложится в модель без пересчёта. Матрица
+/// хранила бы то же самое в координатах, в которых «сдвинуть конец стороны на
+/// полклетки» не выражается локально.
+///
+/// # Но ЧИТАЕТСЯ раскладка всё равно проективно ([`CellMap`])
+///
+/// Соблазн — считать каждую сторону НЕЗАВИСИМОЙ аффинной полосой: обход из угла
+/// `s` в угол `s+1` равными шагами, глубина по нормали. Щупы уходят вглубь всего
+/// на RING клеток из 61, и там проективное искажение действительно неотличимо от
+/// аффинного (< 1.5 px при замеренной трапеции). ВДОЛЬ стороны — нет: там 61
+/// клетка, и равномерный шаг по отрезку это НЕ образ равномерной клеточной сетки.
+///
+/// Замерено на живом кадре (Note 10 Lite, углы [(409,54) (1015,54) (1023,655)
+/// (367,656)], верх 606 px против низа 656 px): перспективный коэффициент по
+/// вертикальной оси h = −0.076, и середина ЛЕВОЙ и ПРАВОЙ сторон уезжает на
+/// 1.2 КЛЕТКИ относительно равномерного шага. ЗЧ-пик по продольному сдвигу шире
+/// клетки не бывает, поэтому эти две стороны падают на пол: на одних и тех же
+/// углах проективный сэмплер дал [0.931 0.887 0.888 0.922], а аффинный
+/// пер-сторонний — [0.925 0.227 0.862 0.196]. Верх и низ совпали, потому что их
+/// нелинейность задаётся ДРУГИМ коэффициентом (g = 0.0015, левая и правая
+/// стороны почти равной длины), и он тут около нуля.
+///
+/// Отсюда правило: степени свободы — углы, но чтение — всегда через [`CellMap`],
+/// то есть через ту же гомографию, которой потом читается payload.
+#[derive(Debug, Clone, Copy)]
+pub struct Quad {
+    /// Углы в КАНОНИЧЕСКОМ порядке [tl, tr, br, bl].
+    pub corners: [(f64, f64); 4],
+}
+
+impl Quad {
+    /// Сторона `s` как независимая полоса: обход идёт из угла `s` в угол `s+1`.
+    #[inline]
+    fn side(&self, s: usize) -> SideFit {
+        SideFit {
+            a: self.corners[s & 3],
+            b: self.corners[(s + 1) & 3],
+        }
+    }
+
+    /// Средний масштаб по четырём сторонам, px на клетку.
+    pub fn px_per_cell(&self, n: usize) -> f64 {
+        (0..4).map(|s| self.side(s).cell_px(n)).sum::<f64>() / 4.0
+    }
+
+    fn translated(&self, dx: f64, dy: f64) -> Quad {
+        let mut q = *self;
+        for c in q.corners.iter_mut() {
+            c.0 += dx;
+            c.1 += dy;
+        }
+        q
+    }
+
+    fn center(&self) -> (f64, f64) {
+        let s = self
+            .corners
+            .iter()
+            .fold((0.0, 0.0), |a, c| (a.0 + c.0, a.1 + c.1));
+        (s.0 * 0.25, s.1 * 0.25)
+    }
+
+    fn scaled_about_center(&self, r: f64) -> Quad {
+        let m = self.center();
+        let mut q = *self;
+        for c in q.corners.iter_mut() {
+            c.0 = m.0 + (c.0 - m.0) * r;
+            c.1 = m.1 + (c.1 - m.1) * r;
+        }
+        q
+    }
+
+    fn rotated_about_center(&self, a: f64) -> Quad {
+        let m = self.center();
+        let (co, si) = (a.cos(), a.sin());
+        let mut q = *self;
+        for c in q.corners.iter_mut() {
+            let (dx, dy) = (c.0 - m.0, c.1 - m.1);
+            c.0 = m.0 + dx * co - dy * si;
+            c.1 = m.1 + dx * si + dy * co;
+        }
+        q
+    }
+}
+
+impl Placement {
+    /// Подобие как четырёхугольник — начальное приближение для проективной доводки.
+    pub fn to_quad(&self, n: usize) -> Quad {
+        Quad {
+            corners: self.corners(n),
+        }
+    }
+}
+
+/// Проективное отображение КЛЕТОЧНЫХ координат `(cu, cv) ∈ [0, n]²` в пиксели
+/// снимка, построенное по четырём углам [`Quad`].
+///
+/// Это ТА ЖЕ гомография, что строит [`crate::detect::detection_from_corners`]
+/// для чтения payload, только в замкнутой форме и без аллокаций: доводка зовёт
+/// её десятками тысяч раз, а решать 8×8 Гауссом на каждый шаг было бы абсурдом.
+/// Совпадение с `detect` не косметическое — если рамка подгоняется одной
+/// моделью, а payload читается другой, «идеальная» корреляция рамки всё равно
+/// даёт сдвинутую сетку payload.
+///
+/// Форма стандартная (единичный квадрат → четырёхугольник), масштаб `1/n` вложен
+/// в коэффициенты, чтобы `map` не делил.
+#[derive(Debug, Clone, Copy)]
+struct CellMap {
+    ax: f64,
+    bx: f64,
+    cx: f64,
+    ay: f64,
+    by: f64,
+    cy: f64,
+    /// Перспективные коэффициенты (уже поделены на n).
+    gu: f64,
+    hv: f64,
+}
+
+impl CellMap {
+    fn new(q: &Quad, n: usize) -> CellMap {
+        let (x0, y0) = q.corners[0];
+        let (x1, y1) = q.corners[1];
+        let (x2, y2) = q.corners[2];
+        let (x3, y3) = q.corners[3];
+        let dx1 = x1 - x2;
+        let dx2 = x3 - x2;
+        let sx = x0 - x1 + x2 - x3;
+        let dy1 = y1 - y2;
+        let dy2 = y3 - y2;
+        let sy = y0 - y1 + y2 - y3;
+        let den = dx1 * dy2 - dx2 * dy1;
+        // Вырожденная четвёрка (стороны почти параллельны в пиксельном смысле)
+        // — единственный случай, где перспективная часть не определена; тогда
+        // отображение честно вырождается в аффинное, а не в мусор.
+        let (g, h) = if den.abs() < 1e-9 {
+            (0.0, 0.0)
+        } else {
+            ((sx * dy2 - dx2 * sy) / den, (dx1 * sy - sx * dy1) / den)
+        };
+        let inv = 1.0 / n as f64;
+        CellMap {
+            ax: (x1 - x0 + g * x1) * inv,
+            bx: (x3 - x0 + h * x3) * inv,
+            cx: x0,
+            ay: (y1 - y0 + g * y1) * inv,
+            by: (y3 - y0 + h * y3) * inv,
+            cy: y0,
+            gu: g * inv,
+            hv: h * inv,
+        }
+    }
+
+    /// Щуп стороны `side` в позиции (вдоль, вглубь) КЛЕТОК — единственная точка,
+    /// через которую захват читает снимок.
+    #[inline]
+    fn probe(&self, side: usize, along: f64, depth: f64, n: usize) -> (f64, f64) {
+        let (cu, cv) = probe_cell(side, along, depth, n as f64);
+        self.map(cu, cv)
+    }
+
+    #[inline]
+    fn map(&self, cu: f64, cv: f64) -> (f64, f64) {
+        let w = self.gu * cu + self.hv * cv + 1.0;
+        // Горизонт (w = 0) внутри символа означает четвёрку, которую камера
+        // физически не увидела бы; выборку уводим за кадр, а не в NaN.
+        if w.abs() < 1e-9 {
+            return (-1.0e9, -1.0e9);
+        }
+        (
+            (self.ax * cu + self.bx * cv + self.cx) / w,
+            (self.ay * cu + self.by * cv + self.cy) / w,
+        )
+    }
+}
+
+/// Клеточные координаты щупа стороны `side` в позиции `along` на глубине `depth`
+/// (обе — в клетках, от начала обхода стороны и от внешнего края соответственно).
+///
+/// Непрерывный аналог [`crate::zcborder::strip_cell`]: центр клетки `i` глубины
+/// `d` — это `along = i + 0.5`, `depth = d + 0.5`. Согласие закреплено тестом
+/// [`tests::probe_cell_matches_strip_cell`].
+#[inline]
+fn probe_cell(side: usize, along: f64, depth: f64, n: f64) -> (f64, f64) {
+    match side & 3 {
+        0 => (along, depth),
+        1 => (n - depth, along),
+        2 => (n - along, n - depth),
+        _ => (depth, n - along),
+    }
+}
+
+/// Одна сторона символа ДВУМЯ КОНЦАМИ: обход из `a` в `b`.
+///
+/// Это система координат ПОДГОНКИ, а не выборки: методы ниже двигают концы в
+/// естественных для промаха единицах («конец уехал на столько-то клеток»).
+/// ЧИТАЕТСЯ сторона всегда через [`CellMap`] всего четырёхугольника — равномерный
+/// шаг по отрезку образом клеточной сетки не является (см. док [`Quad`]).
+#[derive(Debug, Clone, Copy)]
+struct SideFit {
+    a: (f64, f64),
+    b: (f64, f64),
+}
+
+impl SideFit {
+    /// Вектор шага на ОДНУ клетку вдоль стороны.
+    #[inline]
+    fn step(&self, n: usize) -> (f64, f64) {
+        let inv = 1.0 / n as f64;
+        ((self.b.0 - self.a.0) * inv, (self.b.1 - self.a.1) * inv)
+    }
+
+    /// px на клетку у этой стороны.
+    #[inline]
+    fn cell_px(&self, n: usize) -> f64 {
+        let (dx, dy) = self.step(n);
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// Единичные направления (вдоль обхода, внутрь символа).
+    fn dirs(&self) -> ((f64, f64), (f64, f64)) {
+        let (dx, dy) = (self.b.0 - self.a.0, self.b.1 - self.a.1);
+        let l = (dx * dx + dy * dy).sqrt().max(1e-12);
+        let u = (dx / l, dy / l);
+        (u, (-u.1, u.0))
+    }
+
+    /// Длина × `r` вокруг СЕРЕДИНЫ стороны (середина — пивот, как у затравки:
+    /// так ошибка длины расходится на оба конца поровну и вдвое медленнее).
+    fn scaled(&self, r: f64) -> SideFit {
+        let m = ((self.a.0 + self.b.0) * 0.5, (self.a.1 + self.b.1) * 0.5);
+        SideFit {
+            a: (m.0 + (self.a.0 - m.0) * r, m.1 + (self.a.1 - m.1) * r),
+            b: (m.0 + (self.b.0 - m.0) * r, m.1 + (self.b.1 - m.1) * r),
+        }
+    }
+
+    /// Параллельный перенос всей стороны на (вдоль, вглубь) КЛЕТОК.
+    fn shifted(&self, along: f64, deep: f64, n: usize) -> SideFit {
+        self.moved(along, deep, deep, n)
+    }
+
+    /// Сдвиг вдоль на `along` клеток и ПОПЕРЁК — у каждого конца свой: `da` у
+    /// начала, `db` у конца, в клетках.
+    ///
+    /// Пара (da, db) — естественные координаты прямой: вместе они задают и
+    /// смещение, и наклон, причём в единицах, в которых промах и меряется («угол
+    /// уехал на столько-то клеток»). Раздельный перебор смещения и УГЛА покрывал
+    /// бы ту же область гуще у центра и реже у концов, а промахивается именно
+    /// конец: замерено на живом кадре — угол tl уехал на 1.2 клетки, а bl на
+    /// 4.3, при почти верной длине стороны.
+    fn moved(&self, along: f64, da: f64, db: f64, n: usize) -> SideFit {
+        let (u, v) = self.dirs();
+        let c = self.cell_px(n);
+        let sh = |p: (f64, f64), deep: f64| {
+            (
+                p.0 + (along * u.0 + deep * v.0) * c,
+                p.1 + (along * u.1 + deep * v.1) * c,
+            )
+        };
+        SideFit {
+            a: sh(self.a, da),
+            b: sh(self.b, db),
+        }
+    }
+}
+
 /// Итог захвата.
 #[derive(Debug, Clone, Copy)]
 pub struct Acquisition {
@@ -237,10 +524,10 @@ pub struct Acquisition {
     pub score: f64,
     /// Отрыв лучшей ориентации от второй.
     pub margin: f64,
-    /// Оценка px на клетку.
+    /// Оценка px на клетку (среднее по четырём сторонам).
     pub px_per_cell: f64,
     /// Найденная раскладка — вход для дешёвого [`track`] на следующем кадре.
-    pub place: Placement,
+    pub quad: Quad,
     /// Корреляция КАЖДОЙ стороны по отдельности (в каноническом порядке).
     ///
     /// Среднее скрывает форму отказа: ложное срабатывание на тексте обычно даёт
@@ -326,33 +613,71 @@ pub fn acquire(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Option<A
 }
 
 fn acquire_inner(spec: &BorderSpec, field: &Field, opts: &AcquireOpts) -> Option<Acquisition> {
+    let n = spec.n;
     let seeds = seed_scan(spec, field, opts);
-    // Отращивание и проверка независимы по затравкам, поэтому раскладываются по
+    // ФАЗА 1 — отращивание. Независимо по затравкам, поэтому раскладывается по
     // потокам так же, как затравочный скан. После распараллеливания скана именно
     // эта стадия стала узким местом (у затравок разная судьба: часть отсеивается
-    // сразу, часть доходит до полной 4-сторонней проверки), поэтому чередующийся
+    // сразу, часть доходит до полной 4-сторонней подгонки), поэтому чередующийся
     // шаг здесь тоже важнее блочного.
     let want = opts
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |v| v.get()));
     let nthreads = want.clamp(1, MAX_THREADS).min(seeds.len().max(1));
-    let best = if nthreads <= 1 {
-        best_of_seeds(spec, field, opts, &seeds, 0, 1)
+    let mut grown: Vec<(f64, Quad)> = if nthreads <= 1 {
+        grow_of_seeds(spec, field, opts, &seeds, 0, 1)
     } else {
         let seeds = &seeds;
         std::thread::scope(|sc| {
             let handles: Vec<_> = (0..nthreads)
-                .map(|t| sc.spawn(move || best_of_seeds(spec, field, opts, seeds, t, nthreads)))
+                .map(|t| sc.spawn(move || grow_of_seeds(spec, field, opts, seeds, t, nthreads)))
                 .collect();
-            let mut acc: Option<Acquisition> = None;
+            let mut acc: Vec<(f64, Quad)> = Vec::new();
             for h in handles {
-                if let Ok(Some(a)) = h.join() {
-                    acc = Some(pick_better(acc, a));
+                if let Ok(v) = h.join() {
+                    acc.extend(v);
                 }
             }
             acc
         })
     };
+    // Порядок ОБЯЗАН зависеть только от результата, а не от числа потоков.
+    grown.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then(
+                quad_key(&a.1)
+                    .partial_cmp(&quad_key(&b.1))
+                    .unwrap_or(core::cmp::Ordering::Equal),
+            )
+    });
+    // Разные затравки часто сходятся в ОДНУ раскладку; без этого все места под
+    // проективную доводку заняла бы одна и та же гипотеза.
+    let mut cands: Vec<Quad> = Vec::new();
+    for (_, q) in grown {
+        let tol = 1.0 * q.px_per_cell(n);
+        if cands.iter().any(|k| {
+            (0..4).all(|j| {
+                (q.corners[j].0 - k.corners[j].0).hypot(q.corners[j].1 - k.corners[j].1) < tol
+            })
+        }) {
+            continue;
+        }
+        cands.push(q);
+        if cands.len() >= POLISH_CANDS {
+            break;
+        }
+    }
+
+    // ФАЗА 2 — проективная доводка и проверка у лучших. Дорого, поэтому только
+    // здесь; кандидатов единицы, так что поток один и исход детерминирован.
+    let mut best: Option<Acquisition> = None;
+    for q in cands {
+        let q = polish(spec, field, opts.probe_depth, q);
+        if let Some(a) = verify(spec, field, opts.probe_depth, &q) {
+            best = Some(pick_better(best, a));
+        }
+    }
     best
 }
 
@@ -372,6 +697,26 @@ pub fn accepted(a: &Acquisition, gate: (f64, f64, f64)) -> bool {
         && a.strip_ratio >= gate.2
 }
 
+/// ДИАГНОСТИКА: корреляция каждой стороны при ЗАДАННЫХ углах символа.
+///
+/// Существует ради сверки геометрии с независимой реализацией: «углы такие-то,
+/// какие корреляции» — единственный способ отличить «подгонка встала не туда» от
+/// «щупы читают не там».
+pub fn score_sides(
+    spec: &BorderSpec,
+    field: &Field,
+    probe_depth: f64,
+    quad: &Quad,
+) -> [f64; 4] {
+    let tmpl = quad_templates(spec, probe_depth);
+    let cm = CellMap::new(quad, spec.n);
+    let mut out = [0.0f64; 4];
+    for (s, o) in out.iter_mut().enumerate() {
+        *o = tmpl[s].corr(field, &cm, s, spec.n);
+    }
+    out
+}
+
 /// ДИАГНОСТИКА: лучшая гипотеза БЕЗ приёмочного гейта.
 ///
 /// Существует ради измерения ЗАЗОРА между «символ есть» и «символа нет»: порог
@@ -384,26 +729,25 @@ pub fn acquire_best_unfiltered(
     acquire_inner(spec, field, opts)
 }
 
-/// Лучшая гипотеза среди затравок `seeds[t], seeds[t+step], ...`.
-fn best_of_seeds(
+/// Отращивание затравок `seeds[t], seeds[t+step], ...` с грубой оценкой каждой.
+fn grow_of_seeds(
     spec: &BorderSpec,
     field: &Field,
     opts: &AcquireOpts,
     seeds: &[Seed],
     t: usize,
     step: usize,
-) -> Option<Acquisition> {
-    let mut best: Option<Acquisition> = None;
+) -> Vec<(f64, Quad)> {
+    let tmpl = quad_templates(spec, opts.probe_depth);
+    let mut out = Vec::new();
     let mut k = t;
     while k < seeds.len() {
-        if let Some(grown) = grow(spec, field, opts.probe_depth, seeds[k]) {
-            if let Some(a) = verify(spec, field, opts.probe_depth, &grown) {
-                best = Some(pick_better(best, a));
-            }
+        if let Some(q) = grow(spec, field, opts.probe_depth, seeds[k]) {
+            out.push((quad_score(field, &tmpl, &q, spec.n), q));
         }
         k += step;
     }
-    best
+    out
 }
 
 /// Выбор лучшей из двух гипотез с ДЕТЕРМИНИРОВАННЫМ доразрешением ничьих:
@@ -412,13 +756,18 @@ fn pick_better(cur: Option<Acquisition>, a: Acquisition) -> Acquisition {
     match cur {
         None => a,
         Some(b) => {
-            if a.score > b.score || (a.score == b.score && key(&a.place) < key(&b.place)) {
+            if a.score > b.score || (a.score == b.score && quad_key(&a.quad) < quad_key(&b.quad)) {
                 a
             } else {
                 b
             }
         }
     }
+}
+
+/// Ключ детерминированного доразрешения ничьих для четырёхугольника.
+fn quad_key(q: &Quad) -> f64 {
+    q.corners[0].0 * 4096.0 + q.corners[0].1 * 16.0 + q.corners[1].0
 }
 
 /// СЛЕЖЕНИЕ: дешёвая доводка от раскладки предыдущего кадра.
@@ -434,7 +783,7 @@ pub fn track(
     spec: &BorderSpec,
     field: &Field,
     opts: &AcquireOpts,
-    prev: &Placement,
+    prev: &Quad,
 ) -> Option<Acquisition> {
     // Сперва МАЛЕНЬКИЙ ИСЧЕРПЫВАЮЩИЙ поиск трансляции, потом мелкая доводка.
     //
@@ -445,45 +794,38 @@ pub fn track(
     // (5.0, 0.0)). Сетка ±1 клетка с шагом 0.25 накрывает межкадровое дрожание
     // целиком и выбирает ПРАВИЛЬНЫЙ бассейн — 81 вычисление цели, единицы
     // миллисекунд, всё ещё на два порядка дешевле захвата.
+    let n = spec.n;
+    let tmpl = quad_templates(spec, opts.probe_depth);
+    let cell = prev.px_per_cell(n);
     let mut best = *prev;
     let mut bs = f64::MIN;
     for gy in -4i32..=4 {
         for gx in -4i32..=4 {
-            let cand = Placement {
-                origin: (
-                    prev.origin.0 + gx as f64 * 0.25 * prev.scale,
-                    prev.origin.1 + gy as f64 * 0.25 * prev.scale,
-                ),
-                ..*prev
-            };
-            let v = side_score(spec, field, opts.probe_depth, &cand);
+            let cand = prev.translated(gx as f64 * 0.25 * cell, gy as f64 * 0.25 * cell);
+            let v = quad_score(field, &tmpl, &cand, n);
             if v > bs {
                 bs = v;
                 best = cand;
             }
         }
     }
-    let place = refine_all(spec, field, opts.probe_depth, best, REFINE_STEP_TRACK);
-    verify(spec, field, opts.probe_depth, &place).filter(|a| accepted(a, opts.gate))
+    // Проективные степени свободы открыты и в слежении: перспектива меняется
+    // вместе с наклоном руки, а перезахват из-за неё стоил бы кадров.
+    let q = refine_quad(spec, field, opts.probe_depth, best, REFINE_STEP_TRACK, true);
+    verify(spec, field, opts.probe_depth, &q).filter(|a| accepted(a, opts.gate))
+}
+
+/// Шаблоны всех четырёх сторон на полной длине.
+fn quad_templates(spec: &BorderSpec, probe_depth: f64) -> Vec<SideTemplate> {
+    (0..4)
+        .map(|s| SideTemplate::new(side_probes(spec, s, probe_depth, spec.n)))
+        .collect()
 }
 
 /// Средняя корреляция четырёх сторон при данной раскладке — цель доводки.
-fn side_score(spec: &BorderSpec, field: &Field, probe_depth: f64, p: &Placement) -> f64 {
-    let n = spec.n;
-    let mut acc = 0.0;
-    for j in 0..4 {
-        let pr = side_probes(spec, j, probe_depth, n);
-        let got: Vec<(f64, f64)> = pr
-            .iter()
-            .map(|&(cu, cv, _)| {
-                let (x, y) = p.map(cu, cv);
-                field.bilin(x, y)
-            })
-            .collect();
-        let want: Vec<(f64, f64)> = pr.iter().map(|&(_, _, w)| w).collect();
-        acc += corr_slice(&got, &want);
-    }
-    acc / 4.0
+fn quad_score(field: &Field, tmpl: &[SideTemplate], q: &Quad, n: usize) -> f64 {
+    let cm = CellMap::new(q, n);
+    (0..4).map(|s| tmpl[s].corr(field, &cm, s, n)).sum::<f64>() / 4.0
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +1161,7 @@ fn place_from_probe(
 ///
 /// На каждой длине допуск по масштабу ~1/(L/2), поэтому шаг сетки берётся вдвое
 /// мельче допуска, а диапазон — на весь допуск предыдущей ступени.
-fn grow(spec: &BorderSpec, field: &Field, probe_depth: f64, seed: Seed) -> Option<Placement> {
+fn grow(spec: &BorderSpec, field: &Field, probe_depth: f64, seed: Seed) -> Option<Quad> {
     let n = spec.n;
     let refs = side_reference(spec, 0);
     let mut place = seed.place;
@@ -850,7 +1192,18 @@ fn grow(spec: &BorderSpec, field: &Field, probe_depth: f64, seed: Seed) -> Optio
     // Четыре стороны фиксируют её совместно: продольная координата одной пары —
     // это поперечная координата другой. Никаких дополнительных щупов (наружу от
     // рамки или внутрь, в payload) для этого не нужно.
-    Some(refine_all(spec, field, probe_depth, place, REFINE_STEP_ACQUIRE))
+    //
+    // Доводка здесь ЖЁСТКАЯ (без проективных степеней): её задача — ранжировать
+    // затравки, а не описать снимок. Проективную форму даёт [`polish`], и только
+    // лучшим кандидатам — см. [`POLISH_CANDS`].
+    Some(refine_quad(
+        spec,
+        field,
+        probe_depth,
+        place.to_quad(n),
+        REFINE_STEP_ACQUIRE,
+        false,
+    ))
 }
 
 /// Начальный шаг доводки при ЗАХВАТЕ, в клетках.
@@ -868,60 +1221,69 @@ const REFINE_STEP_ACQUIRE: f64 = 1.0;
 /// кадрами (при 10 fps это единицы пикселей) и перескочить не дают.
 const REFINE_STEP_TRACK: f64 = 0.5;
 
-/// Доводка по всем четырём сторонам: паттерн-поиск по (origin, масштаб, угол),
-/// максимизирующий среднюю корреляцию сторон. `coarse` — начальный шаг в клетках.
-fn refine_all(
+/// Доводка четырёхугольника паттерн-поиском по средней корреляции сторон.
+///
+/// `coarse` — начальный шаг в клетках. `free_corners` включает ПРОЕКТИВНЫЕ
+/// степени свободы (каждый угол двигается сам по себе); при `false` разрешены
+/// только жёсткие движения — сдвиг, масштаб, поворот, — то есть ровно прежняя
+/// подгонка подобия. Разделение не косметическое: жёсткая доводка дёшева и
+/// годится, чтобы РАНЖИРОВАТЬ затравки, а проективная имеет смысл лишь после
+/// пер-стороннего скана ([`refine_side`]) — сама по себе она застревает, потому
+/// что промахнувшаяся на две клетки сторона стоит на полу кросс-корреляции, где
+/// градиента нет (замерено на живом кадре: спуск по восьми координатам из
+/// подобия дал [0.99 0.96 0.16 0.25] и дальше не двигался).
+fn refine_quad(
     spec: &BorderSpec,
     field: &Field,
     probe_depth: f64,
-    start: Placement,
+    start: Quad,
     coarse: f64,
-) -> Placement {
+    free_corners: bool,
+) -> Quad {
     let n = spec.n;
-    let probes: Vec<Vec<(f64, f64, (f64, f64))>> =
-        (0..4).map(|k| side_probes(spec, k, probe_depth, n)).collect();
-    let eval = |p: &Placement| -> f64 {
-        let mut acc = 0.0;
-        for j in 0..4 {
-            let got: Vec<(f64, f64)> = probes[j]
-                .iter()
-                .map(|&(cu, cv, _)| {
-                    let (x, y) = p.map(cu, cv);
-                    field.bilin(x, y)
-                })
-                .collect();
-            let want: Vec<(f64, f64)> = probes[j].iter().map(|&(_, _, w)| w).collect();
-            acc += corr_slice(&got, &want);
-        }
-        acc / 4.0
-    };
+    let tmpl = quad_templates(spec, probe_depth);
     let mut best = start;
-    let mut bs = eval(&best);
-    // Лестница шагов от `coarse` вниз до сотых долей клетки.
+    let mut bs = quad_score(field, &tmpl, &best, n);
     let ladder = [coarse, coarse * 0.5, coarse * 0.25, coarse * 0.1, coarse * 0.04];
+    let mut cands: Vec<Quad> = Vec::with_capacity(16);
     for &step in &ladder {
-        let d = step * best.scale;
-        let ds = step * 0.01; // относительный шаг масштаба
-        let dt = step * 0.004; // шаг угла, радианы
         let mut guard = 0;
         loop {
             guard += 1;
             let mut improved = false;
-            let cands = [
-                Placement { origin: (best.origin.0 + d, best.origin.1), ..best },
-                Placement { origin: (best.origin.0 - d, best.origin.1), ..best },
-                Placement { origin: (best.origin.0, best.origin.1 + d), ..best },
-                Placement { origin: (best.origin.0, best.origin.1 - d), ..best },
-                Placement { scale: best.scale * (1.0 + ds), ..best },
-                Placement { scale: best.scale * (1.0 - ds), ..best },
-                Placement { theta: best.theta + dt, ..best },
-                Placement { theta: best.theta - dt, ..best },
-            ];
-            for c in cands {
-                let v = eval(&c);
+            let d = step * best.px_per_cell(n);
+            let ds = step * 0.01; // относительный шаг масштаба
+            let dt = step * 0.004; // шаг угла, радианы
+            cands.clear();
+            // ЖЁСТКИЕ движения: они и раньше давали основную скорость сходимости
+            cands.push(best.translated(d, 0.0));
+            cands.push(best.translated(-d, 0.0));
+            cands.push(best.translated(0.0, d));
+            cands.push(best.translated(0.0, -d));
+            cands.push(best.scaled_about_center(1.0 + ds));
+            cands.push(best.scaled_about_center(1.0 - ds));
+            cands.push(best.rotated_about_center(dt));
+            cands.push(best.rotated_about_center(-dt));
+            if free_corners {
+                for k in 0..4 {
+                    for axis in 0..2 {
+                        for sgn in [1.0f64, -1.0] {
+                            let mut c = best;
+                            if axis == 0 {
+                                c.corners[k].0 += sgn * d;
+                            } else {
+                                c.corners[k].1 += sgn * d;
+                            }
+                            cands.push(c);
+                        }
+                    }
+                }
+            }
+            for c in cands.iter() {
+                let v = quad_score(field, &tmpl, c, n);
                 if v > bs + 1e-7 {
                     bs = v;
-                    best = c;
+                    best = *c;
                     improved = true;
                 }
             }
@@ -932,6 +1294,284 @@ fn refine_all(
     }
     best
 }
+
+/// Полная доводка ОДНОЙ стороны как независимой полосы: грубый СКАН, затем
+/// лестница длин окна, затем спуск по четырём координатам её концов.
+///
+/// Ключевое здесь — что скан именно СКАН, а не спуск. Трапеция живого кадра
+/// уводит сторону на 7.8 % по длине, то есть на 2.4 клетки на конце; ЗЧ-пик по
+/// продольному сдвигу узок (ширина порядка клетки), вокруг него ровный пол
+/// 1/√N, и никакой спуск оттуда не выберется. Зато на КОРОТКОМ окне допуск по
+/// длине ±1/(W/2), и при W = [`SEED_TAPS`] это ±12.5 % — трапеция помещается
+/// целиком. Дальше окно удваивается, а сетка мельчает под допуск предыдущей
+/// ступени: та же схема, что у [`grow`], только применённая к стороне, а не ко
+/// всему символу.
+/// `ctx` — четырёхугольник, из которого сторона берётся: два ДРУГИХ его угла
+/// задают продольную нелинейность этой стороны (см. док [`Quad`]), поэтому
+/// «независимая» подгонка стороны всё равно читает её через полный [`CellMap`].
+fn refine_side(
+    spec: &BorderSpec,
+    field: &Field,
+    probe_depth: f64,
+    side: usize,
+    ctx: &Quad,
+    start: SideFit,
+) -> SideFit {
+    let n = spec.n;
+    let own = side_reference(spec, side).len();
+    let mut fit = start;
+    // корреляция стороны при её концах `sf`, прочих углах — из `ctx`
+    let ev = |t: &SideTemplate, sf: &SideFit| -> f64 {
+        let mut q = *ctx;
+        q.corners[side & 3] = sf.a;
+        q.corners[(side + 1) & 3] = sf.b;
+        t.corr(field, &CellMap::new(&q, n), side, n)
+    };
+
+    // --- ступень 1: грубый скан на коротком окне ---
+    //
+    // Скан ИЕРАРХИЧЕСКИЙ, и это не экономия, а разная обусловленность осей.
+    // Поперёк полоса однородна на RING клеток, поэтому по (da, db) отклик
+    // ШИРОКИЙ и крупный шаг ничего не теряет. Вдоль стороны отклик — ЗЧ-пик
+    // шириной с клетку на ровном полу 1/√N, поэтому шаг вдоль обязан быть
+    // мельче полклетки, иначе пик проскакивается целиком.
+    let t0 = SideTemplate::new(side_probes_win(spec, side, probe_depth, SEED_TAPS));
+    let mut bs = ev(&t0, &fit);
+    let scan = |fit: SideFit, bs: &mut f64, dp: f64, dm: f64, np: i32, nm: i32| {
+        let mut best = fit;
+        for ia in -np..=np {
+            for ib in -np..=np {
+                for im in -nm..=nm {
+                    let c = fit.moved(
+                        im as f64 * dm,
+                        ia as f64 * dp,
+                        ib as f64 * dp,
+                        n,
+                    );
+                    let s = ev(&t0, &c);
+                    if s > *bs {
+                        *bs = s;
+                        best = c;
+                    }
+                }
+            }
+        }
+        best
+    };
+    // грубо: концы ±3 клетки шагом 1, вдоль ±2 клетки шагом 0.5
+    fit = scan(fit, &mut bs, 1.0, 0.5, 3, 4);
+    // мелко: концы ±0.75 шагом 0.25, вдоль ±0.5 шагом 0.125
+    fit = scan(fit, &mut bs, 0.25, 0.125, 3, 4);
+    // длина: ±10 % шагом 2 % — это и есть трапеция
+    let mut best = fit;
+    for k in -5i32..=5 {
+        let c = fit.scaled(1.0 + k as f64 * 0.02);
+        let s = ev(&t0, &c);
+        if s > bs {
+            bs = s;
+            best = c;
+        }
+    }
+    fit = best;
+
+    // --- ступень 2: удвоение окна, сетка под допуск предыдущей ступени ---
+    let mut w = SEED_TAPS;
+    while w < own {
+        let next = (w * 2).min(own);
+        let t = SideTemplate::new(side_probes_win(spec, side, probe_depth, next));
+        let tol = 1.0 / (w as f64 / 2.0);
+        let mut bs = ev(&t, &fit);
+        let mut best = fit;
+        for ki in -2i32..=2 {
+            let scaled = fit.scaled(1.0 + ki as f64 * tol * 0.5);
+            for gi in -2i32..=2 {
+                for gj in -2i32..=2 {
+                    let c = scaled.shifted(gi as f64 * 0.2, gj as f64 * 0.2, n);
+                    let s = ev(&t, &c);
+                    if s > bs {
+                        bs = s;
+                        best = c;
+                    }
+                }
+            }
+        }
+        fit = best;
+        w = next;
+    }
+
+    // --- ступень 3: спуск по концам на ПОЛНОЙ длине ---
+    let t = SideTemplate::new(side_probes(spec, side, probe_depth, n));
+    let mut bs = ev(&t, &fit);
+    let cell = fit.cell_px(n);
+    for &step in &[0.5f64, 0.2, 0.08, 0.03] {
+        let d = step * cell;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            let mut improved = false;
+            for e in 0..2 {
+                for axis in 0..2 {
+                    for sgn in [1.0f64, -1.0] {
+                        let mut c = fit;
+                        let p = if e == 0 { &mut c.a } else { &mut c.b };
+                        if axis == 0 {
+                            p.0 += sgn * d;
+                        } else {
+                            p.1 += sgn * d;
+                        }
+                        let s = ev(&t, &c);
+                        if s > bs + 1e-7 {
+                            bs = s;
+                            fit = c;
+                            improved = true;
+                        }
+                    }
+                }
+            }
+            if !improved || guard >= 16 {
+                break;
+            }
+        }
+    }
+    fit
+}
+
+/// Пересечение прямых (p1,p2) и (p3,p4); `None` — почти параллельны.
+fn line_cross(
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    p4: (f64, f64),
+) -> Option<(f64, f64)> {
+    let (r1, r2) = (p2.0 - p1.0, p2.1 - p1.1);
+    let (s1, s2) = (p4.0 - p3.0, p4.1 - p3.1);
+    let den = r1 * s2 - r2 * s1;
+    let scale = (r1 * r1 + r2 * r2).sqrt() * (s1 * s1 + s2 * s2).sqrt();
+    if scale < 1e-12 || den.abs() < 1e-6 * scale {
+        return None;
+    }
+    let t = ((p3.0 - p1.0) * s2 - (p3.1 - p1.1) * s1) / den;
+    Some((p1.0 + t * r1, p1.1 + t * r2))
+}
+
+/// Сшивка четырёх независимо подогнанных сторон в четырёхугольник.
+///
+/// Угол `k` — ПЕРЕСЕЧЕНИЕ ПРЯМЫХ сторон `k−1` и `k`, а не среднее их концов.
+/// Разница существенная: концы стороны — наименее определённая её часть (у
+/// корреляции там всего один сосед), тогда как прямая определена всеми N−2
+/// отсчётами. Среднее концов вернуло бы в углы ровно ту ошибку длины, ради
+/// которой пер-сторонний скан и делался.
+///
+/// `corr` — насколько каждой стороне верить. Пересечение осмысленно, только
+/// когда ОБЕ прямые найдены; если одна сторона осталась на полу, её прямая
+/// случайна, и пересечение с ней испортило бы верный угол сильной стороны. Тогда
+/// угол берётся у сильной, и слабая на следующем круге стартует уже от него —
+/// ради этого [`polish`] и крутит несколько кругов.
+fn quad_from_sides(sides: &[SideFit; 4], corr: &[f64; 4], fallback: &Quad, n: usize) -> Quad {
+    let mut c = fallback.corners;
+    for k in 0..4 {
+        let pi = (k + 3) & 3;
+        let prev = sides[pi]; // сторона, ВХОДЯЩАЯ в угол k
+        let next = sides[k]; // сторона, ВЫХОДЯЩАЯ из угла k
+        let (cp, cn) = (corr[pi], corr[k]);
+        // обе слабы — угол оставляем как был
+        if cp < SIDE_TRUST && cn < SIDE_TRUST {
+            continue;
+        }
+        // одна заметно сильнее — её конец и есть угол
+        if cp < SIDE_TRUST {
+            c[k] = next.a;
+            continue;
+        }
+        if cn < SIDE_TRUST {
+            c[k] = prev.b;
+            continue;
+        }
+        let mid = ((prev.b.0 + next.a.0) * 0.5, (prev.b.1 + next.a.1) * 0.5);
+        c[k] = match line_cross(prev.a, prev.b, next.a, next.b) {
+            // почти параллельные стороны дали бы угол на бесконечности; такое
+            // пересечение отбрасываем в пользу середины концов
+            Some(x) if (x.0 - mid.0).hypot(x.1 - mid.1) < 3.0 * next.cell_px(n) => x,
+            _ => mid,
+        };
+    }
+    Quad { corners: c }
+}
+
+/// С какой корреляции стороне верят при сшивке углов.
+///
+/// Ниже — прямая ещё не найдена (пол кросс-корреляции ЗЧ на N−2 отсчётах равен
+/// 0.19, живой мусор даёт 0.09..0.42), выше — сторона стоит на своей полосе и её
+/// концы можно брать за углы.
+const SIDE_TRUST: f64 = 0.5;
+
+/// ПРОЕКТИВНАЯ доводка: каждая сторона отдельно, сшивка углов, совместный спуск.
+///
+/// Кругов несколько, и это существенно. Стороны подгоняются ВРОЗЬ, но углы у них
+/// ОБЩИЕ: как только сильная сторона нашлась, она задаёт два угла, и обе её
+/// соседки на следующем круге стартуют уже с верного конца — их остаточный
+/// промах падает с единиц клеток до долей, то есть попадает в тот диапазон, где
+/// сходится и спуск. Замерено на живом кадре: за один круг стороны выходили на
+/// [0.99 0.90 0.60 0.77], за три — на [0.99 0.99 0.99 0.99].
+fn polish(spec: &BorderSpec, field: &Field, probe_depth: f64, q: Quad) -> Quad {
+    let n = spec.n;
+    let tmpl = quad_templates(spec, probe_depth);
+    let mut cur = q;
+    for _ in 0..POLISH_ROUNDS {
+        let mut sides = [cur.side(0), cur.side(1), cur.side(2), cur.side(3)];
+        let mut corr = [0.0f64; 4];
+        for (s, sf) in sides.iter_mut().enumerate() {
+            *sf = refine_side(spec, field, probe_depth, s, &cur, *sf);
+            // оценка — в том же контексте, в котором сторона подгонялась
+            let mut q = cur;
+            q.corners[s] = sf.a;
+            q.corners[(s + 1) & 3] = sf.b;
+            corr[s] = tmpl[s].corr(field, &CellMap::new(&q, n), s, n);
+        }
+        let stitched = quad_from_sides(&sides, &corr, &cur, n);
+        let next = refine_quad(spec, field, probe_depth, stitched, POLISH_STEP, true);
+        if dbg_on() {
+            std::eprintln!(
+                "[acq] круг: врозь [{:.3} {:.3} {:.3} {:.3}] -> сшивка {:.3} -> доводка {:.3}",
+                corr[0], corr[1], corr[2], corr[3],
+                quad_score(field, &tmpl, &stitched, n),
+                quad_score(field, &tmpl, &next, n)
+            );
+            for s in 0..4 {
+                std::eprintln!(
+                    "[acq]   сторона {s}: ({:.1},{:.1})->({:.1},{:.1}) было ({:.1},{:.1})->({:.1},{:.1})",
+                    sides[s].a.0, sides[s].a.1, sides[s].b.0, sides[s].b.1,
+                    cur.side(s).a.0, cur.side(s).a.1, cur.side(s).b.0, cur.side(s).b.1
+                );
+            }
+            std::eprintln!(
+                "[acq]   углы сшивки {:?}",
+                stitched.corners.map(|p| (p.0.round() as i32, p.1.round() as i32))
+            );
+        }
+        // круг обязан улучшать: иначе откатываемся и выходим
+        if quad_score(field, &tmpl, &next, n) <= quad_score(field, &tmpl, &cur, n) + 1e-6 {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// Сколько кругов «стороны врозь -> сшивка углов» делает [`polish`].
+const POLISH_ROUNDS: usize = 3;
+
+/// Начальный шаг совместной доводки ПОСЛЕ пер-стороннего скана, в клетках.
+/// Стороны уже стоят с точностью до сотых клетки, крупный шаг только уводил бы.
+const POLISH_STEP: f64 = 0.25;
+
+/// Сколько лучших по ЖЁСТКОЙ подгонке кандидатов доводится проективно.
+///
+/// Проективная доводка на порядок дороже роста, а верный кандидат по грубой
+/// оценке уже в первых строках даже при полностью промахнувшейся трапеции:
+/// замерено на живых кадрах — символ 0.42..0.53 против 0.21..0.27 у мусора,
+/// и во всех восьми кадрах он был МАКСИМУМОМ.
+const POLISH_CANDS: usize = 8;
 
 /// Локальная сетка по (масштаб, угол, положение) максимизирующая корреляцию окна.
 fn refine(
@@ -1035,7 +1675,18 @@ fn side_probes(
     spec: &BorderSpec,
     side: usize,
     probe_depth: f64,
-    n: usize,
+    _n: usize,
+) -> Vec<(f64, f64, (f64, f64))> {
+    side_probes_win(spec, side, probe_depth, usize::MAX)
+}
+
+/// Как [`side_probes`], но берётся `taps` отсчётов из СЕРЕДИНЫ собственного
+/// диапазона стороны — короткое окно для лестницы длин ([`refine_side`]).
+fn side_probes_win(
+    spec: &BorderSpec,
+    side: usize,
+    probe_depth: f64,
+    taps: usize,
 ) -> Vec<(f64, f64, (f64, f64))> {
     // Полоса v1 (толщина RING, оба ряда одинаковы) допускает и второй ряд, и
     // приграничные щупы. Кольцо v0 — одна клетка толщиной, и под реальным
@@ -1045,16 +1696,91 @@ fn side_probes(
     let strip = spec.carrier == Carrier::ComplexChroma || probe_depth >= 0.99;
     let depths: &[f64] = if strip { &[-0.5, 0.5] } else { &[0.0] };
     let tang: &[f64] = if strip { TANG } else { &[0.0] };
-    let mut out = Vec::with_capacity(depths.len() * tang.len() * (n - 2));
-    for (i, re, im) in side_reference(spec, side) {
+    let refs = side_reference(spec, side);
+    let (lo, hi) = if taps >= refs.len() {
+        (0, refs.len())
+    } else {
+        let lo = refs.len() / 2 - taps / 2;
+        (lo, lo + taps)
+    };
+    let mut out = Vec::with_capacity(depths.len() * tang.len() * (hi - lo));
+    for &(i, re, im) in &refs[lo..hi] {
         for &d in depths {
             for &t in tang {
-                let (cu, cv) = side_probe_at(side, i as f64 + t, probe_depth + d, n);
-                out.push((cu, cv, (re, im)));
+                // (вдоль, вглубь) в СОБСТВЕННОЙ системе стороны: центр клетки
+                // i — это i + 0.5 клетки от начала обхода.
+                out.push((i as f64 + t + 0.5, probe_depth + d, (re, im)));
             }
         }
     }
     out
+}
+
+/// Шаблон стороны со СНЯТЫМ СРЕДНИМ и его норма — считается один раз, после
+/// чего корреляция каждой гипотезы геометрии стоит один проход БЕЗ аллокаций.
+///
+/// Тот же приём, что в [`scan_axis`]: раз `Σ t_c = 0`, то
+/// `Σ (s − s̄)·conj(t_c) = Σ s·conj(t_c)`, и снимать среднее с выборки не нужно.
+/// Доводка вызывает корреляцию тысячами, и пара `Vec` на вызов была бы
+/// дороже самой арифметики.
+struct SideTemplate {
+    /// (вдоль, вглубь, значение шаблона со снятым средним).
+    taps: Vec<(f64, f64, (f64, f64))>,
+    norm: f64,
+}
+
+impl SideTemplate {
+    fn new(pr: Vec<(f64, f64, (f64, f64))>) -> SideTemplate {
+        let m = pr.len();
+        if m == 0 {
+            return SideTemplate { taps: pr, norm: 0.0 };
+        }
+        let inv = 1.0 / m as f64;
+        let (mut tr, mut ti) = (0.0, 0.0);
+        for &(_, _, (r, i)) in &pr {
+            tr += r * inv;
+            ti += i * inv;
+        }
+        let taps: Vec<(f64, f64, (f64, f64))> = pr
+            .into_iter()
+            .map(|(al, dp, (r, i))| (al, dp, (r - tr, i - ti)))
+            .collect();
+        let norm = taps
+            .iter()
+            .map(|&(_, _, (r, i))| r * r + i * i)
+            .sum::<f64>()
+            .sqrt();
+        SideTemplate { taps, norm }
+    }
+
+    /// Нормированная корреляция стороны `side` при данной раскладке символа.
+    ///
+    /// Раскладка — [`CellMap`] всего четырёхугольника, а не отрезок стороны:
+    /// продольная координата стороны проективна, и её нелинейность задаётся
+    /// ДРУГОЙ парой углов (см. док [`Quad`]).
+    fn corr(&self, field: &Field, cm: &CellMap, side: usize, n: usize) -> f64 {
+        let m = self.taps.len();
+        if m == 0 || self.norm < 1e-12 {
+            return 0.0;
+        }
+        let inv = 1.0 / m as f64;
+        let (mut sr, mut si, mut saa) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut xr, mut xi) = (0.0f64, 0.0f64);
+        for &(al, dp, t) in &self.taps {
+            let (x, y) = cm.probe(side, al, dp, n);
+            let v = field.bilin(x, y);
+            sr += v.0;
+            si += v.1;
+            saa += v.0 * v.0 + v.1 * v.1;
+            xr += v.0 * t.0 + v.1 * t.1;
+            xi += v.1 * t.0 - v.0 * t.1;
+        }
+        let var = saa - (sr * sr + si * si) * inv;
+        if var < 1e-12 {
+            return 0.0;
+        }
+        (xr * xr + xi * xi).sqrt() / (var.sqrt() * self.norm)
+    }
 }
 
 /// Тангенциальные смещения щупа ВДОЛЬ стороны, в клетках.
@@ -1072,36 +1798,24 @@ fn side_probes(
 /// использует выравниватель рамки v0 (`detect::TANG`).
 const TANG: &[f64] = &[-0.3, 0.0, 0.3];
 
-/// Как [`side_probe`], но позиция вдоль стороны — ДРОБНАЯ (в клетках от начала).
-#[inline]
-fn side_probe_at(side: usize, along_cells: f64, depth: f64, n: usize) -> (f64, f64) {
-    let a = along_cells + 0.5;
-    let g = n as f64;
-    match side & 3 {
-        0 => (a, depth),
-        1 => (g - depth, a),
-        2 => (g - a, g - depth),
-        _ => (depth, g - a),
-    }
-}
-
 fn verify(
     spec: &BorderSpec,
     field: &Field,
     probe_depth: f64,
-    place: &Placement,
+    quad: &Quad,
 ) -> Option<Acquisition> {
     let n = spec.n;
-    // Матрица: сторона снимка j (в КАНОНИЧЕСКОЙ раскладке place) против эталона
-    // канонической стороны k. `place` уже привязан к канонической верхней
-    // стороне, поэтому «сторона снимка j» здесь — просто j-я сторона квадрата.
+    // Матрица: сторона снимка j (в КАНОНИЧЕСКОЙ раскладке quad) против эталона
+    // канонической стороны k. `quad` уже привязан к канонической верхней
+    // стороне, поэтому «сторона снимка j» здесь — просто j-я сторона.
+    let cm = CellMap::new(quad, n);
     let mut m = [[0.0f64; 4]; 4];
     for j in 0..4 {
         let pr = side_probes(spec, j, probe_depth, n);
         let got: Vec<(f64, f64)> = pr
             .iter()
-            .map(|&(cu, cv, _)| {
-                let (x, y) = place.map(cu, cv);
+            .map(|&(al, dp, _)| {
+                let (x, y) = cm.probe(j, al, dp, n);
                 field.bilin(x, y)
             })
             .collect();
@@ -1131,8 +1845,8 @@ fn verify(
             let pr = side_probes(spec, j, probe_depth + d, n);
             let got: Vec<(f64, f64)> = pr
                 .iter()
-                .map(|&(cu, cv, _)| {
-                    let (x, y) = place.map(cu, cv);
+                .map(|&(al, dp, _)| {
+                    let (x, y) = cm.probe(j, al, dp, n);
                     field.bilin(x, y)
                 })
                 .collect();
@@ -1144,19 +1858,18 @@ fn verify(
     let strip_ratio = if off > 1e-6 { score / off } else { f64::INFINITY };
     if dbg_on() {
         std::eprintln!(
-            "[acq] verify o=({:.2},{:.2}) s={:.4} th={:.3}° диагональ [{:.3} {:.3} {:.3} {:.3}] r={r} score {score:.3}",
-            place.origin.0, place.origin.1,
-            place.scale,
-            place.theta.to_degrees(),
+            "[acq] verify tl=({:.1},{:.1}) px/кл={:.3} диагональ [{:.3} {:.3} {:.3} {:.3}] r={r} score {score:.3}",
+            quad.corners[0].0, quad.corners[0].1,
+            quad.px_per_cell(n),
             m[0][0], m[1][1], m[2][2], m[3][3]
         );
     }
     if r != 0 {
         return None;
     }
-    // Углы: place задаёт КАНОНИЧЕСКИЕ углы. Порядок чтения снимка — тот, где
+    // Углы: quad задаёт КАНОНИЧЕСКИЕ углы. Порядок чтения снимка — тот, где
     // первым идёт угол с минимальной суммой координат.
-    let canon = place.corners(n);
+    let canon = quad.corners;
     let mut tl = 0usize;
     for k in 1..4 {
         if canon[k].0 + canon[k].1 < canon[tl].0 + canon[tl].1 {
@@ -1179,8 +1892,8 @@ fn verify(
         rotation_quadrants: rot,
         score,
         margin,
-        px_per_cell: place.scale,
-        place: *place,
+        px_per_cell: quad.px_per_cell(n),
+        quad: *quad,
         sides,
         strip_ratio,
     })
@@ -1195,7 +1908,7 @@ pub const BORDER_RING: usize = RING;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zcborder::{render_cells, Carrier};
+    use crate::zcborder::{render_cells, strip_cell, Carrier};
     use alloc::vec;
 
     struct XorShift64(u64);
@@ -1430,7 +2143,7 @@ mod tests {
         let f0 = Field { w: cw, h: cw, re: &img0, im: None };
         let a0 = acquire(&spec, &f0, &opts).expect("захват кадра N");
         let f1 = Field { w: cw, h: cw, re: &img1, im: None };
-        let a1 = track(&spec, &f1, &opts, &a0.place).expect("слежение на кадре N+1");
+        let a1 = track(&spec, &f1, &opts, &a0.quad).expect("слежение на кадре N+1");
         assert!(a1.score > 0.9, "слежение: score {:.3}", a1.score);
         assert_eq!(a1.rotation_quadrants, 0);
 
@@ -1453,9 +2166,10 @@ mod tests {
         let got = symbol::demod_symbol_local(&p, &map, &sample);
         let errs = got.iter().zip(&cells).filter(|(a, b)| a != b).count();
         eprintln!(
-            "[track] a0 o=({:.2},{:.2}) s={:.4} th={:.4}°  a1 o=({:.2},{:.2}) s={:.4} th={:.4}°               истина o=(145,133) s=12  score {:.3} ошибок {errs}/{}",
-            a0.place.origin.0, a0.place.origin.1, a0.place.scale, a0.place.theta.to_degrees(),
-            a1.place.origin.0, a1.place.origin.1, a1.place.scale, a1.place.theta.to_degrees(),
+            "[track] a0 tl=({:.2},{:.2}) px/кл={:.4}  a1 tl=({:.2},{:.2}) px/кл={:.4}  \
+             истина tl=(145,133) px/кл=12  score {:.3} ошибок {errs}/{}",
+            a0.quad.corners[0].0, a0.quad.corners[0].1, a0.px_per_cell,
+            a1.quad.corners[0].0, a1.quad.corners[0].1, a1.px_per_cell,
             a1.score, cells.len()
         );
         assert_eq!(errs, 0, "по геометрии слежения payload прочитан неточно");
@@ -1691,14 +2405,14 @@ mod tests {
         let at = (120.0, 90.0);
         let (re, im) = scene(&spec, w, h, cell, 0.0, 0, at, 0xACC0_0000);
         let f = Field { w, h, re: &re, im: Some(&im) };
-        let place = Placement { origin: at, scale: cell, theta: 0.0 };
+        let quad = Placement { origin: at, scale: cell, theta: 0.0 }.to_quad(spec.n);
         for depth in [0.5f64, 1.0] {
+            let cm = CellMap::new(&quad, spec.n);
             let mut d = [0.0f64; 4];
             for j in 0..4 {
                 let got: Vec<(f64, f64)> = (2..spec.n)
                     .map(|i| {
-                        let (cu, cv) = side_probe_at(j, i as f64, depth, spec.n);
-                        let (x, y) = place.map(cu, cv);
+                        let (x, y) = cm.probe(j, i as f64 + 0.5, depth, spec.n);
                         f.bilin(x, y)
                     })
                     .collect();
@@ -1708,5 +2422,215 @@ mod tests {
             }
             eprintln!("[diag] depth {depth}: стороны [{:.3} {:.3} {:.3} {:.3}]", d[0], d[1], d[2], d[3]);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ПЕР-СТОРОННЯЯ ВЫБОРКА ПРОТИВ ПРОЕКТИВНОЙ
+    //
+    // Регрессия, которую держат три теста ниже, стоила захвата целиком: щупы
+    // стороны шли по отрезку РАВНЫМИ шагами, тогда как образ равномерной
+    // клеточной сетки под гомографией равномерным не является. На замеренной
+    // трапеции живого кадра (верх 606 px, низ 656 px) середина левой и правой
+    // сторон уезжала на 1.2 КЛЕТКИ, и обе они падали на пол кросс-корреляции:
+    // на ОДНИХ И ТЕХ ЖЕ верных углах проективный сэмплер давал
+    // [0.931 0.887 0.888 0.922], а пер-сторонний аффинный — [0.925 0.227 0.862
+    // 0.196]. Верх и низ совпадали, потому что их нелинейность задаётся ДРУГИМ
+    // коэффициентом, и на этом кадре он около нуля — то есть ошибка была
+    // невидима на двух сторонах из четырёх, и «половина сторон читается» долго
+    // выглядела как проблема геометрии, а не выборки.
+    // -----------------------------------------------------------------------
+
+    /// Реальные углы символа с живого кадра v1 (Note 10 Lite, 1920×1080,
+    /// ~10.2 px/клетку): именно эта трапеция и вскрыла расхождение сэмплеров.
+    const KEYSTONE: [(f64, f64); 4] = [
+        (409.0, 54.0),
+        (1015.0, 54.0),
+        (1023.0, 655.0),
+        (367.0, 656.0),
+    ];
+
+    /// Непрерывная раскладка щупов совпадает с ДИСКРЕТНОЙ раскладкой рендерера:
+    /// центр клетки `i` глубины `d` стороны `side` — это `(i + 0.5, d + 0.5)` в
+    /// координатах [`probe_cell`]. Сбой здесь означает, что коррелятор ждёт
+    /// последовательность не там, где рендерер её покрасил.
+    #[test]
+    fn probe_cell_matches_strip_cell() {
+        for &n in &[31usize, 37, 61] {
+            let nf = n as f64;
+            for side in 0..4 {
+                for i in 0..n {
+                    for d in 0..RING {
+                        let (x, y) = strip_cell(side, i, d, n);
+                        let want = (x as f64 + 0.5, y as f64 + 0.5);
+                        let got = probe_cell(side, i as f64 + 0.5, d as f64 + 0.5, nf);
+                        assert!(
+                            (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+                            "n={n} сторона {side} позиция {i} глубина {d}: {got:?} против {want:?}"
+                        );
+                    }
+                }
+                // концы стороны — это углы четырёхугольника, а не что-то рядом
+                let corner = |k: usize| match k & 3 {
+                    0 => (0.0, 0.0),
+                    1 => (nf, 0.0),
+                    2 => (nf, nf),
+                    _ => (0.0, nf),
+                };
+                for (got, k) in [
+                    (probe_cell(side, 0.0, 0.0, nf), side),
+                    (probe_cell(side, nf, 0.0, nf), side + 1),
+                ] {
+                    let w = corner(k);
+                    assert!(
+                        (got.0 - w.0).abs() < 1e-12 && (got.1 - w.1).abs() < 1e-12,
+                        "сторона {side}: конец не в углу {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Захват читает снимок ТАМ ЖЕ, где его потом читает демодуляция payload.
+    ///
+    /// Сверка идёт с НЕЗАВИСИМОЙ реализацией: [`CellMap`] — замкнутая форма
+    /// «единичный квадрат → четырёхугольник», а `detect::detection_from_corners`
+    /// решает ту же задачу системой 8×8 Гауссом–Жорданом. Если рамка подгоняется
+    /// одной моделью, а payload читается другой, «идеальная» корреляция рамки
+    /// всё равно даёт сдвинутую сетку payload — поэтому расхождение здесь
+    /// недопустимо, даже когда обе модели по отдельности «разумны».
+    #[test]
+    fn cell_map_agrees_with_detect_homography() {
+        let n = crate::symbol::GRID;
+        let cm = CellMap::new(&Quad { corners: KEYSTONE }, n);
+        let det = crate::detect::detection_from_corners(&KEYSTONE, 0, 1.0)
+            .expect("невырожденная четвёрка");
+        let h = det.homography;
+        let apply = |u: f64, v: f64| {
+            let d = h[2][0] * u + h[2][1] * v + h[2][2];
+            (
+                (h[0][0] * u + h[0][1] * v + h[0][2]) / d,
+                (h[1][0] * u + h[1][1] * v + h[1][2]) / d,
+            )
+        };
+        let mut worst = 0.0f64;
+        for side in 0..4 {
+            for i in 0..n {
+                for &dp in &[0.5f64, 1.5] {
+                    let (cu, cv) = probe_cell(side, i as f64 + 0.5, dp, n as f64);
+                    let a = cm.map(cu, cv);
+                    let b = apply(cu, cv);
+                    worst = worst.max((a.0 - b.0).hypot(a.1 - b.1));
+                }
+            }
+        }
+        assert!(worst < 1e-6, "щупы захвата разошлись с гомографией detect на {worst} px");
+    }
+
+    /// Сцена с ПРОЕКТИВНОЙ раскладкой: клеточная сетка `n × n` отображается в
+    /// четырёхугольник `quad`, вне символа — загромождение (тихой зоны нет).
+    fn projective_scene(spec: &BorderSpec, w: usize, h: usize, quad: &Quad, seed: u64) -> Vec<f32> {
+        let n = spec.n;
+        let mut rng = XorShift64(seed | 1);
+        let border = render_cells(spec);
+        let grid: Vec<f64> = (0..n * n)
+            .map(|k| match border[k] {
+                Some(v) => v.0,
+                None => {
+                    if rng.next() & 1 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
+            })
+            .collect();
+        // 3×3 матрица «клетки -> однородные пиксели» и её обращение
+        let cm = CellMap::new(quad, n);
+        let m = [
+            [cm.ax, cm.bx, cm.cx],
+            [cm.ay, cm.by, cm.cy],
+            [cm.gu, cm.hv, 1.0],
+        ];
+        let co = |r: usize, c: usize| {
+            let (r0, r1) = ((r + 1) % 3, (r + 2) % 3);
+            let (c0, c1) = ((c + 1) % 3, (c + 2) % 3);
+            m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0]
+        };
+        let det = m[0][0] * co(0, 0) + m[0][1] * co(0, 1) + m[0][2] * co(0, 2);
+        assert!(det.abs() > 1e-9, "вырожденная раскладка сцены");
+        let mut inv = [[0.0f64; 3]; 3];
+        for r in 0..3 {
+            for c in 0..3 {
+                inv[c][r] = co(r, c) / det;
+            }
+        }
+        let mut re = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let ww = inv[2][0] * px + inv[2][1] * py + inv[2][2];
+                let cu = (inv[0][0] * px + inv[0][1] * py + inv[0][2]) / ww;
+                let cv = (inv[1][0] * px + inv[1][1] * py + inv[1][2]) / ww;
+                let v = if ww > 0.0 && cu >= 0.0 && cv >= 0.0 && cu < n as f64 && cv < n as f64 {
+                    if grid[cv as usize * n + cu as usize] > 0.0 { 0.88 } else { 0.10 }
+                } else if (y / 11) % 3 == 0 && (x / 8) % 2 == 0 {
+                    0.80
+                } else {
+                    0.14
+                };
+                re[y * w + x] = v as f32;
+            }
+        }
+        re
+    }
+
+    /// При ТОЧНОЙ проективной геометрии коррелируют ВСЕ ЧЕТЫРЕ стороны.
+    ///
+    /// Это и есть сам пинок: пер-сторонний аффинный сэмплер давал на этой самой
+    /// трапеции [~0.93 ~0.23 ~0.86 ~0.20] — две стороны на полу при заведомо
+    /// верных углах.
+    #[test]
+    fn keystone_geometry_reads_on_all_four_sides() {
+        let spec = BorderSpec { n: 61, roots: [3, 1, 4, 2], carrier: Carrier::BinaryLuma };
+        let (w, h) = (1200usize, 760usize);
+        let quad = Quad { corners: KEYSTONE };
+        let re = projective_scene(&spec, w, h, &quad, 0x5EED_BEEF);
+        let f = Field { w, h, re: &re, im: None };
+        let s = score_sides(&spec, &f, PROBE_DEPTH_STRIP, &quad);
+        eprintln!("[keystone] стороны [{:.3} {:.3} {:.3} {:.3}]", s[0], s[1], s[2], s[3]);
+        let lo = s.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            lo > 0.9,
+            "при точных углах сторона просела до {lo:.3}: [{:.3} {:.3} {:.3} {:.3}]",
+            s[0], s[1], s[2], s[3]
+        );
+    }
+
+    /// И сквозной итог: на той же трапеции захват НАХОДИТ символ и ставит углы
+    /// с субклеточной точностью. Гейт — штатный, без послаблений.
+    #[test]
+    fn acquires_a_keystoned_symbol() {
+        let spec = BorderSpec { n: 61, roots: [3, 1, 4, 2], carrier: Carrier::BinaryLuma };
+        let (w, h) = (1200usize, 760usize);
+        let quad = Quad { corners: KEYSTONE };
+        let re = projective_scene(&spec, w, h, &quad, 0x5EED_BEEF);
+        let f = Field { w, h, re: &re, im: None };
+        let opts = AcquireOpts { px_per_cell: (8.0, 13.0), ..Default::default() };
+        let a = acquire(&spec, &f, &opts).expect("трапеция не захвачена");
+        let cell = a.px_per_cell;
+        let worst = (0..4)
+            .map(|k| {
+                (a.quad.corners[k].0 - KEYSTONE[k].0).hypot(a.quad.corners[k].1 - KEYSTONE[k].1)
+            })
+            .fold(0.0f64, f64::max);
+        eprintln!(
+            "[keystone] score {:.3} полоса {:.2} стороны [{:.3} {:.3} {:.3} {:.3}] \
+             худший угол {:.2} px ({:.2} клетки)",
+            a.score, a.strip_ratio, a.sides[0], a.sides[1], a.sides[2], a.sides[3],
+            worst, worst / cell
+        );
+        assert_eq!(a.rotation_quadrants, 0);
+        assert!(a.score > 0.9, "score {:.3}", a.score);
+        assert!(worst < 0.5 * cell, "угол промахнулся на {:.2} px при клетке {cell:.2}", worst);
     }
 }
