@@ -20,6 +20,12 @@
 //! psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]
 //!     Один статический кадр с детерминированной псевдослучайной нагрузкой —
 //!     навести камеру, проверить детекцию ЗЧ на живом экране.
+//!
+//! psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--smoke]
+//!     [ДИАГНОСТИКА] Лестница масштабов §5.1-CL (см. psicode_core::swatch):
+//!     штатная геометрия символа, но payload заменён на n×n КРУПНЫХ блоков
+//!     известной цветности. Кадр анимирован (счётчик §3.3 несёт его номер),
+//!     поэтому анализатор восстанавливает истину из ОДНОГО снимка.
 //! ```
 //!
 //! `--cell N` подменяет размер клетки для ПОКАЗА (см. `frames::Streamer::render`:
@@ -51,8 +57,9 @@ use std::time::{Duration, Instant};
 
 use frames::{
     calibration_counter_frame, calibration_frame, chromatic_profile, reference_profile,
-    single_frame, to_const_luma, RgbFrame, Streamer, SYMBOLS_PER_FRAME,
+    single_frame, swatch_frame, to_const_luma, RgbFrame, Streamer, SYMBOLS_PER_FRAME,
 };
+use psicode_core::swatch;
 use psicode_core::CalibProfile;
 
 use winit::application::ApplicationHandler;
@@ -90,6 +97,7 @@ enum Command {
     Calibrate { cell: usize, smoke: bool },
     Stream { file: String, code: Option<String>, cell: Option<usize>, chroma: bool, smoke: bool },
     Single { counter: u8, cell: Option<usize>, chroma: bool, smoke: bool },
+    Swatch { n: usize, sweep: bool, cell: Option<usize>, smoke: bool },
 }
 
 fn print_usage() {
@@ -100,7 +108,11 @@ fn print_usage() {
          \x20 psicode-tx calibrate [--cell N] [--smoke]\n\
          \x20 psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--smoke]\n\
          \x20 psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]\n\
+         \x20 psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--smoke]\n\
          \n\
+         \x20 swatch:   [ДИАГНОСТИКА] лестница масштабов — n×n крупных однородных\n\
+         \x20           блоков вместо payload; --sweep даёт плотную развёртку всей\n\
+         \x20           плоскости цветности за 256 кадров.\n\
          \x20 --chroma: отображение ПОСТОЯННОЙ ЯРКОСТИ §5.1-CL (ConstLuma1,\n\
          \x20           2 бит/клетку) — символ целиком в цветности, R+G+B ≡ const.\n"
     );
@@ -115,6 +127,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut counter: u8 = 0;
     let mut chroma = false;
     let mut smoke = false;
+    let mut n = 1usize;
+    let mut sweep = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 2usize;
@@ -132,9 +146,25 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             }
             "--counter" => {
                 let v = args.get(i + 1).ok_or("--counter требует число")?;
-                let n: u64 = v.parse().map_err(|_| format!("--counter: не число: {v}"))?;
-                counter = (n & 0xFF) as u8;
+                let cv: u64 = v.parse().map_err(|_| format!("--counter: не число: {v}"))?;
+                counter = (cv & 0xFF) as u8;
                 i += 2;
+            }
+            "--n" => {
+                let v = args.get(i + 1).ok_or("--n требует число")?;
+                let k: usize = v.parse().map_err(|_| format!("--n: не число: {v}"))?;
+                if !(1..=swatch::SWATCH_MAX_N).contains(&k) {
+                    return Err(format!(
+                        "--n: ожидалось 1..={}, дано {k}",
+                        swatch::SWATCH_MAX_N
+                    ));
+                }
+                n = k;
+                i += 2;
+            }
+            "--sweep" => {
+                sweep = true;
+                i += 1;
             }
             "--chroma" => {
                 chroma = true;
@@ -167,6 +197,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             Ok(Command::Stream { file, code, cell, chroma, smoke })
         }
         "single" => Ok(Command::Single { counter, cell, chroma, smoke }),
+        "swatch" => Ok(Command::Swatch { n, sweep, cell, smoke }),
         other => Err(format!("неизвестный режим: {other}")),
     }
 }
@@ -184,6 +215,7 @@ fn run(cmd: Command) {
         Command::Single { counter, cell, chroma, smoke } => {
             run_single(counter, cell, chroma, smoke)
         }
+        Command::Swatch { n, sweep, cell, smoke } => run_swatch(n, sweep, cell, smoke),
     }
 }
 
@@ -281,6 +313,63 @@ fn run_single(counter: u8, cell: Option<usize>, chroma: bool, smoke: bool) {
     let source = single_frame(&profile, counter, Some(display_cell));
     let side = (61 + 2 * profile.quiet_zone_cells() as usize) * display_cell;
     let mut app = App::new(ModeState::Single, source, display_cell, display_cell, side, side, smoke, false, "PsiCode TX — single");
+    launch(&mut app);
+    if app.window_failed {
+        report_no_window();
+    }
+}
+
+/// [ДИАГНОСТИКА] Лестница масштабов §5.1-CL (`psicode_core::swatch`).
+///
+/// Геометрия символа — ШТАТНАЯ (детекция §3.2 и калибровка §3.4 приёмника
+/// работают без правок), payload заменён на `n×n` крупных однородных блоков
+/// известной цветности, разделённых средне-серым рвом. Кадр анимирован с тем же
+/// удержанием, что и stream, а строка счётчика §3.3 несёт его номер — поэтому
+/// анализатору хватает ОДНОГО снимка, чтобы точно знать, что было послано.
+fn run_swatch(n: usize, sweep: bool, cell: Option<usize>, smoke: bool) {
+    let profile = chromatic_profile();
+    let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
+    let nb = n * n;
+    println!(
+        "psicode-tx swatch — {n}×{n} = {nb} блок(ов), режим {}, cell {display_cell} px, \
+         удержание {} период(ов). Esc — выход.",
+        if sweep {
+            "РАЗВЁРТКА плоскости цветности (256 кадров на полный проход)"
+        } else {
+            "углы созвездия ConstLuma1 (алфавит payload)"
+        },
+        profile.frame_hold_periods,
+    );
+    // размер блока в клетках/пикселях — главное число лестницы
+    let (pc0, pr0, bc, br) = swatch::swatch_rect(n, 0, swatch::SWATCH_GUARD);
+    // фактический ров (на мелких ступенях он сжимается — см. swatch_rect)
+    let gap = 2 * pc0.min(pr0);
+    println!(
+        "блок ≈ {bc}×{br} клеток = {}×{} px; между блоками {gap} клеток ({} px)",
+        bc * display_cell,
+        br * display_cell,
+        gap * display_cell,
+    );
+    let source = swatch_frame(&profile, n, 0, sweep, Some(display_cell));
+    let side = (61 + 2 * profile.quiet_zone_cells() as usize) * display_cell;
+    let mode = ModeState::Swatch {
+        profile,
+        frame: 0,
+        n,
+        sweep,
+        hold_periods: profile.frame_hold_periods,
+    };
+    let mut app = App::new(
+        mode,
+        source,
+        display_cell,
+        display_cell,
+        side,
+        side,
+        smoke,
+        false,
+        "PsiCode TX — swatch",
+    );
     launch(&mut app);
     if app.window_failed {
         report_no_window();
@@ -453,6 +542,14 @@ enum ModeState {
         hold_periods: u8,
     },
     Single,
+    /// [ДИАГНОСТИКА] Лестница масштабов: анимированный swatch-паттерн.
+    Swatch {
+        profile: CalibProfile,
+        frame: u64,
+        n: usize,
+        sweep: bool,
+        hold_periods: u8,
+    },
 }
 
 struct App {
@@ -538,6 +635,10 @@ impl App {
                 Some(streamer.render(*seq, Some(display_cell)))
             }
             ModeState::Single => None,
+            ModeState::Swatch { profile, frame, n, sweep, .. } => {
+                *frame = frame.wrapping_add(1);
+                Some(swatch_frame(profile, *n, *frame, *sweep, Some(display_cell)))
+            }
         };
         if let Some(s) = new_source {
             self.source = s;
@@ -625,7 +726,8 @@ impl ApplicationHandler for App {
             .unwrap_or(60.0);
         let refresh_period = Duration::from_secs_f64(1.0 / self.refresh_hz);
         self.period = match &self.mode {
-            ModeState::Stream { hold_periods, .. } => refresh_period * (*hold_periods as u32),
+            ModeState::Stream { hold_periods, .. }
+            | ModeState::Swatch { hold_periods, .. } => refresh_period * (*hold_periods as u32),
             _ => refresh_period, // калибровочный счётчик/статика — темп обновления
         };
         self.next_frame = Instant::now() + self.period;

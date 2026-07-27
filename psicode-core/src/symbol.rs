@@ -53,7 +53,7 @@ const SQRT3: f64 = 1.732_050_807_568_877_2;
 /// шестиугольник, вписанная окружность которого и есть единичный диск, поэтому
 /// в диагональном направлении запас есть, и это точный максимум для
 /// прямоугольной решётки, а не «с потолка».
-const CL_LATTICE_SCALE: f64 = 2.0 / (1.0 + SQRT3);
+pub const CL_LATTICE_SCALE: f64 = 2.0 / (1.0 + SQRT3);
 
 /// Битов на клетку payload: luma_bits + биты хромы режима (§5.2).
 ///
@@ -273,8 +273,15 @@ fn demod_symbol_inner(
     // собой; выбор семейства §5.1 / §5.1-CL инкапсулирован в CellCodec.
     let codec = CellCodec::new(p, black_255, white_255);
     let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
-    let solve =
-        ChannelSolve::from_reference_row(p, black_255, white_255, &gammas, map, sample, want_matrix);
+    let solve = ChannelSolve::from_reference_row(
+        p,
+        black_255,
+        white_255,
+        &gammas,
+        map,
+        sample,
+        want_matrix,
+    );
 
     // --- демодуляция payload-клеток ---
     let mut out = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];

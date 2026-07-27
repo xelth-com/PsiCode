@@ -32,6 +32,7 @@
 use psicode_core::calibrate;
 use psicode_core::fountain::{crc32c, FountainEncoder};
 use psicode_core::l3::{self, FrameHeader, TransferInfo};
+use psicode_core::swatch;
 use psicode_core::symbol::{self, render_symbol_counter};
 use psicode_core::CalibProfile;
 
@@ -229,6 +230,35 @@ pub fn single_frame(profile: &CalibProfile, counter: u8, cell_override: Option<u
         disp.cell_size_px = c as u8;
     }
     RgbFrame::from_symbol(render_symbol_counter(&disp, &cells, counter))
+}
+
+// ---------------------------------------------------------------------------
+// Лестница масштабов (swatch): диагностика цветового тракта §5.1-CL
+// ---------------------------------------------------------------------------
+
+/// Кадр лестницы масштабов (`psicode_core::swatch`): штатная геометрия символа,
+/// но payload — `n×n` крупных однородных блоков известной цветности. `frame`
+/// уходит в строку счётчика §3.3 (младшие 8 бит), и от него же зависит истина,
+/// поэтому анализатору хватает одного снимка. `cell_override` — как у
+/// [`single_frame`].
+pub fn swatch_frame(
+    profile: &CalibProfile,
+    n: usize,
+    frame: u64,
+    sweep: bool,
+    cell_override: Option<usize>,
+) -> RgbFrame {
+    let mut disp = *profile;
+    if let Some(c) = cell_override {
+        disp.cell_size_px = c as u8;
+    }
+    RgbFrame::from_symbol(swatch::render_swatch(
+        &disp,
+        n,
+        frame,
+        sweep,
+        swatch::SWATCH_GUARD,
+    ))
 }
 
 // ---------------------------------------------------------------------------
