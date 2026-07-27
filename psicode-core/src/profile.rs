@@ -46,6 +46,28 @@ use alloc::string::String;
 pub const CODE_SYMBOLS: usize = rs::CODE_LEN; // 32
 pub const CODE_CHARS_GROUPED: usize = CODE_SYMBOLS + CODE_SYMBOLS / base32::GROUP - 1; // 39 с дефисами
 
+/// Способ укладки комплексного символа в цвет клетки (§5.1).
+///
+/// # Два семейства
+///
+/// * **0..=4 — «яркостное» семейство §5.1 v0.** Re живёт на АБСОЛЮТНОЙ яркости
+///   (`G = M + A_L·Re`), Im — на оси `R − B`. `luma_bits` = число бит на
+///   яркостной оси, [`chroma_bits`](CalibProfile::chroma_bits) — на оси `R−B`.
+/// * **5..=7 — `ConstLuma*`, семейство ПОСТОЯННОЙ ЯРКОСТИ (§5.1-CL).** Сумма
+///   драйвов `R + G + B ≡ S` постоянна по построению, а комплексный символ
+///   живёт ЦЕЛИКОМ в цветности: `R = u(1 − b·x + c·y)`, `G = u(1 + 2b·x)`,
+///   `B = u(1 − b·x − c·y)`, u = S/3. Обращение делит на ИЗМЕРЕННУЮ сумму
+///   каналов клетки, поэтому произвольный поканально-общий множитель (поле
+///   освещённости, ошибка экспозиции) сокращается ТОЧНО.
+///
+/// # ВНИМАНИЕ: смысл `luma_bits` в режимах `ConstLuma*`
+///
+/// В `ConstLuma*` яркость данных НЕ несёт вообще. Поле
+/// [`luma_bits`](CalibProfile::luma_bits) в этих режимах переопределяется как
+/// число бит на **ДЕЙСТВИТЕЛЬНОЙ** оси `2G − R − B` (бывшая «яркостная» ось
+/// созвездия), а `ConstLuma1..3` задают 1..3 бита на **МНИМОЙ** оси `R − B`.
+/// Формат профиля от этого не меняется: `bits_per_cell` по-прежнему
+/// `luma_bits + chroma_bits()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromaMode {
     /// только яркость (канал G / luma)
@@ -58,6 +80,13 @@ pub enum ChromaMode {
     Chroma3 = 3,
     /// только зелёный субпиксель, R и B выключены (борьба с хром. аберрацией)
     GreenOnly = 4,
+    /// постоянная яркость (§5.1-CL), 1 бит на мнимой оси `R−B`;
+    /// `luma_bits` = бит на действительной оси `2G−R−B`
+    ConstLuma1 = 5,
+    /// постоянная яркость, 2 бита на мнимой оси
+    ConstLuma2 = 6,
+    /// постоянная яркость, 3 бита на мнимой оси
+    ConstLuma3 = 7,
 }
 
 impl ChromaMode {
@@ -68,8 +97,19 @@ impl ChromaMode {
             2 => Self::Chroma2,
             3 => Self::Chroma3,
             4 => Self::GreenOnly,
+            5 => Self::ConstLuma1,
+            6 => Self::ConstLuma2,
+            7 => Self::ConstLuma3,
             _ => return None,
         })
+    }
+
+    /// Принадлежит ли режим семейству ПОСТОЯННОЙ ЯРКОСТИ (§5.1-CL).
+    ///
+    /// В нём `luma_bits` считается числом бит на действительной оси `2G−R−B`,
+    /// а не на абсолютной яркости (см. док типа).
+    pub fn is_const_luma(self) -> bool {
+        matches!(self, Self::ConstLuma1 | Self::ConstLuma2 | Self::ConstLuma3)
     }
 }
 
@@ -200,12 +240,17 @@ impl CalibProfile {
     }
     /// число бит хромы на ячейку для текущего `chroma_mode` (§5.1):
     /// Mono и GreenOnly несут 0 бит хромы, Chroma1..3 — 1..3 бита.
+    ///
+    /// Для семейства постоянной яркости (`ConstLuma1..3`, §5.1-CL) это число
+    /// бит на МНИМОЙ оси `R−B`; действительная ось `2G−R−B` берёт `luma_bits`
+    /// (см. док [`ChromaMode`]). Сумма `luma_bits + chroma_bits()` остаётся
+    /// числом бит на клетку в обоих семействах.
     pub fn chroma_bits(&self) -> u8 {
         match self.chroma_mode {
             ChromaMode::Mono | ChromaMode::GreenOnly => 0,
-            ChromaMode::Chroma1 => 1,
-            ChromaMode::Chroma2 => 2,
-            ChromaMode::Chroma3 => 3,
+            ChromaMode::Chroma1 | ChromaMode::ConstLuma1 => 1,
+            ChromaMode::Chroma2 | ChromaMode::ConstLuma2 => 2,
+            ChromaMode::Chroma3 | ChromaMode::ConstLuma3 => 3,
         }
     }
     /// Период вставки repair-символов в источник, в исходных символах (§6.1).
@@ -433,6 +478,26 @@ mod tests {
         assert_eq!(p, q);
     }
 
+    /// Новые значения `chroma_mode` 5..=7 (§5.1-CL) кодируются/декодируются в
+    /// уже существующем 3-битном поле: раскладка 160-битного кода НЕ меняется,
+    /// длина строки та же, round-trip точен.
+    #[test]
+    fn const_luma_modes_roundtrip_in_existing_field() {
+        for m in [
+            ChromaMode::ConstLuma1,
+            ChromaMode::ConstLuma2,
+            ChromaMode::ConstLuma3,
+        ] {
+            let mut p = sample();
+            p.chroma_mode = m;
+            let s = p.encode_string().unwrap();
+            assert_eq!(s.len(), CODE_CHARS_GROUPED, "{m:?}: {s}");
+            let (q, fixed) = CalibProfile::decode_string(&s).unwrap();
+            assert_eq!(fixed, 0, "{m:?}");
+            assert_eq!(p, q, "{m:?}");
+        }
+    }
+
     #[test]
     fn physical_values() {
         let p = sample();
@@ -462,6 +527,26 @@ mod tests {
         assert_eq!(q.chroma_bits(), 0);
         q.chroma_mode = ChromaMode::Chroma3;
         assert_eq!(q.chroma_bits(), 3);
+        // семейство постоянной яркости (§5.1-CL): те же 1..3 бита на мнимой оси
+        for (m, bits) in [
+            (ChromaMode::ConstLuma1, 1u8),
+            (ChromaMode::ConstLuma2, 2),
+            (ChromaMode::ConstLuma3, 3),
+        ] {
+            q.chroma_mode = m;
+            assert_eq!(q.chroma_bits(), bits, "{m:?}");
+            assert!(m.is_const_luma(), "{m:?}");
+        }
+        for m in [
+            ChromaMode::Mono,
+            ChromaMode::Chroma1,
+            ChromaMode::Chroma2,
+            ChromaMode::Chroma3,
+            ChromaMode::GreenOnly,
+        ] {
+            assert!(!m.is_const_luma(), "{m:?}");
+        }
+        q.chroma_mode = ChromaMode::Chroma3;
         q.quiet_zone = 3;
         assert_eq!(q.quiet_zone_cells(), 8);
         q.fec_overhead = 0;

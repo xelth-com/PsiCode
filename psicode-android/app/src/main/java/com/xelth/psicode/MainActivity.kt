@@ -143,7 +143,10 @@ class MainActivity : AppCompatActivity() {
         // Инициализация Rust-ядра (или "no core" баннер).
         if (PsiCodeCore.available) {
             handle = try {
-                PsiCodeCore.rxInit(PROFILE_CELL_PX)
+                // Цветной режим включается запуском: --ez chroma true
+                val chroma = if (intent?.getBooleanExtra("chroma", false) == true) 1 else 0
+                android.util.Log.d("PsiCodeRX", "rxInit chromatic=$chroma")
+                PsiCodeCore.rxInit(PROFILE_CELL_PX, chroma)
             } catch (t: Throwable) {
                 0L
             }
@@ -288,7 +291,13 @@ class MainActivity : AppCompatActivity() {
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                 CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
             )
-            if (hasAf) set(
+            // Контрастный AF на мерцающем коде уходит в бесконечность и залипает.
+            // Если ручной фокус поддержан — НИКОГДА его не включаем: сразу AF_OFF и
+            // парковка линзы на запомненной (или дефолтной) дистанции.
+            if (afOffSupported) {
+                set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                set(CaptureRequest.LENS_FOCUS_DISTANCE, focusStartDiopter())
+            } else if (hasAf) set(
                 CaptureRequest.CONTROL_AF_MODE,
                 CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
             )
@@ -437,11 +446,25 @@ class MainActivity : AppCompatActivity() {
     // Всё продвижение шагов — на cam-потоке (camHandler.postDelayed); агрегация score — на proc-потоке.
 
     private fun startSweep() {
+        // Ручной пин: свипа нет вообще, стоим где сказано.
+        manualFocusDiopter()?.let { d ->
+            afState = Af3A.LOCKED
+            sweepActive = false
+            applyFocusStep(d)
+            lastDetectMs = SystemClock.elapsedRealtime()
+            noDetectActive = false
+            android.util.Log.d("PsiCodeRX", "FOCUS manual pin d=$d -> LOCKED (свип пропущен)")
+            return
+        }
         afState = Af3A.FOCUS_SWEEP
         sweepIndex = 0
         sweepBestScore = 0.0
         sweepBestD = -1.0f
-        sweepSteps = SWEEP_DIOPTERS
+        // Запомненный с прошлого раза фокус идёт ПЕРВЫМ шагом: если сцена не менялась,
+        // ранний выход срабатывает на нём и таблица не прогоняется.
+        val start = focusStartDiopter()
+        sweepSteps = floatArrayOf(start) +
+            SWEEP_DIOPTERS.filter { kotlin.math.abs(it - start) >= 0.05f }.toFloatArray()
         sweepFine = false
         curStepBestScore = 0.0
         sweepStepResults = 0
@@ -510,6 +533,7 @@ class MainActivity : AppCompatActivity() {
             val d = sweepBestD
             lastFocusDistance = d
             applyFocusStep(d)                       // выставляем лучшую дистанцию (репитинг без колбэка)
+            rememberFocus(d)                        // переживёт перезапуск: следующий старт начнёт с неё
             afState = Af3A.LOCKED
             val now = SystemClock.elapsedRealtime()
             lastDetectMs = now
@@ -519,6 +543,28 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.d("PsiCodeRX", "FOCUS-SWEEP nothing detected; retry in ${SWEEP_RETRY_MS}ms")
             camHandler?.postDelayed({ startSweep() }, SWEEP_RETRY_MS)
         }
+    }
+
+    /**
+     * Ручной пин фокуса из intent: `--ef focus 3.4` (диоптрии).
+     * Задан -> свип не запускается вообще, линза стоит на этом значении.
+     */
+    private fun manualFocusDiopter(): Float? {
+        val v = intent?.extras?.get("focus") as? Number ?: return null
+        return v.toFloat().coerceAtLeast(SWEEP_MIN_DIOPTER)
+    }
+
+    /** С чего начинать: ручной пин -> запомненный с прошлого лока -> дефолт. */
+    private fun focusStartDiopter(): Float {
+        manualFocusDiopter()?.let { return it }
+        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getFloat(KEY_FOCUS, -1f)
+        return if (saved >= SWEEP_MIN_DIOPTER) saved else FOCUS_DEFAULT_DIOPTER
+    }
+
+    /** Запомнить рабочий фокус — следующий старт пробует его первым. */
+    private fun rememberFocus(diopter: Float) {
+        if (diopter < SWEEP_MIN_DIOPTER) return
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putFloat(KEY_FOCUS, diopter).apply()
     }
 
     /** Выставить дистанцию фокуса (диоптрии) и перезапустить репитинг. Экспозиция/AWB уже в builder. */
@@ -564,7 +610,7 @@ class MainActivity : AppCompatActivity() {
             )
             // отладка: дамп первых двух кадров С ХОРОШО ОТТРЕКАННОЙ геометрией
             // (score >= 0.99 => фокус и лок уже устоялись), пуллятся через run-as
-            if (dumpCount < 2 && json.contains("\"score\":0.9")) {
+            if (dumpCount < DUMP_MAX && json.contains("\"score\":0.9")) {
                 try {
                     val i = dumpCount
                     java.io.File(filesDir, "dump$i.meta").writeText(
@@ -741,15 +787,26 @@ class MainActivity : AppCompatActivity() {
         // cell_size_px из эталонного профиля §7.4 (16 px). Rust rxInit подстраивается сам.
         private const val PROFILE_CELL_PX = 16
         private const val PROC_INTERVAL_MS = 120L    // ~8 fps
+        // Замер шума канала: сколько подряд захватов СТАТИЧНОГО кадра дампить.
+        // Разброс одной клетки по этой серии = шум одного захвата (codes/255),
+        // он же порог применимости гладкого временного базиса (RESEARCH).
+        private const val DUMP_MAX = 24
         private const val CONVERGE_TIMEOUT_FRAMES = 45
         private const val EXPOSURE_FLOOR_NS = 16_700_000L   // пин: 1 кадр 60Гц (против бандинга)
         private const val EXPOSURE_PIN_MAX_NS = 20_000_000L // длиннее -> бленд смены кадров tx
         private const val NODETECT_RECOVER_MS = 6_000L     // серия без детекта до re-sweep
         private const val RECOVERY_COOLDOWN_MS = 10_000L   // не чаще раза в 10с
-        // decoder-guided focus sweep: диоптрии от бесконечности (0) до ~11см (9); log-разрежённо.
-        // Вероятные дистанции первыми (экран ~25–45 см): ранний выход обычно
-        // срабатывает на первых шагах и свип не гоняет весь стол.
-        private val SWEEP_DIOPTERS = floatArrayOf(3.2f, 2.4f, 4.2f, 1.7f, 5.5f, 1.0f, 7.0f, 0.0f, 9.0f)
+        // decoder-guided focus sweep: диоптрии = 1/метры. Экран стоит на 11–65 см,
+        // поэтому диапазон ОГРАНИЧЕН снизу: 0.0 (бесконечность) и 1.0 (метр) убраны —
+        // на этих шагах линза уезжает через весь ход и возвращается ни с чем.
+        // Вероятные дистанции первыми: ранний выход обычно срабатывает на первых шагах.
+        private val SWEEP_DIOPTERS = floatArrayOf(3.2f, 2.4f, 4.2f, 1.7f, 5.5f, 7.0f, 9.0f)
+        private const val SWEEP_MIN_DIOPTER = 1.5f   // 67 см — дальше экран не ставят
+        private const val FOCUS_DEFAULT_DIOPTER = 3.2f // ~31 см: парковка до свипа
+        // Найденный фокус переживает перезапуск: следующий старт пробует его ПЕРВЫМ
+        // и обычно локается сразу, без прогона таблицы.
+        private const val PREFS = "psicode"
+        private const val KEY_FOCUS = "focus_diopter"
         private const val SWEEP_SETTLE_MS = 400L          // устаканивание линзы
         private const val SWEEP_RESULTS_PER_STEP = 2      // кадров-результатов на шаг (не таймер!)
         private const val SWEEP_EARLY_SCORE = 0.90        // ранний лок ТОЛЬКО на резком кольце:

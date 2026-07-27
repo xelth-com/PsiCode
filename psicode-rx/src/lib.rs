@@ -19,4 +19,6 @@ pub mod yuv;
 // подставляется в рантайме; на десктопе методы просто не вызываются).
 mod jni_glue;
 
-pub use session::{tx_default_profile, FrameStatus, RxSession, RxState};
+pub use session::{
+    tx_chromatic_profile, tx_default_profile, FrameStatus, RxSession, RxState,
+};

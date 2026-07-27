@@ -40,9 +40,119 @@ pub const A_L_FRACTION_CHROMA: f64 = 0.7;
 /// [EXPERIMENTAL] Доля `usable` под хрому в хромо-режимах v0 (§5.1).
 pub const A_C_FRACTION_CHROMA: f64 = 0.3;
 
+/// √3 — отношение коэффициентов осей отображения постоянной яркости (§5.1-CL).
+const SQRT3: f64 = 1.732_050_807_568_877_2;
+
+/// Масштаб прямоугольного созвездия PAM×PAM внутри гамута (§5.1-CL).
+///
+/// [`ConstLumaMap`] построен на ДИСКЕ |z| ≤ 1: там ограничение гамута сводится
+/// к одному радиусу (см. док структуры). Созвездие же Mode A — прямоугольная
+/// решётка на КВАДРАТЕ [−1, 1]², и в угловой точке (∓1, ±1) отклонение каналов
+/// R/B равно `u·b·(1+√3)` вместо `u·2b` на границе диска. Множитель `2/(1+√3)`
+/// возвращает угол РОВНО на границу гамута: область ограничений — правильный
+/// шестиугольник, вписанная окружность которого и есть единичный диск, поэтому
+/// в диагональном направлении запас есть, и это точный максимум для
+/// прямоугольной решётки, а не «с потолка».
+const CL_LATTICE_SCALE: f64 = 2.0 / (1.0 + SQRT3);
+
 /// Битов на клетку payload: luma_bits + биты хромы режима (§5.2).
+///
+/// В семействе постоянной яркости (`ChromaMode::ConstLuma*`) сумма та же, но
+/// `luma_bits` — биты ДЕЙСТВИТЕЛЬНОЙ оси `2G−R−B`, а не абсолютной яркости.
 pub fn bits_per_cell(p: &CalibProfile) -> u32 {
     p.luma_bits as u32 + p.chroma_bits() as u32
+}
+
+/// Отображение ПОСТОЯННОЙ ЯРКОСТИ (§5.1-CL, режимы `ChromaMode::ConstLuma*`):
+/// комплексный символ z = (x, y) живёт целиком в ЦВЕТНОСТИ при неизменной сумме
+/// драйвов.
+///
+/// # Прямое
+/// ```text
+/// R = u·(1 − b·x + c·y)
+/// G = u·(1 + 2·b·x)
+/// B = u·(1 − b·x − c·y)
+/// ```
+/// откуда `R + G + B ≡ 3u = S` тождественно, при любых (x, y).
+///
+/// # Обратное (из ЛИНЕАРИЗОВАННЫХ драйвов клетки)
+/// ```text
+/// S_meas = R + G + B          // ИЗМЕРЕННАЯ поклеточно — это нормативно
+/// x = (2G − R − B) / (2·S_meas·b)
+/// y = 3·(R − B)   / (2·S_meas·c)
+/// ```
+/// Проверка алгебры: `2G − R − B = 6u·b·x = 2S·b·x`, `R − B = 2u·c·y =
+/// (2S/3)·c·y`. Общий множитель λ на всех трёх драйвах (чем и становится поле
+/// освещённости/ошибка экспозиции после обращения гаммы дисплея) сокращается в
+/// этих отношениях ТОЧНО. С НОМИНАЛЬНОЙ суммой S инвариантность исчезает
+/// полностью — делить нужно именно на измеренную.
+///
+/// # Почему c = √3·b
+/// Векторы отклонений каналов в плоскости (x, y): `G: (2b, 0)`, `R: (−b, c)`,
+/// `B: (−b, −c)`. Их нормы равны ⇔ `c = √3·b`; тогда векторы образуют
+/// равносторонний треугольник (120°), ограничение гамута на диске сводится к
+/// ОДНОМУ радиусу, и одновременно выравнивается шум по осям (из обращения
+/// σ_x ∝ √6/(2Sb), σ_y ∝ 3√2/(2Sc); равенство ⇔ c = √3·b).
+///
+/// # Оптимум гамута
+/// Обозначив A = u·2b (свинг драйва на канал на границе диска), ограничения
+/// `u + A ≤ white`, `u − A ≥ black` дают максимум A при `u = (white+black)/2`,
+/// где `A = (white−black)/2`. Для эталонного профиля §7.4 (black 5, white 255):
+/// u = 130, S = 390, A = 125, b = 0.4808, c = 0.8327 — драйв ровно 5..255.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConstLumaMap {
+    /// Нейтраль на канал, u = S/3.
+    pub u: f64,
+    /// Коэффициент действительной оси `2G−R−B`.
+    pub b: f64,
+    /// Коэффициент мнимой оси `R−B`, c = √3·b.
+    pub c: f64,
+    /// Постоянная сумма драйвов S = 3u.
+    pub s: f64,
+    /// Свинг драйва канала на границе диска, A = u·2b.
+    pub amp: f64,
+}
+
+impl ConstLumaMap {
+    /// Прямое отображение z -> тройка drive (без квантования и клампа).
+    pub fn drive(&self, x: f64, y: f64) -> [f64; 3] {
+        [
+            self.u * (1.0 - self.b * x + self.c * y),
+            self.u * (1.0 + 2.0 * self.b * x),
+            self.u * (1.0 - self.b * x - self.c * y),
+        ]
+    }
+
+    /// Обратное отображение: тройка ОЦЕНЁННЫХ драйвов -> ẑ. Делит на ИЗМЕРЕННУЮ
+    /// сумму каналов — в этом весь смысл отображения (см. док структуры).
+    pub fn z_from_drive(&self, d: [f64; 3]) -> (f64, f64) {
+        let s = (d[0] + d[1] + d[2]).max(1e-9);
+        (
+            (2.0 * d[1] - d[0] - d[2]) / (2.0 * s * self.b),
+            3.0 * (d[0] - d[2]) / (2.0 * s * self.c),
+        )
+    }
+}
+
+/// Параметры отображения постоянной яркости для профиля (§5.1-CL): выводятся из
+/// уровней чёрного/белого профиля, а не из констант эталона.
+pub fn const_luma_map(p: &CalibProfile) -> ConstLumaMap {
+    let (black_255, white_255) = levels(p);
+    const_luma_from_levels(black_255 as f64, white_255 as f64)
+}
+
+/// Вывод [`ConstLumaMap`] из drive-уровней чёрного/белого.
+fn const_luma_from_levels(black: f64, white: f64) -> ConstLumaMap {
+    let u = 0.5 * (white + black);
+    let amp = (white - u).min(u - black).max(0.0);
+    let b = if u > 0.0 { amp / (2.0 * u) } else { 0.0 };
+    ConstLumaMap {
+        u,
+        b,
+        c: SQRT3 * b,
+        s: 3.0 * u,
+        amp,
+    }
 }
 
 /// true = белая клетка бинаризованной ЗЧ-последовательности корня `root`
@@ -132,75 +242,39 @@ pub fn render_symbol_counter(p: &CalibProfile, cells: &[u8], counter: u8) -> Fra
 /// [0,1] снимка в этой точке. Возвращает символы клеток в растровом порядке
 /// (та же система, что вход render_symbol).
 ///
-/// v0: цветокоррекция ограничена нормировкой по референсной строке (§3.4) —
-/// на канал восстанавливаются gain/offset и снимается гамма. Полноценная
-/// матрица 3×3 (§3.4) в v0 НЕ применяется; появится после канальных измерений.
+/// Цветокоррекция §3.4: поканальные gain/offset для ЯРКОСТНОГО семейства §5.1
+/// (v0, побитово как было) и полная матрица 3×3 для семейства ПОСТОЯННОЙ
+/// ЯРКОСТИ §5.1-CL. Хроматическому коду смешивание каналов фатально (замер на
+/// живом телефоне: до 26% синего протекает в зелёный), см. [`ChannelSolve`].
 pub fn demod_symbol(
     p: &CalibProfile,
     map: &dyn Fn(f64, f64) -> (f64, f64),
     sample: &dyn Fn(f64, f64) -> [f32; 3],
 ) -> Vec<u8> {
+    // Матрица 3×3 — только семейству постоянной яркости; яркостное семейство
+    // §5.1 идёт прежним поканальным путём БАЙТ-В-БАЙТ (живая передача и тест
+    // замороженного формата опираются на него).
+    demod_symbol_inner(p, map, sample, p.chroma_mode.is_const_luma())
+}
+
+/// Тело [`demod_symbol`] с явным выбором ветки цветокоррекции §3.4 —
+/// `want_matrix = false` принудительно оставляет поканальную нормировку
+/// (используется тестом развязки как контроль).
+fn demod_symbol_inner(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    want_matrix: bool,
+) -> Vec<u8> {
     let (black_255, white_255) = levels(p);
     let quiet = p.quiet_zone_cells() as usize;
     let cell = p.cell_size_px as usize;
-    let (a_l, a_c) = amplitudes(p, black_255, white_255);
-    // GreenOnly и Mono несут chroma_bits=0, поэтому Im-ветка ниже отключается
-    // сама собой; отдельного флага режима демодулятору не требуется.
-    let luma_bits = p.luma_bits as u32;
-    let chroma_bits = p.chroma_bits() as u32;
-    let l_levels = 1u32 << luma_bits;
-    let c_levels = 1u32 << chroma_bits;
+    // GreenOnly и Mono несут chroma_bits=0, поэтому Im-ветка отключается сама
+    // собой; выбор семейства §5.1 / §5.1-CL инкапсулирован в CellCodec.
+    let codec = CellCodec::new(p, black_255, white_255);
     let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
-
-    // --- нормировка по референсной строке (§3.4) ---
-    // Модель сенсора на канал: s = a·(d/255)^γ + b. Референсная строка даёт
-    // два якоря (все K-клетки и все W-клетки), из них решаем a и b, затем
-    // инвертируем: d = 255·((s − b)/a)^(1/γ). Это снимает произвольные
-    // per-channel gain/offset датчика (белый баланс, чёрный уровень).
-    let black = [black_255; 3];
-    let white = [white_255; 3];
-    let mut s_k = [0.0f64; 3];
-    let mut s_w = [0.0f64; 3];
-    let mut nk = 0usize;
-    let mut nw = 0usize;
-    for ic in 0..INTERIOR {
-        let pat = ref_pattern(ic % REF_PERIOD, black_255, white_255);
-        let cx = RING + ic;
-        let cy = RING; // референсная строка — первая строка внутренней области
-        if pat == black {
-            let s = sample_cell(quiet, cell, cx, cy, map, sample);
-            for c in 0..3 {
-                s_k[c] += s[c];
-            }
-            nk += 1;
-        } else if pat == white {
-            let s = sample_cell(quiet, cell, cx, cy, map, sample);
-            for c in 0..3 {
-                s_w[c] += s[c];
-            }
-            nw += 1;
-        }
-    }
-    // nk и nw заведомо > 0 (K и W присутствуют в каждом периоде паттерна);
-    // защищаемся на случай вырожденной геометрии.
-    let nk = nk.max(1) as f64;
-    let nw = nw.max(1) as f64;
-    let mut a_gain = [1.0f64; 3];
-    let mut b_off = [0.0f64; 3];
-    for c in 0..3 {
-        s_k[c] /= nk;
-        s_w[c] /= nw;
-        let dkc = (black_255 as f64 / 255.0).powf(gammas[c]);
-        let dwc = (white_255 as f64 / 255.0).powf(gammas[c]);
-        let denom = dwc - dkc;
-        let a = if denom.abs() < 1e-12 {
-            1.0
-        } else {
-            (s_w[c] - s_k[c]) / denom
-        };
-        a_gain[c] = if a.abs() < 1e-12 { 1e-12 } else { a };
-        b_off[c] = s_k[c] - a_gain[c] * dkc;
-    }
+    let solve =
+        ChannelSolve::from_reference_row(p, black_255, white_255, &gammas, map, sample, want_matrix);
 
     // --- демодуляция payload-клеток ---
     let mut out = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
@@ -209,28 +283,204 @@ pub fn demod_symbol(
         for pc in 0..PAYLOAD_COLS {
             let cx = RING + pc;
             let s = sample_cell(quiet, cell, cx, cy, map, sample);
-            // снимаем сенсорную модель на канал -> drive 0..255
-            let mut d = [0.0f64; 3];
-            for c in 0..3 {
-                let base = ((s[c] - b_off[c]) / a_gain[c]).max(0.0);
-                d[c] = (255.0 * base.powf(1.0 / gammas[c])).clamp(0.0, 255.0);
-            }
-            // §5.1 обратное отображение: Re из G, Im из (R − B)/2.
-            let re_hat = (d[1] - MID) / a_l;
-            let b_l = nearest_level(re_hat, l_levels);
-            let luma_gray = binary_to_gray(b_l);
-            let sym = if chroma_bits > 0 {
-                let im_hat = (d[0] - d[2]) / (2.0 * a_c);
-                let b_c = nearest_level(im_hat, c_levels);
-                let chroma_gray = binary_to_gray(b_c);
-                (luma_gray << chroma_bits) | chroma_gray
-            } else {
-                luma_gray
-            };
-            out[pr * PAYLOAD_COLS + pc] = sym as u8;
+            out[pr * PAYLOAD_COLS + pc] = codec.decode(solve.drive(s, &gammas));
         }
     }
     out
+}
+
+/// Обращение сенсорной модели §3.4: измеренный линеаризованный RGB клетки ->
+/// drive 0..255 на канал.
+///
+/// # Поканальная ветка (§5.1, режимы 0..=4 — побитово путь v0)
+/// Модель на канал: `s = a·(d/255)^γ + b`. Референсная строка даёт два якоря
+/// (все K-клетки и все W-клетки), из них решаются a и b, затем инвертируем
+/// `d = 255·((s − b)/a)^(1/γ)`. Это снимает произвольные per-channel
+/// gain/offset датчика (белый баланс, чёрный уровень), но НЕ смешивание.
+///
+/// # Матричная ветка (§5.1-CL, `ChromaMode::ConstLuma*`)
+/// Тракт «дисплей -> оптика -> сенсор -> CCM ISP» смешивает каналы линейно, и
+/// поканальная модель это смешивание не снимает. Для 1-битного ЯРКОСТНОГО кода
+/// это безобидно (порог монотонен), для кода ЦВЕТНОСТИ — фатально: замер на
+/// живом телефоне (Galaxy A22, 6 кадров) даёт off-diagonal до −0.26 (синий в
+/// зелёный) и −0.20 (зелёный в красный), из-за чего ось Re = 2G−R−B схлопывается
+/// до ~35% размаха и уезжает с центра — одно из четырёх созвездных состояний
+/// оказывается по НЕВЕРНУЮ сторону порога (BER оси Re ≈ 0.24, при том что ось
+/// Im = R−B работает: BER ≈ 0.03).
+///
+/// Поэтому здесь по ВСЕЙ референсной строке (§3.4 даёт K W R G B C M Y и серую
+/// лесенку именно для этого) решается МНК-задача
+/// `t̂ = N·s + q`, где `t_c = (d_c/255)^γ_c` — линеаризованный drive канала.
+/// 16 различных цветов патчей на 4 параметра выходного канала; примари R/G/B
+/// линейно независимы, так что система заведомо переопределена. При вырождении
+/// (плохая геометрия, битый снимок) — откат на поканальную ветку.
+enum ChannelSolve {
+    /// Поканальные усиление и смещение: `s = a·t + b`.
+    PerChannel { a: [f64; 3], b: [f64; 3] },
+    /// Полная развязка каналов: `t̂ = N·s + q`.
+    Matrix { n: [[f64; 3]; 3], q: [f64; 3] },
+}
+
+impl ChannelSolve {
+    fn from_reference_row(
+        p: &CalibProfile,
+        black_255: u8,
+        white_255: u8,
+        gammas: &[f64; 3],
+        map: &dyn Fn(f64, f64) -> (f64, f64),
+        sample: &dyn Fn(f64, f64) -> [f32; 3],
+        want_matrix: bool,
+    ) -> Self {
+        let quiet = p.quiet_zone_cells() as usize;
+        let cell = p.cell_size_px as usize;
+        let black = [black_255; 3];
+        let white = [white_255; 3];
+
+        let mut s_k = [0.0f64; 3];
+        let mut s_w = [0.0f64; 3];
+        let mut nk = 0usize;
+        let mut nw = 0usize;
+        // нормальные уравнения МНК: базис [s0, s1, s2, 1] на выходной канал.
+        let mut ata = [[0.0f64; 4]; 4];
+        let mut atb = [[0.0f64; 3]; 4];
+        for ic in 0..INTERIOR {
+            let pat = ref_pattern(ic % REF_PERIOD, black_255, white_255);
+            let cx = RING + ic;
+            let cy = RING; // референсная строка — первая строка внутренней области
+            let is_k = pat == black;
+            let is_w = pat == white;
+            if !is_k && !is_w && !want_matrix {
+                continue; // яркостное семейство читает только якоря K/W
+            }
+            let s = sample_cell(quiet, cell, cx, cy, map, sample);
+            if is_k {
+                for c in 0..3 {
+                    s_k[c] += s[c];
+                }
+                nk += 1;
+            } else if is_w {
+                for c in 0..3 {
+                    s_w[c] += s[c];
+                }
+                nw += 1;
+            }
+            if want_matrix {
+                let basis = [s[0], s[1], s[2], 1.0];
+                for c in 0..3 {
+                    let t = (pat[c] as f64 / 255.0).powf(gammas[c]);
+                    for i in 0..4 {
+                        atb[i][c] += basis[i] * t;
+                    }
+                }
+                for i in 0..4 {
+                    for j in 0..4 {
+                        ata[i][j] += basis[i] * basis[j];
+                    }
+                }
+            }
+        }
+        // nk и nw заведомо > 0 (K и W присутствуют в каждом периоде паттерна);
+        // защищаемся на случай вырожденной геометрии.
+        let nk = nk.max(1) as f64;
+        let nw = nw.max(1) as f64;
+        let mut a_gain = [1.0f64; 3];
+        let mut b_off = [0.0f64; 3];
+        for c in 0..3 {
+            s_k[c] /= nk;
+            s_w[c] /= nw;
+            let dkc = (black_255 as f64 / 255.0).powf(gammas[c]);
+            let dwc = (white_255 as f64 / 255.0).powf(gammas[c]);
+            let denom = dwc - dkc;
+            let a = if denom.abs() < 1e-12 {
+                1.0
+            } else {
+                (s_w[c] - s_k[c]) / denom
+            };
+            a_gain[c] = if a.abs() < 1e-12 { 1e-12 } else { a };
+            b_off[c] = s_k[c] - a_gain[c] * dkc;
+        }
+        let fallback = ChannelSolve::PerChannel {
+            a: a_gain,
+            b: b_off,
+        };
+        if !want_matrix {
+            return fallback;
+        }
+        match solve4x3(&ata, &atb) {
+            Some((n, q)) => ChannelSolve::Matrix { n, q },
+            None => fallback,
+        }
+    }
+
+    /// Измеренный линеаризованный RGB клетки -> drive 0..255 на канал.
+    fn drive(&self, s: [f64; 3], gammas: &[f64; 3]) -> [f64; 3] {
+        let mut d = [0.0f64; 3];
+        for c in 0..3 {
+            let t = match self {
+                ChannelSolve::PerChannel { a, b } => (s[c] - b[c]) / a[c],
+                ChannelSolve::Matrix { n, q } => {
+                    n[c][0] * s[0] + n[c][1] * s[1] + n[c][2] * s[2] + q[c]
+                }
+            };
+            d[c] = (255.0 * t.max(0.0).powf(1.0 / gammas[c])).clamp(0.0, 255.0);
+        }
+        d
+    }
+}
+
+/// Решает нормальные уравнения `AᵀA · x_c = AᵀB_c` для трёх выходных каналов
+/// сразу (гаусс с выбором ведущего элемента) и раскладывает решение в матрицу
+/// 3×3 плюс смещение. `None` — система вырождена (не хватило разных цветов).
+fn solve4x3(ata: &[[f64; 4]; 4], atb: &[[f64; 3]; 4]) -> Option<([[f64; 3]; 3], [f64; 3])> {
+    // расширенная матрица [AᵀA | AᵀB] размера 4×7
+    let mut m = [[0.0f64; 7]; 4];
+    for i in 0..4 {
+        m[i][..4].copy_from_slice(&ata[i]);
+        for c in 0..3 {
+            m[i][4 + c] = atb[i][c];
+        }
+    }
+    // масштаб для порога вырожденности: наибольший диагональный элемент AᵀA.
+    let scale = (0..4).fold(0.0f64, |acc, i| acc.max(ata[i][i].abs()));
+    if scale <= 0.0 {
+        return None;
+    }
+    for col in 0..4 {
+        let mut piv = col;
+        for r in col + 1..4 {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if m[piv][col].abs() < 1e-9 * scale {
+            return None; // вырождено: недостаточно линейно независимых цветов
+        }
+        m.swap(col, piv);
+        let d = m[col][col];
+        for j in col..7 {
+            m[col][j] /= d;
+        }
+        for r in 0..4 {
+            if r != col {
+                let f = m[r][col];
+                for j in col..7 {
+                    m[r][j] -= f * m[col][j];
+                }
+            }
+        }
+    }
+    let mut n = [[0.0f64; 3]; 3];
+    let mut q = [0.0f64; 3];
+    for c in 0..3 {
+        for j in 0..3 {
+            n[c][j] = m[j][4 + c];
+        }
+        q[c] = m[3][4 + c];
+        if !n[c].iter().all(|v| v.is_finite()) || !q[c].is_finite() {
+            return None;
+        }
+    }
+    Some((n, q))
 }
 
 /// [LIVE] Радиус тонкого окна локального порога (клетки): 1 = 3×3, масштаб
@@ -346,11 +596,20 @@ fn levels(p: &CalibProfile) -> (u8, u8) {
 }
 
 /// Амплитуды (A_L, A_C) для §5.1 (v0, экспериментальные доли usable).
+///
+/// Вызывается только для «яркостного» семейства (режимы 0..=4). У `ConstLuma*`
+/// собственное отображение ([`ConstLumaMap`]), и эти амплитуды к нему
+/// неприменимы — арм оставлен лишь ради исчерпывающего match.
 fn amplitudes(p: &CalibProfile, black_255: u8, white_255: u8) -> (f64, f64) {
     let usable = ((white_255 as f64 - MID).min(MID - black_255 as f64)).max(0.0);
     match p.chroma_mode {
         ChromaMode::Mono | ChromaMode::GreenOnly => (usable, 0.0),
-        ChromaMode::Chroma1 | ChromaMode::Chroma2 | ChromaMode::Chroma3 => {
+        ChromaMode::Chroma1
+        | ChromaMode::Chroma2
+        | ChromaMode::Chroma3
+        | ChromaMode::ConstLuma1
+        | ChromaMode::ConstLuma2
+        | ChromaMode::ConstLuma3 => {
             (A_L_FRACTION_CHROMA * usable, A_C_FRACTION_CHROMA * usable)
         }
     }
@@ -393,29 +652,109 @@ fn encode_field(re: f64, im: f64, a_l: f64, a_c: f64, greenonly: bool) -> [u8; 3
     [quant(r), quant(g), quant(b)]
 }
 
-/// Символ клетки Mode A -> drive-RGB. luma и chroma декодируются из Грей-кода
-/// раздельно (§5.2): symbol = (luma_gray << chroma_bits) | chroma_gray.
-fn encode_cell(
-    s: u32,
+/// Отображение пары осей созвездия в цвет: какое из двух семейств §5.1 активно.
+enum CodecKind {
+    /// §5.1 v0 (режимы 0..=4): Re на абсолютной яркости G, Im на оси R−B.
+    Legacy { a_l: f64, a_c: f64, greenonly: bool },
+    /// §5.1-CL (`ConstLuma*`): постоянная сумма драйвов, z целиком в цветности.
+    ConstLuma(ConstLumaMap),
+}
+
+/// Кодек одной payload-клетки Mode A: символ <-> drive-RGB.
+///
+/// Общее у обоих семейств — раскладка символа на ДВЕ оси и Грей-код (§5.2):
+/// `symbol = (re_gray << chroma_bits) | im_gray`, каждая ось независимо. Ветка
+/// [`CodecKind::Legacy`] побитово повторяет путь v0 (режимы 0..=4) — ради
+/// байт-совместимости живой передачи и замороженного формата; ветка
+/// [`CodecKind::ConstLuma`] реализует §5.1-CL.
+struct CellCodec {
+    /// Биты МНИМОЙ оси (`chroma_bits` профиля).
     chroma_bits: u32,
+    /// Уровней на ДЕЙСТВИТЕЛЬНОЙ оси, 2^luma_bits.
     l_levels: u32,
+    /// Уровней на МНИМОЙ оси, 2^chroma_bits.
     c_levels: u32,
-    a_l: f64,
-    a_c: f64,
-    greenonly: bool,
-) -> [u8; 3] {
-    let luma_gray = s >> chroma_bits;
-    let chroma_mask = (1u32 << chroma_bits) - 1; // при chroma_bits=0 даёт 0
-    let chroma_gray = s & chroma_mask;
-    let b_l = gray_to_binary(luma_gray);
-    let re = -1.0 + 2.0 * b_l as f64 / (l_levels - 1) as f64;
-    let im = if chroma_bits > 0 {
-        let b_c = gray_to_binary(chroma_gray);
-        -1.0 + 2.0 * b_c as f64 / (c_levels - 1) as f64
-    } else {
-        0.0
-    };
-    encode_field(re, im, a_l, a_c, greenonly)
+    kind: CodecKind,
+}
+
+impl CellCodec {
+    fn new(p: &CalibProfile, black_255: u8, white_255: u8) -> Self {
+        let chroma_bits = p.chroma_bits() as u32;
+        let kind = if p.chroma_mode.is_const_luma() {
+            CodecKind::ConstLuma(const_luma_from_levels(black_255 as f64, white_255 as f64))
+        } else {
+            let (a_l, a_c) = amplitudes(p, black_255, white_255);
+            CodecKind::Legacy {
+                a_l,
+                a_c,
+                greenonly: matches!(p.chroma_mode, ChromaMode::GreenOnly),
+            }
+        };
+        CellCodec {
+            chroma_bits,
+            l_levels: 1u32 << (p.luma_bits as u32),
+            c_levels: 1u32 << chroma_bits,
+            kind,
+        }
+    }
+
+    /// Символ клетки Mode A -> drive-RGB. Оси декодируются из Грей-кода
+    /// раздельно (§5.2): symbol = (luma_gray << chroma_bits) | chroma_gray.
+    fn encode(&self, s: u32) -> [u8; 3] {
+        let luma_gray = s >> self.chroma_bits;
+        let chroma_mask = (1u32 << self.chroma_bits) - 1; // при chroma_bits=0 даёт 0
+        let chroma_gray = s & chroma_mask;
+        let b_l = gray_to_binary(luma_gray);
+        let re = -1.0 + 2.0 * b_l as f64 / (self.l_levels - 1) as f64;
+        let im = if self.chroma_bits > 0 {
+            let b_c = gray_to_binary(chroma_gray);
+            -1.0 + 2.0 * b_c as f64 / (self.c_levels - 1) as f64
+        } else {
+            0.0
+        };
+        match &self.kind {
+            CodecKind::Legacy {
+                a_l,
+                a_c,
+                greenonly,
+            } => encode_field(re, im, *a_l, *a_c, *greenonly),
+            CodecKind::ConstLuma(m) => {
+                // созвездие сжато в гамут (см. CL_LATTICE_SCALE)
+                let d = m.drive(CL_LATTICE_SCALE * re, CL_LATTICE_SCALE * im);
+                [quant(d[0]), quant(d[1]), quant(d[2])]
+            }
+        }
+    }
+
+    /// Линеаризованные драйвы клетки -> символ Mode A.
+    fn decode(&self, d: [f64; 3]) -> u8 {
+        let (re_hat, im_hat) = match &self.kind {
+            // §5.1 обратное отображение: Re из G, Im из (R − B)/2.
+            CodecKind::Legacy { a_l, a_c, .. } => (
+                (d[1] - MID) / a_l,
+                if self.chroma_bits > 0 {
+                    (d[0] - d[2]) / (2.0 * a_c)
+                } else {
+                    0.0
+                },
+            ),
+            // §5.1-CL: обе оси — отношения к ИЗМЕРЕННОЙ сумме каналов.
+            CodecKind::ConstLuma(m) => {
+                let (x, y) = m.z_from_drive(d);
+                (x / CL_LATTICE_SCALE, y / CL_LATTICE_SCALE)
+            }
+        };
+        let b_l = nearest_level(re_hat, self.l_levels);
+        let luma_gray = binary_to_gray(b_l);
+        let sym = if self.chroma_bits > 0 {
+            let b_c = nearest_level(im_hat, self.c_levels);
+            let chroma_gray = binary_to_gray(b_c);
+            (luma_gray << self.chroma_bits) | chroma_gray
+        } else {
+            luma_gray
+        };
+        sym as u8
+    }
 }
 
 /// Сборка клеточной решётки символа GRID×GRID в drive-RGB. `counter` — младшие
@@ -470,11 +809,7 @@ fn build_symbol_cells(p: &CalibProfile, cells: &[u8], counter: u8) -> Vec<[u8; 3
     }
 
     // --- внутренняя область: смещения [2..58] (§3.3) ---
-    let greenonly = matches!(p.chroma_mode, ChromaMode::GreenOnly);
-    let chroma_bits = p.chroma_bits() as u32;
-    let l_levels = 1u32 << (p.luma_bits as u32);
-    let c_levels = 1u32 << chroma_bits;
-    let (a_l, a_c) = amplitudes(p, black_255, white_255);
+    let codec = CellCodec::new(p, black_255, white_255);
 
     // строка ir=0 (y=2): референсная строка §3.4
     for ic in 0..INTERIOR {
@@ -487,7 +822,7 @@ fn build_symbol_cells(p: &CalibProfile, cells: &[u8], counter: u8) -> Vec<[u8; 3
         for pc in 0..PAYLOAD_COLS {
             let x = RING + pc;
             let s = cells[pr * PAYLOAD_COLS + pc] as u32;
-            sym[y * GRID + x] = encode_cell(s, chroma_bits, l_levels, c_levels, a_l, a_c, greenonly);
+            sym[y * GRID + x] = codec.encode(s);
         }
     }
     // строка ir=56 (y=58): строка счётчика кадров (§3.3/§6.3). Середина
@@ -852,6 +1187,272 @@ mod tests {
         let got = demod_symbol_local(&p, &map, &sample);
         let errors = got.iter().zip(&cells).filter(|(a, b)| a != b).count();
         assert_eq!(errors, 0, "локальный демод не точен на чистом канале: {errors}");
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.1-CL: отображение постоянной яркости (ChromaMode::ConstLuma*)
+    // -----------------------------------------------------------------------
+
+    /// Три режима постоянной яркости и разумные глубины действительной оси.
+    const CL_CASES: [(u8, ChromaMode); 4] = [
+        (1, ChromaMode::ConstLuma1),
+        (2, ChromaMode::ConstLuma1),
+        (3, ChromaMode::ConstLuma1),
+        (2, ChromaMode::ConstLuma2),
+    ];
+
+    /// Псевдослучайная нагрузка клеток под маску bits_per_cell.
+    fn rand_cells(p: &CalibProfile, seed: u64) -> Vec<u8> {
+        let bits = bits_per_cell(p);
+        let mask = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        let mut rng = XorShift64(seed);
+        (0..PAYLOAD_COLS * PAYLOAD_ROWS)
+            .map(|_| (rng.next() as u32 & mask) as u8)
+            .collect()
+    }
+
+    /// Идеальный сэмплер поверх кадра: дисплей `drive^γ` -> МУЛЬТИПЛИКАТИВНОЕ
+    /// поле освещённости `field(y)` (одинаковое по трём каналам, как реальная
+    /// виньетка/наклон подсветки) -> линейный сенсор. `map` — тождество.
+    fn field_sampler(
+        p: &CalibProfile,
+        frame: &Frame,
+        field: impl Fn(f64) -> f64 + 'static,
+    ) -> impl Fn(f64, f64) -> [f32; 3] {
+        let size = frame.size_px;
+        let rgb = frame.rgb.clone();
+        let g = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        move |x: f64, y: f64| -> [f32; 3] {
+            let xi = (x.max(0.0) as usize).min(size - 1);
+            let yi = (y.max(0.0) as usize).min(size - 1);
+            let f = field(yi as f64 / (size - 1) as f64);
+            let d = rgb[yi * size + xi];
+            [
+                (f * (d[0] as f64 / 255.0).powf(g[0])) as f32,
+                (f * (d[1] as f64 / 255.0).powf(g[1])) as f32,
+                (f * (d[2] as f64 / 255.0).powf(g[2])) as f32,
+            ]
+        }
+    }
+
+    /// Доля ошибочных клеток после render -> sample -> demod.
+    fn ser_through(p: &CalibProfile, cells: &[u8], sample: &dyn Fn(f64, f64) -> [f32; 3]) -> f64 {
+        let map = |u: f64, v: f64| (u, v);
+        let got = demod_symbol(p, &map, sample);
+        got.iter().zip(cells).filter(|(a, b)| a != b).count() as f64 / cells.len() as f64
+    }
+
+    /// Константы гамута §5.1-CL для эталонных уровней §7.4 (black 5, white 255):
+    /// u = 130, S = 390, A = 125 (драйв ровно 5..255), b = 0.4808, c = √3·b.
+    #[test]
+    fn const_luma_gamut_constants_match_reference_profile() {
+        let p = prof(1, ChromaMode::ConstLuma1, 16, 0);
+        let (black, white) = levels(&p);
+        assert_eq!((black, white), (5, 255), "эталонные уровни §7.4");
+        let m = const_luma_map(&p);
+        assert!((m.u - 130.0).abs() < 1e-9, "u = {}", m.u);
+        assert!((m.s - 390.0).abs() < 1e-9, "S = {}", m.s);
+        assert!((m.amp - 125.0).abs() < 1e-9, "A = {}", m.amp);
+        assert!((m.b - 0.480_769_230_769).abs() < 1e-9, "b = {}", m.b);
+        assert!((m.c - SQRT3 * m.b).abs() < 1e-15, "c = {}", m.c);
+        assert!((m.c - 0.832_716_734_408).abs() < 1e-9, "c = {}", m.c);
+        // u ± A попадает ровно в чёрный/белый
+        assert!((m.u + m.amp - white as f64).abs() < 1e-9);
+        assert!((m.u - m.amp - black as f64).abs() < 1e-9);
+    }
+
+    /// Гамут: для ЛЮБОГО z единичного диска все три драйва лежат в [black, white]
+    /// (и граница достигается) — при уровнях эталона и при других уровнях.
+    #[test]
+    fn const_luma_drive_stays_in_gamut_on_unit_disk() {
+        for (wq, bq) in [(15u8, 2u8), (0, 0), (7, 15), (15, 15)] {
+            let mut p = prof(1, ChromaMode::ConstLuma1, 16, 0);
+            p.white_level_q = wq;
+            p.black_level_q = bq;
+            let (black, white) = levels(&p);
+            let m = const_luma_map(&p);
+            let mut max_dev = 0.0f64;
+            for i in 0..720 {
+                let th = core::f64::consts::PI * i as f64 / 360.0;
+                for r in [0.0, 0.5, 1.0] {
+                    let d = m.drive(r * th.cos(), r * th.sin());
+                    for c in 0..3 {
+                        assert!(
+                            d[c] >= black as f64 - 1e-9 && d[c] <= white as f64 + 1e-9,
+                            "w{wq} b{bq}: канал {c} драйв {} вне [{black}, {white}]",
+                            d[c]
+                        );
+                        max_dev = max_dev.max((d[c] - m.u).abs());
+                    }
+                    // сумма постоянна тождественно
+                    assert!((d[0] + d[1] + d[2] - m.s).abs() < 1e-9);
+                }
+            }
+            // созвездие не вырождено и упирается в границу гамута
+            assert!((max_dev - m.amp).abs() < 1e-6, "w{wq} b{bq}: свинг {max_dev}");
+        }
+    }
+
+    /// Постоянство суммы драйвов R+G+B по ВСЕМ payload-клеткам отрендеренного
+    /// символа (после 8-битного квантования — с точностью до ±1 градации).
+    #[test]
+    fn const_luma_render_keeps_channel_sum_constant() {
+        for (luma, mode) in CL_CASES {
+            let p = prof(luma, mode, 8, 1);
+            let cells = rand_cells(&p, 0xBEEF_0000_1234_5678 ^ luma as u64);
+            let sym = build_symbol_cells(&p, &cells, 0);
+            let m = const_luma_map(&p);
+            let mut seen = std::collections::HashSet::new();
+            for pr in 0..PAYLOAD_ROWS {
+                let y = RING + 1 + pr;
+                for pc in 0..PAYLOAD_COLS {
+                    let d = sym[y * GRID + (RING + pc)];
+                    let s = d[0] as i32 + d[1] as i32 + d[2] as i32;
+                    seen.insert(s);
+                    assert!(
+                        (s as f64 - m.s).abs() <= 1.5,
+                        "{mode:?} luma{luma}: сумма {s} != S = {}",
+                        m.s
+                    );
+                }
+            }
+            // разброс — только шум округления, не сигнал
+            assert!(seen.len() <= 3, "{mode:?} luma{luma}: сумм {}", seen.len());
+        }
+    }
+
+    /// Round-trip §5.1-CL через идеальный канал: точное восстановление клеток.
+    #[test]
+    fn const_luma_clean_roundtrip_ideal_channel() {
+        for (luma, mode) in CL_CASES {
+            for cell in [8u8, 16u8] {
+                let p = prof(luma, mode, cell, 0);
+                assert_roundtrip(&p, 1.0, 0.0, 0x0FED_CBA9_8765_4321 ^ cell as u64);
+                // и с произвольным поканальным усилением/подъёмом чёрного
+                assert_roundtrip(&p, 0.8, 0.05, 0xDEAD_BEEF_0BAD_F00D ^ cell as u64);
+            }
+        }
+    }
+
+    /// ГЛАВНЫЙ тест смены отображения: под МУЛЬТИПЛИКАТИВНЫМ полем освещённости
+    /// (линейный наклон 0.62 -> 0.86 по кадру, замер на живом телефоне) режимы
+    /// постоянной яркости восстанавливают клетки ТОЧНО, а legacy-хрома §5.1 —
+    /// нет. Механизм: обращение §5.1-CL делит на ИЗМЕРЕННУЮ сумму каналов
+    /// клетки, и общий множитель поля сокращается; §5.1 же кладёт Re на
+    /// абсолютную яркость, а её нормировка (§3.4) снимается по референсной
+    /// СТРОКЕ сверху кадра — то есть по ОДНОЙ точке поля.
+    #[test]
+    fn const_luma_is_immune_to_illumination_field_legacy_is_not() {
+        // поле: 0.62 сверху -> 0.86 снизу, одинаково по трём каналам
+        let field = |t: f64| 0.62 + (0.86 - 0.62) * t;
+
+        // 1. новое отображение: SER = 0 на всех конфигурациях
+        for (luma, mode) in CL_CASES {
+            let p = prof(luma, mode, 16, 0);
+            let cells = rand_cells(&p, 0x5EED_1111_2222_3333 ^ luma as u64);
+            let frame = render_symbol(&p, &cells);
+            let sample = field_sampler(&p, &frame, field);
+            let ser = ser_through(&p, &cells, &sample);
+            assert_eq!(ser, 0.0, "{mode:?} luma{luma}: SER {ser:.4} под полем");
+        }
+
+        // 2. Лобовое сравнение при РАВНОЙ ёмкости: luma_bits + Chroma1 против
+        //    luma_bits + ConstLuma1 под ТЕМ ЖЕ полем.
+        let mut worst_legacy = 0.0f64;
+        for luma in [2u8, 3] {
+            let legacy = prof(luma, ChromaMode::Chroma1, 16, 0);
+            let lcells = rand_cells(&legacy, 0x5EED_1111_2222_3333);
+            let lframe = render_symbol(&legacy, &lcells);
+            let lsample = field_sampler(&legacy, &lframe, field);
+            let lser = ser_through(&legacy, &lcells, &lsample);
+
+            let cl = prof(luma, ChromaMode::ConstLuma1, 16, 0);
+            let ccells = rand_cells(&cl, 0x5EED_1111_2222_3333);
+            let cframe = render_symbol(&cl, &ccells);
+            let csample = field_sampler(&cl, &cframe, field);
+            let cser = ser_through(&cl, &ccells, &csample);
+
+            assert_eq!(cser, 0.0, "ConstLuma1+luma{luma}: SER {cser:.4}");
+            worst_legacy = worst_legacy.max(lser);
+            println!(
+                "поле 0.62..0.86, {} бит/клетку: legacy Chroma1 SER {lser:.4} vs ConstLuma1 SER {cser:.4}",
+                luma as u32 + 1
+            );
+        }
+        // При 3 уровнях наклона поля 2-битная яркостная ось ещё вытягивает
+        // (ошибка чуть меньше половины шага), 3-битная — уже нет. Именно поэтому
+        // §5.1 упирается в 1–2 бита на живом канале, а §5.1-CL — нет.
+        assert!(
+            worst_legacy > 0.10,
+            "тест некорректен: legacy §5.1 обязан рассыпаться под полем (худший SER {worst_legacy:.4})"
+        );
+    }
+
+    /// [LIVE] §3.4 матрица 3×3: под ЛИНЕЙНЫМ СМЕШИВАНИЕМ каналов (замер на
+    /// Galaxy A22 даёт off-diagonal до −0.26: синий течёт в зелёный) семейство
+    /// постоянной яркости обязано восстанавливать клетки ТОЧНО — развязка
+    /// решается по референсной строке §3.4 (K W R G B C M Y + лесенка).
+    /// Проверяем и то, что БЕЗ развязки код действительно рассыпается: иначе
+    /// тест ничего не доказывает.
+    #[test]
+    fn const_luma_survives_channel_crosstalk_via_reference_row() {
+        // матрица смешивания сенсора/ISP: строки суммируются к 1 (нейтраль
+        // остаётся нейтралью, поэтому якоря K/W §3.4 смешивания НЕ видят —
+        // ровно та ситуация, в которой поканальная нормировка бессильна).
+        let mix = [
+            [0.78, 0.14, 0.08],
+            [0.12, 0.62, 0.26],
+            [0.07, 0.28, 0.65],
+        ];
+        let mut worst_without = 0.0f64;
+        for (luma, mode) in CL_CASES {
+            let p = prof(luma, mode, 16, 0);
+            let cells = rand_cells(&p, 0xC0DE_1234_5678_9ABC ^ luma as u64);
+            let frame = render_symbol(&p, &cells);
+            let size = frame.size_px;
+            let rgb = frame.rgb.clone();
+            let g = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+            let sample = move |x: f64, y: f64| -> [f32; 3] {
+                let xi = (x.max(0.0) as usize).min(size - 1);
+                let yi = (y.max(0.0) as usize).min(size - 1);
+                let d = rgb[yi * size + xi];
+                let lin = [
+                    (d[0] as f64 / 255.0).powf(g[0]),
+                    (d[1] as f64 / 255.0).powf(g[1]),
+                    (d[2] as f64 / 255.0).powf(g[2]),
+                ];
+                let mut o = [0.0f32; 3];
+                for c in 0..3 {
+                    // 0.8 усиления и +0.03 подъёма чёрного поверх смешивания
+                    let v = mix[c][0] * lin[0] + mix[c][1] * lin[1] + mix[c][2] * lin[2];
+                    o[c] = (0.8 * v + 0.03) as f32;
+                }
+                o
+            };
+            let ser = ser_through(&p, &cells, &sample);
+            assert_eq!(ser, 0.0, "{mode:?} luma{luma}: SER {ser:.4} под смешиванием");
+            // контроль: ТОТ ЖЕ снимок через поканальную ветку разваливается —
+            // развязка каналов не косметика.
+            let map = |u: f64, v: f64| (u, v);
+            let got = demod_symbol_inner(&p, &map, &sample, false);
+            let bad = got.iter().zip(&cells).filter(|(a, b)| a != b).count();
+            worst_without = worst_without.max(bad as f64 / cells.len() as f64);
+        }
+        assert!(
+            worst_without > 0.05,
+            "тест некорректен: без матрицы §5.1-CL обязан страдать (худший SER {worst_without:.4})"
+        );
+    }
+
+    /// Поле, СИЛЬНО обрезающее динамику (0.35..1.0), не ломает §5.1-CL: важна
+    /// только пропорция каналов, а не абсолютный уровень.
+    #[test]
+    fn const_luma_survives_deep_field() {
+        let p = prof(2, ChromaMode::ConstLuma1, 16, 0);
+        let cells = rand_cells(&p, 0x9999_8888_7777_6666);
+        let frame = render_symbol(&p, &cells);
+        let sample = field_sampler(&p, &frame, |t| 0.35 + 0.65 * t);
+        assert_eq!(ser_through(&p, &cells, &sample), 0.0);
     }
 
     /// [LIVE] Под сильным ПРОСТРАНСТВЕННЫМ фоном (аддитивный градиент «блика»,

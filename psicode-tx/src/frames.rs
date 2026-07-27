@@ -87,7 +87,12 @@ pub fn reference_profile() -> CalibProfile {
     CalibProfile {
         version: CalibProfile::VERSION,
         cell_size_px: 16,
-        frame_hold_periods: 16, // live v0: длинный hold против ISP-смешивания (~84% чистых захватов)
+        // Живой прогон 2026-07-27: обратная задача по «84% чистых при H=16» даёт
+        // коэффициент смешивания ISP α ≈ 0.07, то есть H=16 держался не из-за
+        // смешивания, а из-за попадания окна экспозиции на стык кадров.
+        // Симуляция (psicode-sim tprobe) даёт при H=6 9.8 симв/с на клетку при
+        // 1.8% ошибок против 3.75 при H=16 — 2.6x. Проверяем на железе.
+        frame_hold_periods: 6,
         // v0 live: 1 бит/клетку — живой канал даёт эффективный блюр ~σ2,
         // BENCHMARKS §6 для него предписывает luma1+Mono (SER 0 в симе).
         luma_bits: 1,
@@ -105,6 +110,30 @@ pub fn reference_profile() -> CalibProfile {
         quiet_zone: 1,
         fec_overhead: 2,
     }
+}
+
+/// Переводит профиль в семейство ПОСТОЯННОЙ ЯРКОСТИ (§5.1-CL, `ConstLuma1`).
+///
+/// Комплексный символ уезжает из абсолютной яркости целиком в цветность, а
+/// обращение делит на ИЗМЕРЕННУЮ поклеточную сумму каналов — то есть ось,
+/// которую разрушает поле освещённости приёмника (замер: luma плывёт 0.62..0.86
+/// по кадру), перестаёт нести данные.
+///
+/// `luma_bits = 1` — теперь это биты ДЕЙСТВИТЕЛЬНОЙ оси `2G−R−B`, плюс 1 бит
+/// мнимой оси `R−B`: 2 бит/клетку, обе оси двухуровневые. Это прямой апгрейд
+/// живого 1-битного режима при том же (максимальном) запасе на ось; поднимать
+/// `luma_bits` есть смысл после замера на железе.
+pub fn to_const_luma(mut p: CalibProfile) -> CalibProfile {
+    use psicode_core::ChromaMode;
+    p.luma_bits = 1;
+    p.chroma_mode = ChromaMode::ConstLuma1;
+    p
+}
+
+/// Эталонный профиль в режиме постоянной яркости (§5.1-CL): 2 бит/клетку.
+/// Всё остальное — как у [`reference_profile`].
+pub fn chromatic_profile() -> CalibProfile {
+    to_const_luma(reference_profile())
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +537,59 @@ mod tests {
         let f = single_frame(&prof, 42, Some(12));
         assert_eq!(f.w, (symbol::GRID + 2 * quiet) * 12);
         assert!(f.px.iter().any(|&c| c != GRAY));
+    }
+
+    /// Профиль §5.1-CL: `reference_profile` не тронут, `chromatic_profile` даёт
+    /// ConstLuma1 + 1 бит действительной оси = 2 бит/клетку, и поток на нём
+    /// строится и парсится (§6.2) точно так же.
+    #[test]
+    fn chromatic_profile_streams_and_parses() {
+        use psicode_core::ChromaMode;
+
+        // эталон не изменился
+        let r = reference_profile();
+        assert_eq!(r.luma_bits, 1);
+        assert_eq!(r.chroma_mode, ChromaMode::Mono);
+        assert_eq!(r.frame_hold_periods, 6);
+        assert_eq!(symbol::bits_per_cell(&r), 1);
+
+        let p = chromatic_profile();
+        assert_eq!(p.chroma_mode, ChromaMode::ConstLuma1);
+        assert_eq!(p.luma_bits, 1);
+        assert_eq!(symbol::bits_per_cell(&p), 2, "ConstLuma1 + 1 бит Re");
+        // остальные поля унаследованы от эталона
+        assert_eq!(p.cell_size_px, r.cell_size_px);
+        assert_eq!(p.frame_hold_periods, r.frame_hold_periods);
+        assert_eq!(p.quiet_zone, r.quiet_zone);
+        assert_eq!(p.fec_overhead, r.fec_overhead);
+        // профиль валиден для обратного канала (кодируется в 32 символа)
+        assert!(p.encode_string().is_ok(), "профиль §5.1-CL не кодируется");
+
+        // ёмкость кадра при смене bpc 1 -> 2 (§6.2)
+        for bpc in [1u32, 2] {
+            println!(
+                "bpc {bpc}: frame_byte_capacity {}, symbol_size {}, полезных байт/кадр {}",
+                l3::frame_byte_capacity(bpc),
+                symbol_size_for(bpc),
+                SYMBOLS_PER_FRAME * symbol_size_for(bpc),
+            );
+        }
+
+        let file = make_file(20_000);
+        let s = Streamer::new(&file, p, 0x5150);
+        assert_eq!(s.bpc(), 2);
+        for seq in 0..(s.frames_per_pass() as u64).min(24) {
+            let parsed = l3::parse_frame(&s.frame_cells(seq), s.bpc());
+            assert!(parsed.stripes_ok.iter().all(|&ok| ok), "кадр {seq}: страйп бит");
+        }
+        // кадр рендерится и не вырожден в серый
+        let f = s.render(0, Some(12));
+        assert!(f.px.iter().any(|&c| c != GRAY));
+        // ...и он ЦВЕТНОЙ: в payload есть клетки с R != B (мнимая ось)
+        assert!(
+            f.px.iter().any(|c| c[0] != c[2]),
+            "кадр §5.1-CL обязан быть цветным"
+        );
     }
 
     /// fec_overhead управляет вплетением repair (§6.1): fec=0 -> проход = ровно K

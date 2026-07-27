@@ -63,6 +63,17 @@ const DETECT_MAX_DIM: usize = 4096;
 /// 3 бит/клетку. Идентичен transfer.rs/live.rs. `cell_size_px` — display-масштаб;
 /// в демодуляции он СОКРАЩАЕТСЯ (frame_map переводит px->клетки, demod клетки->px
 /// тем же cell), важно лишь cell >= 8 (порог 2×2-субсэмпла клетки, §5.2).
+/// Профиль ПОСТОЯННОЙ ЯРКОСТИ (§5.1-CL) — зеркало `psicode-tx::frames::chromatic_profile`.
+/// 2 бит/клетку: 1 бит на ось `2G−R−B`, 1 бит на ось `R−B`. Обращение делит на
+/// измеренную поклеточную сумму каналов, поэтому поле освещённости приёмника
+/// сокращается внутри клетки и не требует локального порога.
+pub fn tx_chromatic_profile() -> CalibProfile {
+    let mut p = tx_default_profile();
+    p.luma_bits = 1;
+    p.chroma_mode = ChromaMode::ConstLuma1;
+    p
+}
+
 pub fn tx_default_profile() -> CalibProfile {
     CalibProfile {
         version: CalibProfile::VERSION,
@@ -214,7 +225,18 @@ impl RxSession {
     /// `cell_px` — как рендерит tx; в демоде он сокращается, важно лишь >= 8.
     /// Значение < 8 заменяется на 12 (live tx-умолчание).
     pub fn with_cell(cell_px: u8) -> Self {
-        let mut p = tx_default_profile();
+        Self::with_cell_mode(cell_px, false)
+    }
+
+    /// То же, но с выбором семейства отображения: `chromatic = true` -> §5.1-CL
+    /// (постоянная яркость, 2 бит/клетку), иначе живой 1-битный монохром.
+    /// Должно совпадать с тем, что рендерит передатчик (`psicode-tx --chroma`).
+    pub fn with_cell_mode(cell_px: u8, chromatic: bool) -> Self {
+        let mut p = if chromatic {
+            tx_chromatic_profile()
+        } else {
+            tx_default_profile()
+        };
         p.cell_size_px = if cell_px >= 8 { cell_px } else { 12 };
         Self::new(p)
     }

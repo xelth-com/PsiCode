@@ -27,7 +27,8 @@ object PsiCodeCore {
     }
 
     /** Создать приёмник под профиль (cell_size_px из §7). Возвращает нативный handle. */
-    external fun rxInit(profileCellPx: Int): Long
+    /** @param chromatic 1 = §5.1-CL (постоянная яркость, 2 бит/клетку), 0 = моно 1 бит. */
+    external fun rxInit(profileCellPx: Int, chromatic: Int): Long
 
     /**
      * Скормить один YUV_420_888 кадр. Плоскости передаются как есть (с row padding);

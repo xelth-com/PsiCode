@@ -13,19 +13,27 @@
 //!     счётчик кадров сверху/снизу для оценки rolling-shutter). C или закрытие
 //!     окна -> консольный запрос кода профиля с телефона.
 //!
-//! psicode-tx stream <file> [--code C] [--cell N] [--smoke]
+//! psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--smoke]
 //!     Стриминг файла кадрами L3 (§6.1/§6.2). Профиль: --code, иначе
 //!     psicode-tx.profile из cwd, иначе эталон §6/§7.4. Цикл бесконечен, Esc — выход.
 //!
-//! psicode-tx single [--counter N] [--cell N] [--smoke]
+//! psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]
 //!     Один статический кадр с детерминированной псевдослучайной нагрузкой —
 //!     навести камеру, проверить детекцию ЗЧ на живом экране.
 //! ```
 //!
 //! `--cell N` подменяет размер клетки для ПОКАЗА (см. `frames::Streamer::render`:
 //! `cell_size_px` профиля — то, что предполагает ПРИЁМНИК; на экране мы рисуем
-//! 1 display-px на Frame-px, умноженный на целочисленный зум окна). `--smoke`
-//! автозакрывает окно после ~20 кадров (для CI и быстрой проверки).
+//! 1 display-px на Frame-px, умноженный на целочисленный зум окна).
+//!
+//! `--chroma` переводит профиль в семейство ПОСТОЯННОЙ ЯРКОСТИ (§5.1-CL,
+//! `ChromaMode::ConstLuma1` + 1 бит действительной оси = 2 бит/клетку):
+//! комплексный символ живёт целиком в ЦВЕТНОСТИ при постоянной сумме R+G+B, и
+//! поле освещённости приёмника сокращается в поклеточном отношении каналов.
+//! Флаг применяется ПОВЕРХ разрешённого профиля (--code / файл / эталон), то
+//! есть меняет только отображение цвета, не трогая геометрию и тайминг.
+//!
+//! `--smoke` автозакрывает окно после ~20 кадров (для CI и быстрой проверки).
 //!
 //! # Тайминг (§6.3) — предупреждение
 //!
@@ -42,8 +50,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use frames::{
-    calibration_counter_frame, calibration_frame, reference_profile, single_frame, RgbFrame,
-    Streamer, SYMBOLS_PER_FRAME,
+    calibration_counter_frame, calibration_frame, chromatic_profile, reference_profile,
+    single_frame, to_const_luma, RgbFrame, Streamer, SYMBOLS_PER_FRAME,
 };
 use psicode_core::CalibProfile;
 
@@ -80,8 +88,8 @@ fn main() {
 /// Разобранная команда CLI.
 enum Command {
     Calibrate { cell: usize, smoke: bool },
-    Stream { file: String, code: Option<String>, cell: Option<usize>, smoke: bool },
-    Single { counter: u8, cell: Option<usize>, smoke: bool },
+    Stream { file: String, code: Option<String>, cell: Option<usize>, chroma: bool, smoke: bool },
+    Single { counter: u8, cell: Option<usize>, chroma: bool, smoke: bool },
 }
 
 fn print_usage() {
@@ -90,8 +98,11 @@ fn print_usage() {
          \n\
          Использование:\n\
          \x20 psicode-tx calibrate [--cell N] [--smoke]\n\
-         \x20 psicode-tx stream <file> [--code C] [--cell N] [--smoke]\n\
-         \x20 psicode-tx single [--counter N] [--cell N] [--smoke]\n"
+         \x20 psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--smoke]\n\
+         \x20 psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]\n\
+         \n\
+         \x20 --chroma: отображение ПОСТОЯННОЙ ЯРКОСТИ §5.1-CL (ConstLuma1,\n\
+         \x20           2 бит/клетку) — символ целиком в цветности, R+G+B ≡ const.\n"
     );
 }
 
@@ -102,6 +113,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut cell: Option<usize> = None;
     let mut code: Option<String> = None;
     let mut counter: u8 = 0;
+    let mut chroma = false;
     let mut smoke = false;
     let mut positional: Vec<String> = Vec::new();
 
@@ -123,6 +135,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 let n: u64 = v.parse().map_err(|_| format!("--counter: не число: {v}"))?;
                 counter = (n & 0xFF) as u8;
                 i += 2;
+            }
+            "--chroma" => {
+                chroma = true;
+                i += 1;
             }
             "--smoke" => {
                 smoke = true;
@@ -148,9 +164,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 .into_iter()
                 .next()
                 .ok_or("stream требует <file>")?;
-            Ok(Command::Stream { file, code, cell, smoke })
+            Ok(Command::Stream { file, code, cell, chroma, smoke })
         }
-        "single" => Ok(Command::Single { counter, cell, smoke }),
+        "single" => Ok(Command::Single { counter, cell, chroma, smoke }),
         other => Err(format!("неизвестный режим: {other}")),
     }
 }
@@ -162,8 +178,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 fn run(cmd: Command) {
     match cmd {
         Command::Calibrate { cell, smoke } => run_calibrate(cell, smoke),
-        Command::Stream { file, code, cell, smoke } => run_stream(file, code, cell, smoke),
-        Command::Single { counter, cell, smoke } => run_single(counter, cell, smoke),
+        Command::Stream { file, code, cell, chroma, smoke } => {
+            run_stream(file, code, cell, chroma, smoke)
+        }
+        Command::Single { counter, cell, chroma, smoke } => {
+            run_single(counter, cell, chroma, smoke)
+        }
     }
 }
 
@@ -187,7 +207,13 @@ fn run_calibrate(cell: usize, smoke: bool) {
     }
 }
 
-fn run_stream(file: String, code: Option<String>, cell: Option<usize>, smoke: bool) {
+fn run_stream(
+    file: String,
+    code: Option<String>,
+    cell: Option<usize>,
+    chroma: bool,
+    smoke: bool,
+) {
     let bytes = match std::fs::read(&file) {
         Ok(b) => b,
         Err(e) => {
@@ -200,7 +226,7 @@ fn run_stream(file: String, code: Option<String>, cell: Option<usize>, smoke: bo
         std::process::exit(1);
     }
 
-    let profile = resolve_profile(code.as_deref());
+    let profile = apply_chroma(resolve_profile(code.as_deref()), chroma);
     let session_id = make_session_id();
     let streamer = Streamer::new(&bytes, profile, session_id);
     let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
@@ -244,8 +270,12 @@ fn run_stream(file: String, code: Option<String>, cell: Option<usize>, smoke: bo
     }
 }
 
-fn run_single(counter: u8, cell: Option<usize>, smoke: bool) {
-    let profile = reference_profile();
+fn run_single(counter: u8, cell: Option<usize>, chroma: bool, smoke: bool) {
+    let profile = if chroma {
+        announce_const_luma(chromatic_profile())
+    } else {
+        reference_profile()
+    };
     let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
     println!("psicode-tx single — статический кадр, counter={counter}, cell={display_cell} px. Esc — выход.");
     let source = single_frame(&profile, counter, Some(display_cell));
@@ -260,6 +290,30 @@ fn run_single(counter: u8, cell: Option<usize>, smoke: bool) {
 /// Сторона квадрата калибровочного паттерна в px: 61·cell.
 fn frames_grid_side(cell: usize) -> usize {
     61 * cell
+}
+
+/// `--chroma`: перевести профиль в режим постоянной яркости §5.1-CL. Флаг
+/// применяется ПОВЕРХ разрешённого профиля, поэтому меняет только отображение
+/// цвета (и bits_per_cell), не трогая геометрию/тайминг/FEC.
+fn apply_chroma(p: CalibProfile, chroma: bool) -> CalibProfile {
+    if chroma {
+        announce_const_luma(to_const_luma(p))
+    } else {
+        p
+    }
+}
+
+/// Печать того, что именно сделал `--chroma` (профиль возвращается как есть).
+fn announce_const_luma(p: CalibProfile) -> CalibProfile {
+    println!(
+        "--chroma: отображение §5.1-CL {:?} — Re на оси 2G−R−B ({} бит), Im на оси R−B ({} бит), \
+         R+G+B ≡ const, всего {} бит/клетку",
+        p.chroma_mode,
+        p.luma_bits,
+        p.chroma_bits(),
+        p.luma_bits as u32 + p.chroma_bits() as u32,
+    );
+    p
 }
 
 /// Профиль для стриминга: --code -> файл psicode-tx.profile -> эталон §6/§7.4.

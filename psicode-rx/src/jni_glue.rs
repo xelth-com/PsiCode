@@ -30,6 +30,7 @@ pub extern "system" fn Java_com_xelth_psicode_PsiCodeCore_rxInit<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     profile_cell_px: jint,
+    chromatic: jint,
 ) -> jlong {
     catch_unwind(|| {
         let cell = if (8..256).contains(&profile_cell_px) {
@@ -37,7 +38,7 @@ pub extern "system" fn Java_com_xelth_psicode_PsiCodeCore_rxInit<'local>(
         } else {
             12
         };
-        Box::into_raw(Box::new(RxSession::with_cell(cell))) as jlong
+        Box::into_raw(Box::new(RxSession::with_cell_mode(cell, chromatic != 0))) as jlong
     })
     .unwrap_or(0)
 }
