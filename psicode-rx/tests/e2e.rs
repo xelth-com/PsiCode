@@ -374,3 +374,104 @@ fn timing_report_1080p() {
         st.px_per_cell, st.score
     );
 }
+
+// ---------------------------------------------------------------------------
+// (e) внутриполосные КАЛИБРОВОЧНЫЕ кадры (§4-IB) в живом приёмном тракте
+// ---------------------------------------------------------------------------
+
+/// Передача с вплетёнными по расписанию удвоения калибровочными кадрами:
+/// приёмник опознаёт их ДО всякой калибровки, снимает канал, не путает с
+/// payload — и передача всё равно доходит байт-в-байт.
+#[test]
+fn inband_calibration_frames_are_recognised_and_transfer_still_completes() {
+    use psicode_core::calframe;
+
+    let mut p = tx_default_profile();
+    p.cell_size_px = 16;
+    let bpc = symbol::bits_per_cell(&p);
+    let sz_cells = symbol::GRID + 2 * p.quiet_zone_cells() as usize;
+    let sz = sz_cells * p.cell_size_px as usize;
+
+    let mut s = 0x0BAD_F00D_1234_5678u64;
+    let payload: Vec<u8> = (0..2000).map(|_| (splitmix(&mut s) >> 24) as u8).collect();
+    let checksum = crc32c(&payload);
+    let enc = FountainEncoder::new(&payload, SYMBOL_SIZE);
+    let k = enc.k();
+    let session = 0x5053_4931u32;
+
+    let frame_cap = (10 * k as usize).div_ceil(SYMBOLS_PER_FRAME) + 32;
+    let emit = emission_order(k, frame_cap + 2);
+
+    let mut rx = RxSession::new(p);
+    let mut got: Option<Vec<u8>> = None;
+    let (mut n_cal, mut n_cal_seen, mut false_pos) = (0usize, 0usize, 0usize);
+    let mut pseq = 0u64;
+    let mut stream_seq = 0u64;
+
+    while (pseq as usize) < frame_cap && got.is_none() {
+        let is_cal = calframe::is_calibration_index(stream_seq);
+        let frame = if is_cal {
+            n_cal += 1;
+            calframe::render_calibration_frame(&p, (pseq & 0xFF) as u8)
+        } else {
+            let base = pseq as usize * SYMBOLS_PER_FRAME;
+            let sym = build_symbol_bytes(&enc, &emit, base);
+            let ti = if pseq % 8 == 0 {
+                Some(TransferInfo {
+                    transfer_length: payload.len() as u64,
+                    symbol_size: SYMBOL_SIZE as u16,
+                    k,
+                    checksum,
+                })
+            } else {
+                None
+            };
+            let hdr = FrameHeader::new(session, emit[base], SYMBOLS_PER_FRAME as u8);
+            let cells = l3::build_frame(&hdr, ti.as_ref(), &sym, bpc);
+            render_symbol_counter(&p, &cells, (pseq & 0xFF) as u8)
+        };
+
+        let pl = to_yuv420(&frame.rgb, sz, sz, false);
+        let st = rx.process_frame_yuv(
+            &pl.y, &pl.u, &pl.v, sz, sz, pl.y_stride, pl.uv_stride, pl.uv_pixel_stride,
+        );
+        assert!(st.detected, "кадр потока {stream_seq}: не найдено");
+        if is_cal {
+            assert!(
+                st.calibration,
+                "калибровочный кадр {stream_seq} НЕ опознан (маркер §4-IB.2)"
+            );
+            n_cal_seen += 1;
+        } else {
+            if st.calibration {
+                false_pos += 1;
+            }
+            pseq += 1;
+        }
+        if st.done {
+            got = rx.take_result();
+        }
+        stream_seq += 1;
+    }
+
+    assert_eq!(n_cal_seen, n_cal, "опознаны не все калибровочные кадры");
+    assert_eq!(false_pos, 0, "ЛОЖНЫЕ срабатывания маркера на payload: {false_pos}");
+    assert!(n_cal >= 5, "расписание должно было дать хотя бы 5 кадров, дало {n_cal}");
+    assert_eq!(rx.state(), RxState::Done, "передача не завершилась");
+    assert_eq!(got.expect("объект"), payload, "объект не байт-точен");
+
+    // калибровка снята и жива
+    let est = rx.calibration().expect("калибровка должна быть в кэше");
+    assert!(est.ok && est.marker_rho > calframe::MARKER_RHO_MIN);
+    eprintln!(
+        "(e) §4-IB: {n_cal} калибровочных кадров из {stream_seq} потока ({:.2} %), \
+         payload {pseq} кадров, CRC-32C OK; ρ={:.3} U={:.3} невязка={:.4} σ̂={:.2} px, \
+         разброс половин={:.4}",
+        100.0 * n_cal as f64 / stream_seq as f64,
+        est.marker_rho,
+        est.uniformity,
+        est.residual,
+        est.sigma_px,
+        est.spatial_spread,
+    );
+}

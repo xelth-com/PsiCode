@@ -13,7 +13,7 @@
 //!     счётчик кадров сверху/снизу для оценки rolling-shutter). C или закрытие
 //!     окна -> консольный запрос кода профиля с телефона.
 //!
-//! psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--smoke]
+//! psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--calib] [--smoke]
 //!     Стриминг файла кадрами L3 (§6.1/§6.2). Профиль: --code, иначе
 //!     psicode-tx.profile из cwd, иначе эталон §6/§7.4. Цикл бесконечен, Esc — выход.
 //!
@@ -95,7 +95,7 @@ fn main() {
 /// Разобранная команда CLI.
 enum Command {
     Calibrate { cell: usize, smoke: bool },
-    Stream { file: String, code: Option<String>, cell: Option<usize>, chroma: bool, smoke: bool },
+    Stream { file: String, code: Option<String>, cell: Option<usize>, chroma: bool, calib: bool, smoke: bool },
     Single { counter: u8, cell: Option<usize>, chroma: bool, smoke: bool },
     Swatch { n: usize, sweep: bool, cell: Option<usize>, smoke: bool },
 }
@@ -106,7 +106,7 @@ fn print_usage() {
          \n\
          Использование:\n\
          \x20 psicode-tx calibrate [--cell N] [--smoke]\n\
-         \x20 psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--smoke]\n\
+         \x20 psicode-tx stream <file> [--code C] [--cell N] [--chroma] [--calib] [--smoke]\n\
          \x20 psicode-tx single [--counter N] [--cell N] [--chroma] [--smoke]\n\
          \x20 psicode-tx swatch [--n 1..16] [--sweep] [--cell N] [--smoke]\n\
          \n\
@@ -114,7 +114,12 @@ fn print_usage() {
          \x20           блоков вместо payload; --sweep даёт плотную развёртку всей\n\
          \x20           плоскости цветности за 256 кадров.\n\
          \x20 --chroma: отображение ПОСТОЯННОЙ ЯРКОСТИ §5.1-CL (ConstLuma1,\n\
-         \x20           2 бит/клетку) — символ целиком в цветности, R+G+B ≡ const.\n"
+         \x20           2 бит/клетку) — символ целиком в цветности, R+G+B ≡ const.\n\
+         \x20 --calib:  вплетать ВНУТРИПОЛОСНЫЕ калибровочные кадры §4-IB по\n\
+         \x20           расписанию удвоения 0,1,2,4,...,128 и далее каждые 128\n\
+         \x20           (0.78 % в установившемся режиме). Приёмник снимает с них\n\
+         \x20           матрицу 3×3, гамму и σ блюра вместо односкеточной\n\
+         \x20           референсной строки §3.4.\n"
     );
 }
 
@@ -126,6 +131,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut code: Option<String> = None;
     let mut counter: u8 = 0;
     let mut chroma = false;
+    let mut calib = false;
     let mut smoke = false;
     let mut n = 1usize;
     let mut sweep = false;
@@ -170,6 +176,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 chroma = true;
                 i += 1;
             }
+            "--calib" => {
+                calib = true;
+                i += 1;
+            }
             "--smoke" => {
                 smoke = true;
                 i += 1;
@@ -194,7 +204,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 .into_iter()
                 .next()
                 .ok_or("stream требует <file>")?;
-            Ok(Command::Stream { file, code, cell, chroma, smoke })
+            Ok(Command::Stream { file, code, cell, chroma, calib, smoke })
         }
         "single" => Ok(Command::Single { counter, cell, chroma, smoke }),
         "swatch" => Ok(Command::Swatch { n, sweep, cell, smoke }),
@@ -209,8 +219,8 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 fn run(cmd: Command) {
     match cmd {
         Command::Calibrate { cell, smoke } => run_calibrate(cell, smoke),
-        Command::Stream { file, code, cell, chroma, smoke } => {
-            run_stream(file, code, cell, chroma, smoke)
+        Command::Stream { file, code, cell, chroma, calib, smoke } => {
+            run_stream(file, code, cell, chroma, calib, smoke)
         }
         Command::Single { counter, cell, chroma, smoke } => {
             run_single(counter, cell, chroma, smoke)
@@ -239,11 +249,13 @@ fn run_calibrate(cell: usize, smoke: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_stream(
     file: String,
     code: Option<String>,
     cell: Option<usize>,
     chroma: bool,
+    calib: bool,
     smoke: bool,
 ) {
     let bytes = match std::fs::read(&file) {
@@ -260,7 +272,7 @@ fn run_stream(
 
     let profile = apply_chroma(resolve_profile(code.as_deref()), chroma);
     let session_id = make_session_id();
-    let streamer = Streamer::new(&bytes, profile, session_id);
+    let streamer = Streamer::new(&bytes, profile, session_id).with_calibration(calib);
     let display_cell = cell.unwrap_or(profile.cell_size_px as usize).max(1);
 
     // Печать «на старте» (§8): K, symbol_size, кадров/проход, оценка goodput.
@@ -283,6 +295,18 @@ fn run_stream(
         SYMBOLS_PER_FRAME,
         streamer.frames_per_pass(),
     );
+    if streamer.calibration_enabled() {
+        // §4-IB.3: расписание удвоения. Печатаем ФАКТИЧЕСКИЕ накладные расходы
+        // на длине этой передачи, а не только асимптоту.
+        use psicode_core::calframe;
+        let n = (streamer.frames_per_pass() as u64).max(1);
+        println!(
+            "калибровочные кадры §4-IB: ВКЛ (0,1,2,4,...,128 далее каждые 128); накладные расходы {:.2} % на первых {n} кадрах (расписание front-loaded: 8 кадров до 128-го), {:.2} % в установившемся режиме; худшее ожидание позднего приёмника {} кадров",
+            100.0 * streamer.calibration_overhead(n),
+            100.0 / calframe::CALIB_PERIOD as f64,
+            calframe::worst_join_wait(4 * calframe::CALIB_PERIOD),
+        );
+    }
     // goodput при 60 Гц как baseline (уточняется по факту в resumed()).
     let est60 = goodput_kbps(bytes.len(), streamer.frames_per_pass(), profile.frame_hold_periods, 60.0);
     println!("оценка goodput @60 Гц: {est60:.1} kbit/s (уточняется по частоте монитора); Esc — выход.");

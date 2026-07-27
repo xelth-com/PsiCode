@@ -21,10 +21,13 @@
 
 use std::collections::HashMap;
 
+use psicode_core::calframe::{self, CalibCache};
 use psicode_core::detect::{detect_symbol_acquire, frame_map, track_symbol, Detection};
 use psicode_core::fountain::FountainDecoder;
 use psicode_core::l3::{self, FrameHeader, ParsedFrame};
-use psicode_core::symbol::{self, demod_symbol, demod_symbol_local, read_counters};
+use psicode_core::symbol::{
+    self, demod_symbol, demod_symbol_local, demod_symbol_matrix, read_counters,
+};
 use psicode_core::tone;
 use psicode_core::{CalibProfile, ChromaMode};
 
@@ -132,6 +135,13 @@ pub struct FrameStatus {
     pub done: bool,
     /// Совпал ли CRC-32C собранного объекта (§6.2).
     pub crc_ok: bool,
+    /// Кадр опознан как ВНУТРИПОЛОСНЫЙ КАЛИБРОВОЧНЫЙ (§4-IB) — данных не несёт.
+    pub calibration: bool,
+    /// Возраст кэша калибровки в кадрах (0, если только что обновлён).
+    pub calib_age: u32,
+    /// Кэш калибровки устарел (по возрасту или по деградации декодирования):
+    /// приёмник ЖДЁТ следующего запланированного калибровочного кадра.
+    pub calib_stale: bool,
 }
 
 impl FrameStatus {
@@ -148,6 +158,9 @@ impl FrameStatus {
             symbols_have,
             done: state == RxState::Done,
             crc_ok: state == RxState::Done,
+            calibration: false,
+            calib_age: 0,
+            calib_stale: true,
         }
     }
 
@@ -156,7 +169,7 @@ impl FrameStatus {
         format!(
             "{{\"detected\":{},\"score\":{:.4},\"rotation\":{},\"px_per_cell\":{:.2},\
              \"stripes_ok\":{},\"symbols_new\":{},\"k\":{},\"symbols_have\":{},\
-             \"done\":{},\"crc_ok\":{}}}",
+             \"done\":{},\"crc_ok\":{},\"calibration\":{},\"calib_age\":{},\"calib_stale\":{}}}",
             self.detected,
             self.score,
             self.rotation,
@@ -167,6 +180,9 @@ impl FrameStatus {
             self.symbols_have,
             self.done,
             self.crc_ok,
+            self.calibration,
+            self.calib_age,
+            self.calib_stale,
         )
     }
 }
@@ -199,6 +215,13 @@ pub struct RxSession {
     state: RxState,
     /// Собранный объект (ждёт `take_result`).
     result: Option<Vec<u8>>,
+    /// Кэш калибровки по внутриполосным калибровочным кадрам (§4-IB.4).
+    /// Пока он валиден, §3.4 берётся ОТТУДА, а односкеточная референсная строка
+    /// снимка не читается вовсе.
+    calib: CalibCache,
+    /// Обрабатывать ли внутриполосные калибровочные кадры (§4-IB). Включено;
+    /// путь v0 при пустом/устаревшем кэше остаётся байт-в-байт прежним.
+    use_calib: bool,
 }
 
 impl RxSession {
@@ -218,7 +241,20 @@ impl RxSession {
             cum: [0usize; 9],
             state: RxState::Searching,
             result: None,
+            calib: CalibCache::new(),
+            use_calib: true,
         }
+    }
+
+    /// Включить/выключить обработку внутриполосных калибровочных кадров (§4-IB).
+    /// Выключение возвращает приёмник РОВНО на путь v0 (референсная строка §3.4).
+    pub fn set_use_calibration_frames(&mut self, on: bool) {
+        self.use_calib = on;
+    }
+
+    /// Действующая калибровка канала (`None` — нет или устарела).
+    pub fn calibration(&self) -> Option<&psicode_core::calframe::CalibEstimate> {
+        self.calib.get()
     }
 
     /// Новая сессия с профилем tx по умолчанию и заданным display-размером клетки.
@@ -356,13 +392,46 @@ impl RxSession {
         // держит бюджет: ~тысячи сэмплов/кадр вместо гаммы по всем 2M пикселям.
         let raw_sample = |x: f64, y: f64| -> [f32; 3] { bilinear_rgb(&yf, x, y) };
 
-        // тон-гамма: оценка на первом локе, дальше кэш (сброшен при потере лока).
+        // --- внутриполосный КАЛИБРОВОЧНЫЙ кадр (§4-IB)? ---
+        // Проверка идёт ДО демодуляции и до всякой калибровки: маркер бинарный,
+        // luma-only и снимается со второй разности по вертикали (§4-IB.2),
+        // поэтому не требует ни гаммы, ни развязки каналов.
+        if self.use_calib && calframe::is_calibration_frame(&self.profile, &map, &raw_sample) {
+            let est = calframe::estimate_from_frame(&self.profile, &map, &raw_sample);
+            if est.ok {
+                // калибровка перекрывает и тон-гамму: 5 КРУПНЫХ нейтральных
+                // плиток против 8 односкеточных клеток референсной строки.
+                self.gammas = Some(est.gammas);
+            }
+            self.calib.accept(est);
+            self.last_detection = Some(det);
+            let (k, have) = self.progress();
+            return FrameStatus {
+                detected: true,
+                score: det_score,
+                rotation: det_rotation,
+                px_per_cell,
+                stripes_ok: 0,
+                symbols_new: 0,
+                k,
+                symbols_have: have,
+                done: self.state == RxState::Done,
+                crc_ok: self.state == RxState::Done,
+                calibration: true,
+                calib_age: 0,
+                calib_stale: self.calib.stale(),
+            };
+        }
+
+        // Тон-гамма: оценка на первом локе, дальше кэш (сброшен при потере лока).
+        // Живая калибровка §4-IB переживает потерю лока — она свойство пары
+        // «дисплей+камера», а не геометрии, — поэтому после ре-лока гамма
+        // берётся из неё, а не переоценивается по референсной строке.
         if self.gammas.is_none() {
-            self.gammas = Some(tone::estimate_channel_gammas(
-                &self.profile,
-                &map,
-                &raw_sample,
-            ));
+            self.gammas = Some(match self.calib.get() {
+                Some(est) => est.gammas,
+                None => tone::estimate_channel_gammas(&self.profile, &map, &raw_sample),
+            });
         }
         let cg = self.gammas.unwrap_or([tone::DEFAULT_GAMMA; 3]);
         let cgf = [cg[0] as f32, cg[1] as f32, cg[2] as f32];
@@ -381,8 +450,15 @@ impl RxSession {
         // против глобального порога, т.к. фон яркости гуляет 0.62..0.86 по кадру.
         // Порог монотонен -> берём СЫРОЙ зелёный (raw_sample), гамма не нужна.
         // Прочие режимы (многоуровневая яркость/хрома) — прежний demod_symbol.
+        // Многоуровневые/хромо-режимы: если кэш калибровки (§4-IB.4) жив, берём
+        // матрицу развязки §3.4 ИЗ НЕГО и НЕ читаем односкеточную референсную
+        // строку снимка вовсе. Устарел — молча падаем на путь v0 и ждём
+        // следующего запланированного калибровочного кадра (обратного канала
+        // нет, запрашивать нечего).
         let cells_rx = if self.profile.luma_bits == 1 && self.profile.chroma_bits() == 0 {
             demod_symbol_local(&self.profile, &map, &raw_sample)
+        } else if let Some(est) = self.calib.get() {
+            demod_symbol_matrix(&self.profile, &map, &lin_sample, &est.matrix)
         } else {
             demod_symbol(&self.profile, &map, &lin_sample)
         };
@@ -414,6 +490,11 @@ impl RxSession {
         // сохраняем геометрию (в УМЕНЬШЕННЫХ координатах) для трекинга следующего кадра.
         self.last_detection = Some(det);
 
+        // Контроль устаревания (§4-IB.4): возраст +1 и EWMA доли валидных
+        // страйпов. Просевшее здоровье = сигнал «канал уехал», и приёмник просто
+        // ЖДЁТ ближайшего калибровочного кадра расписания.
+        self.calib.observe_payload(stripes_ok, 8);
+
         let (k, have) = self.progress();
         FrameStatus {
             detected: true,
@@ -426,6 +507,9 @@ impl RxSession {
             symbols_have: have,
             done: self.state == RxState::Done,
             crc_ok: self.state == RxState::Done,
+            calibration: false,
+            calib_age: self.calib.age().min(u32::MAX as u64) as u32,
+            calib_stale: self.calib.stale(),
         }
     }
 

@@ -267,11 +267,6 @@ fn demod_symbol_inner(
     want_matrix: bool,
 ) -> Vec<u8> {
     let (black_255, white_255) = levels(p);
-    let quiet = p.quiet_zone_cells() as usize;
-    let cell = p.cell_size_px as usize;
-    // GreenOnly и Mono несут chroma_bits=0, поэтому Im-ветка отключается сама
-    // собой; выбор семейства §5.1 / §5.1-CL инкапсулирован в CellCodec.
-    let codec = CellCodec::new(p, black_255, white_255);
     let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
     let solve = ChannelSolve::from_reference_row(
         p,
@@ -282,6 +277,26 @@ fn demod_symbol_inner(
         sample,
         want_matrix,
     );
+    demod_with_solve(p, map, sample, &solve, &gammas)
+}
+
+/// Демодуляция payload-сетки при УЖЕ решённой цветокоррекции §3.4. Вынесена из
+/// [`demod_symbol_inner`], чтобы источником матрицы могла быть не только
+/// референсная строка, но и внутриполосный калибровочный кадр
+/// ([`crate::calframe`]) — путь v0 при этом остаётся байт-в-байт прежним.
+fn demod_with_solve(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    solve: &ChannelSolve,
+    gammas: &[f64; 3],
+) -> Vec<u8> {
+    let (black_255, white_255) = levels(p);
+    let quiet = p.quiet_zone_cells() as usize;
+    let cell = p.cell_size_px as usize;
+    // GreenOnly и Mono несут chroma_bits=0, поэтому Im-ветка отключается сама
+    // собой; выбор семейства §5.1 / §5.1-CL инкапсулирован в CellCodec.
+    let codec = CellCodec::new(p, black_255, white_255);
 
     // --- демодуляция payload-клеток ---
     let mut out = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
@@ -290,10 +305,139 @@ fn demod_symbol_inner(
         for pc in 0..PAYLOAD_COLS {
             let cx = RING + pc;
             let s = sample_cell(quiet, cell, cx, cy, map, sample);
-            out[pr * PAYLOAD_COLS + pc] = codec.decode(solve.drive(s, &gammas));
+            out[pr * PAYLOAD_COLS + pc] = codec.decode(solve.drive(s, gammas));
         }
     }
     out
+}
+
+/// Полная развязка каналов §3.4 как ОТДЕЛЬНАЯ величина: `t̂ = N·s + q`, где
+/// `s` — измеренный линеаризованный RGB клетки, `t_c = (d_c/255)^γ_c`.
+///
+/// Существует, чтобы матрицу можно было ОЦЕНИТЬ ОДИН РАЗ (по внутриполосному
+/// калибровочному кадру, [`crate::calframe`]) и переиспользовать на десятках
+/// последующих payload-кадров, вместо переоценки по односкеточной референсной
+/// строке §3.4 на каждом кадре.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelMatrix {
+    /// Матрица развязки 3×3 (строка = выходной канал).
+    pub n: [[f64; 3]; 3],
+    /// Смещение (чёрный уровень / вуаль), на выходной канал.
+    pub q: [f64; 3],
+}
+
+impl ChannelMatrix {
+    /// Единичная матрица без смещения (нейтральный элемент).
+    pub fn identity() -> Self {
+        ChannelMatrix {
+            n: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            q: [0.0; 3],
+        }
+    }
+
+    /// Измеренный линеаризованный RGB клетки -> drive 0..255 на канал.
+    pub fn drive(&self, s: [f64; 3], gammas: &[f64; 3]) -> [f64; 3] {
+        ChannelSolve::Matrix {
+            n: self.n,
+            q: self.q,
+        }
+        .drive(s, gammas)
+    }
+
+    /// Линеаризованный drive `t̂ = N·s + q` (без обращения гаммы).
+    pub fn apply(&self, s: [f64; 3]) -> [f64; 3] {
+        let mut t = [0.0f64; 3];
+        for c in 0..3 {
+            t[c] = self.n[c][0] * s[0] + self.n[c][1] * s[1] + self.n[c][2] * s[2] + self.q[c];
+        }
+        t
+    }
+
+    /// Относительная невязка Фробениуса к эталонной матрице: `‖N̂−N‖_F/‖N‖_F`.
+    /// Метрика A/B-сравнения источников калибровки (смещение `q` не входит: оно
+    /// поглощает чёрный уровень и меряется отдельно).
+    pub fn frobenius_rel_error(&self, truth: &ChannelMatrix) -> f64 {
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for c in 0..3 {
+            for j in 0..3 {
+                let d = self.n[c][j] - truth.n[c][j];
+                num += d * d;
+                den += truth.n[c][j] * truth.n[c][j];
+            }
+        }
+        if den <= 0.0 {
+            0.0
+        } else {
+            (num / den).sqrt()
+        }
+    }
+
+    /// Ошибка ФОРМЫ смешивания: `min_α ‖α·N̂ − N‖_F / ‖N‖_F`.
+    ///
+    /// Почему именно она — основная метрика A/B: ОБЩИЙ скалярный множитель у
+    /// матрицы физически не наблюдаем и операционно безвреден. Поле
+    /// освещённости входит в снимок мультипликативно и ОДИНАКОВО во все три
+    /// канала, поэтому любая оценка `N` по патчам несёт множитель `1/f̄` со
+    /// средним полем `f̄` в местах патчей. Демодулятор §5.1-CL делит на
+    /// ИЗМЕРЕННУЮ поклеточную сумму каналов, и этот множитель сокращается
+    /// ТОЧНО; в яркостном семействе §5.1 масштаб задают якоря K/W, а не
+    /// матрица. Вредна только СМЕСЬ каналов — её и меряем.
+    pub fn shape_rel_error(&self, truth: &ChannelMatrix) -> f64 {
+        let mut dot = 0.0;
+        let mut self_sq = 0.0;
+        let mut den = 0.0;
+        for c in 0..3 {
+            for j in 0..3 {
+                dot += self.n[c][j] * truth.n[c][j];
+                self_sq += self.n[c][j] * self.n[c][j];
+                den += truth.n[c][j] * truth.n[c][j];
+            }
+        }
+        if den <= 0.0 || self_sq <= 0.0 {
+            return f64::INFINITY;
+        }
+        let alpha = dot / self_sq;
+        let mut num = 0.0;
+        for c in 0..3 {
+            for j in 0..3 {
+                let d = alpha * self.n[c][j] - truth.n[c][j];
+                num += d * d;
+            }
+        }
+        (num / den).sqrt()
+    }
+}
+
+/// Демодуляция payload-сетки с ВНЕШНЕЙ матрицей развязки §3.4 (из
+/// калибровочного кадра). Референсная строка снимка при этом НЕ читается —
+/// именно ради этого калибровочные кадры и существуют.
+pub fn demod_symbol_matrix(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    m: &ChannelMatrix,
+) -> Vec<u8> {
+    let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    let solve = ChannelSolve::Matrix { n: m.n, q: m.q };
+    demod_with_solve(p, map, sample, &solve, &gammas)
+}
+
+/// Оценка матрицы развязки §3.4 ПО РЕФЕРЕНСНОЙ СТРОКЕ — тот же МНК, что внутри
+/// [`demod_symbol`], но как самостоятельная величина. Нужна для head-to-head
+/// сравнения «референсная строка против калибровочного кадра» (см.
+/// `psicode-core/examples/calib_ab.rs`). `None` — система вырождена.
+pub fn estimate_matrix_reference_row(
+    p: &CalibProfile,
+    gammas: &[f64; 3],
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+) -> Option<ChannelMatrix> {
+    let (black_255, white_255) = levels(p);
+    match ChannelSolve::from_reference_row(p, black_255, white_255, gammas, map, sample, true) {
+        ChannelSolve::Matrix { n, q } => Some(ChannelMatrix { n, q }),
+        ChannelSolve::PerChannel { .. } => None,
+    }
 }
 
 /// Обращение сенсорной модели §3.4: измеренный линеаризованный RGB клетки ->
@@ -438,7 +582,7 @@ impl ChannelSolve {
 /// Решает нормальные уравнения `AᵀA · x_c = AᵀB_c` для трёх выходных каналов
 /// сразу (гаусс с выбором ведущего элемента) и раскладывает решение в матрицу
 /// 3×3 плюс смещение. `None` — система вырождена (не хватило разных цветов).
-fn solve4x3(ata: &[[f64; 4]; 4], atb: &[[f64; 3]; 4]) -> Option<([[f64; 3]; 3], [f64; 3])> {
+pub(crate) fn solve4x3(ata: &[[f64; 4]; 4], atb: &[[f64; 3]; 4]) -> Option<([[f64; 3]; 3], [f64; 3])> {
     // расширенная матрица [AᵀA | AᵀB] размера 4×7
     let mut m = [[0.0f64; 7]; 4];
     for i in 0..4 {
@@ -592,7 +736,7 @@ fn box_mean(src: &[f64], n: usize, rad: i32) -> Vec<f64> {
 // ---------------------------------------------------------------------------
 
 /// Drive-значения чёрного и белого уровней (§5.1): (black_255, white_255).
-fn levels(p: &CalibProfile) -> (u8, u8) {
+pub(crate) fn levels(p: &CalibProfile) -> (u8, u8) {
     let white_255 = (255.0 * p.white_level_pct() as f64 / 100.0)
         .round()
         .clamp(0.0, 255.0) as u8;
@@ -882,7 +1026,7 @@ pub fn read_counters(
 
 /// Сэмплирует клетку (cx, cy) символа: центр, либо среднее 2×2 субсэмплов
 /// в центр ± cell/4 при cell ≥ 8 (§5.2 MUST). Возвращает сенсорный RGB.
-fn sample_cell(
+pub(crate) fn sample_cell(
     quiet: usize,
     cell: usize,
     cx: usize,

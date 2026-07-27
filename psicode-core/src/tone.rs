@@ -103,7 +103,26 @@ pub fn estimate_channel_gammas(
             e.1[c] /= e.2 as f64;
         }
     }
+    let pts: Vec<(f64, [f64; 3])> = levels.iter().map(|e| (e.0, e.1)).collect();
     let gprof = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    fit_linearisation_gamma(&pts, &gprof)
+}
+
+/// Ядро оценки пер-канальной гаммы ЛИНЕАРИЗАЦИИ по нейтральной лесенке.
+///
+/// `levels` — точки `(drive01, сырой RGB)`, ОТСОРТИРОВАННЫЕ по drive и уже
+/// усреднённые по повторам; `gprof` — гаммы профиля (что ждёт демодулятор).
+/// Возвращает `[γr, γg, γb]`: показатель, которым надо возвести СЫРОЙ отсчёт,
+/// чтобы получить линейный свет.
+///
+/// Вынесено из [`estimate_channel_gammas`] без изменения поведения, чтобы
+/// внутриполосный калибровочный кадр ([`crate::calframe`]) считал гамму ТЕМ ЖЕ
+/// оценщиком, но по КРУПНЫМ нейтральным плиткам, а не по односкеточной
+/// референсной строке §3.4 — иначе head-to-head сравнивал бы и оценщики тоже.
+pub fn fit_linearisation_gamma(levels: &[(f64, [f64; 3])], gprof: &[f64; 3]) -> [f64; 3] {
+    if levels.len() < 3 {
+        return [DEFAULT_GAMMA; 3];
+    }
     let mut out = [DEFAULT_GAMMA; 3];
     // Крайние уровни (чёрный/белый) — якоря a,b, как у демодулятора (§3.4).
     let (dk, sk_all) = (levels[0].0, levels[0].1);
@@ -126,7 +145,7 @@ pub fn estimate_channel_gammas(
                 let b = sk - a * xk;
                 if a.abs() > 1e-12 {
                     let mut res = 0.0;
-                    for e in &levels {
+                    for e in levels {
                         let s = e.1[c].max(1e-6).powf(g);
                         let base = ((s - b) / a).max(0.0);
                         let dhat = base.powf(1.0 / gp);

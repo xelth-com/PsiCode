@@ -117,6 +117,8 @@ class MainActivity : AppCompatActivity() {
     private var uBytes = ByteArray(0)
     private var vBytes = ByteArray(0)
     private var dumpCount = 0 // отладка: дамп кадров в filesDir
+    /** `--ez dumpraw true`: дампить кадры без ожидания лока (калибровочные кадры). */
+    private val dumpRaw: Boolean by lazy { intent?.getBooleanExtra("dumpraw", false) == true }
     private var procCount = 0 // счётчик обработанных кадров (дампим после сходимости 3A)
     @Volatile private var saved = false
 
@@ -610,7 +612,11 @@ class MainActivity : AppCompatActivity() {
             )
             // отладка: дамп первых двух кадров С ХОРОШО ОТТРЕКАННОЙ геометрией
             // (score >= 0.99 => фокус и лок уже устоялись), пуллятся через run-as
-            if (dumpCount < DUMP_MAX && json.contains("\"score\":0.9")) {
+            // `--ez dumpraw true` — дампить БЕЗУСЛОВНО, не дожидаясь лока. Нужно для
+            // калибровочных кадров с плоской нагрузкой (swatch): там внутри символа
+            // нет градиентной энергии, карта активности его не находит, и захват,
+            // завязанный на score, невозможен в принципе. Поиск делается офлайн.
+            if (dumpCount < DUMP_MAX && (dumpRaw || json.contains("\"score\":0.9"))) {
                 try {
                     val i = dumpCount
                     java.io.File(filesDir, "dump$i.meta").writeText(

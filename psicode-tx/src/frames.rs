@@ -8,6 +8,10 @@
 //!   16-битный счётчик кадров, продублированный сверху и снизу окна (измерение
 //!   рвущихся кадров rolling-shutter).
 //! * [`Streamer`] — поток кадров L3 файла (§6.1/§6.2), эталонная раскладка ниже.
+//!   Опционально ([`Streamer::with_calibration`]) вплетает ВНУТРИПОЛОСНЫЕ
+//!   калибровочные кадры (§4-IB, [`psicode_core::calframe`]) по расписанию
+//!   удвоения 0,1,2,4,...,128 и далее каждые 128 — установившиеся накладные
+//!   расходы 1/128 = 0.78 %.
 //! * [`single_frame`] — один статический кадр с детерминированной псевдослучайной
 //!   нагрузкой (навести камеру, проверить детекцию ЗЧ на живом экране).
 //!
@@ -29,6 +33,7 @@
 //! (transfer.rs округляет вниз до 140 вручную — оба варианта валидны; здесь берём
 //! максимальный floor, чтобы не терять ёмкость).
 
+use psicode_core::calframe;
 use psicode_core::calibrate;
 use psicode_core::fountain::{crc32c, FountainEncoder};
 use psicode_core::l3::{self, FrameHeader, TransferInfo};
@@ -265,6 +270,15 @@ pub fn swatch_frame(
 // Стриминг файла (§6.1/§6.2)
 // ---------------------------------------------------------------------------
 
+/// Кадр потока: полезная нагрузка или внутриполосная калибровка (§4-IB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Обычный payload-кадр; `seq` — его номер В ПОТОКЕ PAYLOAD (§6.3).
+    Payload(u64),
+    /// Внутриполосный калибровочный кадр (§4-IB): данных не несёт.
+    Calibration,
+}
+
 /// Поток кадров L3 для передачи файла (§6.1/§6.2). Тракт как в
 /// psicode-sim/transfer.rs, но symbol_size обобщён на любой `bpc` (см. модульдок)
 /// и поток ESI бесконечен (§6.1: «цикл символов до остановки»).
@@ -282,6 +296,10 @@ pub struct Streamer {
     /// Первый repair-ESI ПОСЛЕ систематического прохода.
     next_repair: u32,
     frames_per_pass: usize,
+    /// Вплетать ли внутриполосные калибровочные кадры (§4-IB.3). Выключено по
+    /// умолчанию: боевой путь v0 (две байт-точных живых передачи) обязан
+    /// остаться байт-в-байт прежним, калибровочные кадры — ДОБАВКА и опция.
+    calib: bool,
 }
 
 impl Streamer {
@@ -306,6 +324,53 @@ impl Streamer {
             pass,
             next_repair,
             frames_per_pass,
+            calib: false,
+        }
+    }
+
+    /// Включает внутриполосные калибровочные кадры по расписанию удвоения
+    /// (§4-IB.3): 0, 1, 2, 4, 8, ..., 128, далее каждые 128.
+    ///
+    /// Номер кадра ПОТОКА при этом расходится с номером payload-кадра: индексы
+    /// расписания «съедаются» калибровкой, а payload идёт дальше без пропусков
+    /// (см. [`Streamer::payload_seq`]). Приёмник, ничего не знающий о §4-IB,
+    /// просто не найдёт в калибровочном кадре валидных страйпов и выбросит его —
+    /// поэтому опция обратно совместима.
+    pub fn with_calibration(mut self, on: bool) -> Self {
+        self.calib = on;
+        self
+    }
+
+    /// Включены ли калибровочные кадры.
+    pub fn calibration_enabled(&self) -> bool {
+        self.calib
+    }
+
+    /// Что за кадр стоит на позиции `seq` в ПОТОКЕ (§4-IB.3).
+    pub fn frame_kind(&self, seq: u64) -> FrameKind {
+        if self.calib && calframe::is_calibration_index(seq) {
+            FrameKind::Calibration
+        } else {
+            FrameKind::Payload(self.payload_seq(seq))
+        }
+    }
+
+    /// Номер payload-кадра для позиции потока `seq`: позиция минус число
+    /// калибровочных кадров до неё. При выключенной калибровке — тождество.
+    pub fn payload_seq(&self, seq: u64) -> u64 {
+        if self.calib {
+            seq - calframe::calibration_count_before(seq)
+        } else {
+            seq
+        }
+    }
+
+    /// Доля калибровочных кадров среди первых `n` кадров потока (§4-IB.3).
+    pub fn calibration_overhead(&self, n: u64) -> f64 {
+        if self.calib {
+            calframe::schedule_overhead(n)
+        } else {
+            0.0
         }
     }
 
@@ -372,14 +437,28 @@ impl Streamer {
     /// что ПРИЁМНИК считает размером клетки; для v0-показа мы рисуем 1 display-px на
     /// Frame-px (умноженный на целочисленный зум окна), поэтому px на экране ≠
     /// прескрипция `cell_size_px`.
+    /// Рендер позиции потока `seq` в RGB. При включённой калибровке (§4-IB.3)
+    /// часть позиций отдаёт калибровочный кадр, остальные — payload с номером
+    /// [`Streamer::payload_seq`] (именно он идёт в строку счётчика §3.3, чтобы
+    /// атрибуция рваного снимка §6.3 у приёмника не сбилась).
     pub fn render(&self, seq: u64, cell_override: Option<usize>) -> RgbFrame {
-        let cells = self.frame_cells(seq);
         let mut disp = self.profile;
         if let Some(c) = cell_override {
             disp.cell_size_px = c as u8;
         }
-        let counter = (seq & 0xFF) as u8;
-        RgbFrame::from_symbol(render_symbol_counter(&disp, &cells, counter))
+        match self.frame_kind(seq) {
+            FrameKind::Calibration => {
+                // счётчик несёт номер СЛЕДУЮЩЕГО payload-кадра — калибровочный
+                // кадр номера потока не занимает
+                let counter = (self.payload_seq(seq) & 0xFF) as u8;
+                RgbFrame::from_symbol(calframe::render_calibration_frame(&disp, counter))
+            }
+            FrameKind::Payload(pseq) => {
+                let cells = self.frame_cells(pseq);
+                let counter = (pseq & 0xFF) as u8;
+                RgbFrame::from_symbol(render_symbol_counter(&disp, &cells, counter))
+            }
+        }
     }
 }
 
@@ -620,6 +699,70 @@ mod tests {
             f.px.iter().any(|c| c[0] != c[2]),
             "кадр §5.1-CL обязан быть цветным"
         );
+    }
+
+    /// Внутриполосные калибровочные кадры (§4-IB.3): выключены по умолчанию
+    /// (боевой путь байт-в-байт прежний); включённые — занимают ровно позиции
+    /// расписания удвоения, payload при этом НЕ теряет ни одного кадра, а
+    /// строка счётчика §3.3 продолжает нести номер payload-кадра.
+    #[test]
+    fn calibration_schedule_interleaves_without_losing_payload() {
+        use psicode_core::calframe;
+
+        let file = make_file(20_000);
+        let prof = reference_profile();
+        let plain = Streamer::new(&file, prof, 9);
+        let cal = Streamer::new(&file, prof, 9).with_calibration(true);
+
+        // выключено -> тождество (регрессия боевого пути)
+        assert!(!plain.calibration_enabled());
+        for seq in [0u64, 1, 2, 4, 128, 1000] {
+            assert_eq!(plain.frame_kind(seq), FrameKind::Payload(seq));
+            assert_eq!(plain.payload_seq(seq), seq);
+        }
+        assert_eq!(plain.calibration_overhead(1000), 0.0);
+
+        // включено -> расписание удвоения, payload без пропусков
+        let mut expect_payload = 0u64;
+        let mut n_cal = 0u64;
+        for seq in 0..600u64 {
+            match cal.frame_kind(seq) {
+                FrameKind::Calibration => {
+                    assert!(calframe::is_calibration_index(seq), "кадр {seq} не по расписанию");
+                    n_cal += 1;
+                }
+                FrameKind::Payload(pseq) => {
+                    assert_eq!(pseq, expect_payload, "payload потерял кадр на позиции {seq}");
+                    expect_payload += 1;
+                }
+            }
+        }
+        assert_eq!(n_cal, calframe::calibration_count_before(600));
+        assert_eq!(expect_payload + n_cal, 600);
+
+        // накладные расходы и худшее ожидание позднего приёмника
+        let o = cal.calibration_overhead(10_000);
+        println!(
+            "§4-IB.3: накладные расходы {:.3} % на 10k кадрах, {:.3} % асимптотически; \
+             худшее ожидание {} кадров",
+            100.0 * o,
+            100.0 / calframe::CALIB_PERIOD as f64,
+            calframe::worst_join_wait(2048),
+        );
+        assert!(o < 0.009, "накладные расходы {o}");
+        assert_eq!(calframe::worst_join_wait(2048), 127);
+
+        // калибровочный кадр рендерится в ШТАТНОЙ геометрии символа и
+        // отличается от payload-кадра той же позиции
+        let a = cal.render(0, Some(12));
+        let b = plain.render(0, Some(12));
+        assert_eq!((a.w, a.h), (b.w, b.h), "геометрия кадра обязана совпадать");
+        assert_ne!(a.px, b.px, "калибровочный кадр обязан отличаться от payload");
+        // payload-кадры на не-расписанных позициях идентичны обычному потоку
+        // с соответствующим номером payload
+        let c = cal.render(3, Some(12)); // seq 3 -> payload 0? нет: 0,1,2 калиб -> payload 0
+        assert_eq!(cal.payload_seq(3), 0);
+        assert_eq!(c.px, plain.render(0, Some(12)).px, "содержимое payload сдвинулось");
     }
 
     /// fec_overhead управляет вплетением repair (§6.1): fec=0 -> проход = ровно K
