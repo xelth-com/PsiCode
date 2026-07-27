@@ -202,6 +202,14 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 v1 = true;
                 i += 1;
             }
+            // Рамка v1 с носителем последовательности в ЦВЕТНОСТИ (§3.2,
+            // ExtrudedStripsChroma): те же экструдированные полосы, но ЗЧ несётся
+            // комплексно через §5.1-CL, а не одним битом яркости.
+            "--v1c" => {
+                v1 = true;
+                V1_CHROMA.store(true, core::sync::atomic::Ordering::Relaxed);
+                i += 1;
+            }
             "--smoke" => {
                 smoke = true;
                 i += 1;
@@ -496,10 +504,20 @@ fn apply_chroma(p: CalibProfile, chroma: bool) -> CalibProfile {
 /// тайминг и FEC. При `v1 == false` профиль возвращается без изменений.
 fn apply_v1(mut p: CalibProfile, v1: bool) -> CalibProfile {
     if v1 {
-        p.border = BorderMode::ExtrudedStrips;
+        p.border = if V1_CHROMA.load(core::sync::atomic::Ordering::Relaxed) {
+            BorderMode::ExtrudedStripsChroma
+        } else {
+            BorderMode::ExtrudedStrips
+        };
     }
     p
 }
+
+/// Носитель ЗЧ-последовательности в рамке v1: `false` = яркость (1 бит),
+/// `true` = цветность (комплексно, §5.1-CL). Ставится флагом `--v1c`.
+/// Отдельный флаг, а не поле Command: `v1` уже протянут через три команды и
+/// три обработчика, а это диагностический переключатель одного значения.
+static V1_CHROMA: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Печать того, что сделал `--v1` (профиль уже с изменённой рамкой). Стиль —
 /// как у [`announce_const_luma`]: сторона полотна в v1 ровно `61·cell`.

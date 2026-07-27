@@ -17,6 +17,7 @@
 
 mod channel;
 mod exp;
+mod finder;
 mod framed;
 mod gprobe;
 mod image;
@@ -760,6 +761,7 @@ fn main() {
         Some("gprobe") => gprobe::cmd_gprobe(),
         Some("probe") => probe::cmd_probe(),
         Some("tprobe") => tprobe::cmd_tprobe(),
+        Some("finder") => finder::cmd_finder(),
         _ => {
             eprintln!(
                 "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | l3live | modeb | transfer | exp | probe | tprobe>"
