@@ -376,6 +376,26 @@ pub fn estimate_kernel(
     margin: usize,
     shape: KernelShape,
 ) -> Option<IsiKernel> {
+    estimate_kernel_masked(meas, ideal, radius, margin, shape, None)
+}
+
+/// [`estimate_kernel`] с МАСКОЙ пригодных откликов.
+///
+/// `valid[i] = true` означает «клетку `i` можно брать ОТКЛИКОМ регрессии»: её
+/// собственное значение и значения всех соседей в носителе ядра известны точно.
+/// Нужно там, где известна лишь ЧАСТЬ кадра — ЗЧ-кольцо, референсная строка и
+/// строка счётчика известны всегда, а payload до декодирования нет. Такой фит
+/// вообще не является решение-направленным, поэтому у него нет области
+/// сходимости: он работает при любой SER, включая ту, при которой бутстрап по
+/// решениям разваливается.
+pub fn estimate_kernel_masked(
+    meas: &Grid,
+    ideal: &Grid,
+    radius: usize,
+    margin: usize,
+    shape: KernelShape,
+    valid: Option<&[bool]>,
+) -> Option<IsiKernel> {
     assert_eq!(meas.rows, ideal.rows);
     assert_eq!(meas.cols, ideal.cols);
     let r = radius.min(MAX_RADIUS) as i32;
@@ -394,25 +414,53 @@ pub fn estimate_kernel(
         }
     }
     let na = active.len();
-    let nb = na + TREND_TERMS;
+    // Порядок гладкого фона ПОДБИРАЕТСЯ. При маске отклики могут лежать всего
+    // в двух строках сетки (кольцо сверху и снизу), и тогда столбцы {1, r, r²}
+    // имеют ранг 2, а не 3 — система вырождена не из-за ядра, а из-за тренда.
+    // Пробуем биквадратику, затем билинейку, затем одну константу.
+    for trend in [TREND_TERMS, 3, 1] {
+        if let Some(k) = fit_with_trend(meas, ideal, radius, margin, &active, na, trend, valid) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Тело [`estimate_kernel_masked`] при ФИКСИРОВАННОМ числе членов фона.
+#[allow(clippy::too_many_arguments)]
+fn fit_with_trend(
+    meas: &Grid,
+    ideal: &Grid,
+    radius: usize,
+    margin: usize,
+    active: &[(usize, i32, i32)],
+    na: usize,
+    trend: usize,
+    valid: Option<&[bool]>,
+) -> Option<IsiKernel> {
+    let (rows, cols) = (meas.rows, meas.cols);
+    let nb = na + trend;
     // нормальные уравнения; базис: активные отсчёты ядра, затем гладкий фон
     let mut ata = vec![0.0f64; nb * nb];
     let mut atb = vec![0.0f64; nb];
     let mut basis = vec![0.0f64; nb];
     let (hr, hc) = (0.5 * rows as f64, 0.5 * cols as f64);
+    let mut used = 0usize;
     for rr in margin..rows - margin {
         for cc in margin..cols - margin {
+            if let Some(v) = valid {
+                if !v[rr * cols + cc] {
+                    continue;
+                }
+            }
+            used += 1;
             for (i, &(_, dr, dc)) in active.iter().enumerate() {
                 basis[i] = ideal.at(rr as i32 - dr, cc as i32 - dc);
             }
             let ur = (rr as f64 - hr) / hr;
             let uc = (cc as f64 - hc) / hc;
-            basis[na] = 1.0;
-            basis[na + 1] = ur;
-            basis[na + 2] = uc;
-            basis[na + 3] = ur * ur;
-            basis[na + 4] = ur * uc;
-            basis[na + 5] = uc * uc;
+            let terms = [1.0, ur, uc, ur * ur, ur * uc, uc * uc];
+            basis[na..nb].copy_from_slice(&terms[..trend]);
             let y = meas.v[rr * cols + cc];
             for a in 0..nb {
                 let ba = basis[a];
@@ -425,6 +473,12 @@ pub fn estimate_kernel(
                 }
             }
         }
+    }
+    // Обусловленность решает не число клеток, а их РАЗНООБРАЗИЕ, но совсем
+    // тонкую выборку отсекаем сразу: на каждый параметр нужно хотя бы четыре
+    // наблюдения, иначе «оценка» — это подгонка под шум.
+    if used < 4 * nb {
+        return None;
     }
     for a in 0..nb {
         for b in 0..a {

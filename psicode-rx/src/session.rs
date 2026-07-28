@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use psicode_core::acquire::{self, AcquireOpts, Field, Quad, PROBE_DEPTH_STRIP};
 use psicode_core::calframe::{self, CalibCache};
+use psicode_core::isi::IsiKernel;
 use psicode_core::detect::{
     detect_symbol_acquire, detection_from_corners, frame_map, track_symbol, Detection,
 };
@@ -30,7 +31,9 @@ use psicode_core::zcborder;
 use psicode_core::fountain::FountainDecoder;
 use psicode_core::l3::{self, FrameHeader, ParsedFrame};
 use psicode_core::symbol::{
-    self, demod_symbol, demod_symbol_local, demod_symbol_matrix, read_counters,
+    self, cell_scale_mtf, demod_symbol, demod_symbol_isi, demod_symbol_local,
+    demod_symbol_local_isi, demod_symbol_matrix, read_counters, IsiConfig, IsiDemod,
+    ISI_QUALITY_MIN,
 };
 use psicode_core::tone;
 use psicode_core::profile::BorderMode;
@@ -73,6 +76,123 @@ const DETECT_MAX_DIM: usize = 4096;
 /// рассыпается), верхняя — «символ во весь кадр». Сужать диапазон дешевле всего:
 /// стоимость затравки ~ сумма 1/масштаб², и мелкий конец её и определяет.
 const V1_PX_PER_CELL: (f64, f64) = (7.0, 20.0);
+
+
+/// Как приёмник добывает ядро межклеточной интерференции ([`psicode_core::isi`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsiMode {
+    /// Выключено — тракт остаётся ровно прежним. УМОЛЧАНИЕ.
+    #[default]
+    Off,
+    /// Включено: ядро берётся из объединённого пула оценок ([`KernelPool`]).
+    On,
+}
+
+impl IsiMode {
+    /// Из целого (JNI/интенты): 0 — выкл, всё прочее — вкл.
+    pub fn from_i32(v: i32) -> Self {
+        if v == 0 {
+            IsiMode::Off
+        } else {
+            IsiMode::On
+        }
+    }
+}
+
+/// Сколько последних принятых оценок ядра держит пул.
+///
+/// Девять — нечётное (медиана без усреднения соседей) и покрывает ~0.5 с потока
+/// при поллинге 50 мс: достаточно коротко, чтобы следовать за уходом фокуса, и
+/// достаточно длинно, чтобы подавить покадровый разброс. Именно усреднение по
+/// кадрам дало 30/32 выживших страйпа против 28/32 у покадровой оценки.
+const KERNEL_POOL: usize = 9;
+/// Минимум оценок, начиная с которого работает КЭШИРОВАННЫЙ путь.
+const KERNEL_POOL_MIN: usize = 3;
+/// Каждый N-й кадр ядро переоценивается заново, даже когда пул уже набран.
+///
+/// Без этого пул ЗАМЁРЗ БЫ: при заданном `cfg.kernel` демодулятор возвращает то
+/// же самое ядро, и складывать его обратно — значит вечно подтверждать первую
+/// оценку. Ядро же обязано следовать за уходом фокуса и экспозиции.
+///
+/// 16 — компромисс по цене: переоценка стоит +2.9 мс против +1.2 мс у
+/// кэшированного пути, то есть в среднем это +0.1 мс на кадр, а при поллинге
+/// 50 мс медиана из девяти обновляется целиком примерно за семь секунд.
+const KERNEL_REFRESH: u64 = 16;
+
+/// Пул оценок ядра ISI с поотсчётной медианой.
+///
+/// # Почему пул, а не «ядро только из калибровочного кадра»
+///
+/// Замерено на синтетическом канале с впрыснутым ядром
+/// (`psicode-rx/examples/isi_eq.rs sources`) — максимальное отклонение отсчёта:
+///
+/// | источник | откликов | отклонение | зависит от SER |
+/// |---|---|---|---|
+/// | пробные решения payload | 3721 | 0.0016…0.026 | да |
+/// | калибровочный кадр §4-IB (с маской) | ~290 | 0.017…0.041 | нет |
+/// | известное окружение (кольцо+реф+счётчик) | ~118 | 0.072…0.096 | нет |
+///
+/// Калибровочный кадр и вправду НЕ решение-направленный и потому равнодушен к
+/// SER — но точность его ограничена тем, что клеточного масштаба в нём мало: он
+/// спроектирован ПРОТИВ клеточного масштаба (крупные плитки, §4-IB). Оценка по
+/// решениям точнее в разы, пока SER первого прохода ≲ 0.02.
+///
+/// На ЖИВЫХ снимках A22 путь «известное окружение» оказался прямо вреден
+/// (SER 0.024 против 0.016 у базы, 2/32 выживших страйпа против 10/32): его 118
+/// откликов лежат в двух строках у самого края символа, где хуже всего и
+/// геометрия, и поле.
+///
+/// Отсюда архитектура: основной источник — оценка по решениям, лекарство от её
+/// разброса — МЕДИАНА ПО КАДРАМ, а калибровочный кадр вливается в тот же пул
+/// как устойчивый опорный вклад.
+#[derive(Debug, Clone, Default)]
+pub struct KernelPool {
+    hist: Vec<[IsiKernel; 3]>,
+}
+
+impl KernelPool {
+    /// Принять оценку (кольцевой буфер длиной [`KERNEL_POOL`]).
+    fn push(&mut self, k: [IsiKernel; 3]) {
+        if self.hist.len() == KERNEL_POOL {
+            self.hist.remove(0);
+        }
+        self.hist.push(k);
+    }
+
+    /// Рабочее ядро: поотсчётная медиана пула. `None` — оценок ещё мало.
+    fn working(&self) -> Option<[IsiKernel; 3]> {
+        if self.hist.len() < KERNEL_POOL_MIN {
+            return None;
+        }
+        let mut out = [IsiKernel::identity(1); 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            let r = self.hist[0][c].radius;
+            let side = 2 * r + 1;
+            let mut k = IsiKernel::identity(r);
+            for dr in -(r as i32)..=(r as i32) {
+                for dc in -(r as i32)..=(r as i32) {
+                    let mut v: Vec<f64> = self.hist.iter().map(|h| h[c].tap(dr, dc)).collect();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+                    k.taps[((dr + r as i32) as usize) * side + (dc + r as i32) as usize] =
+                        v[v.len() / 2];
+                }
+            }
+            k.taps[r * side + r] = 1.0; // центр нормирован по построению
+            *o = k;
+        }
+        Some(out)
+    }
+
+    /// Число накопленных оценок.
+    pub fn len(&self) -> usize {
+        self.hist.len()
+    }
+
+    /// Пул пуст.
+    pub fn is_empty(&self) -> bool {
+        self.hist.is_empty()
+    }
+}
 
 /// Профиль tx по умолчанию (§8): σ=1-оптимум BENCHMARKS §6 — luma 2 + Chroma1 =
 /// 3 бит/клетку. Идентичен transfer.rs/live.rs. `cell_size_px` — display-масштаб;
@@ -166,6 +286,54 @@ pub struct FrameStatus {
     /// корреляция ВНУТРИ полосы сильнее, чем на две клетки в стороны.
     /// Символ ЕСТЬ: 8.6..13.0. Символа НЕТ: 1.05..1.92.
     pub strip_ratio: f64,
+    /// [ДИАГНОСТИКА + СВИП ФОКУСА] Модуляция на КЛЕТОЧНОМ масштабе по
+    /// известному содержимому ([`psicode_core::symbol::cell_scale_mtf`]).
+    ///
+    /// Именно эту величину следует брать целевой функцией свипа фокуса вместо
+    /// `score` рамки. Замер по развёртке блюра (`isi_eq focus`):
+    ///
+    /// | σ, клеток | 0.0 | 0.3 | 0.4 | 0.5 | 0.7 | 1.0 | 2.0 |
+    /// |---|---|---|---|---|---|---|---|
+    /// | `cell_mtf` | 1.031 | 1.026 | 0.972 | 0.845 | 0.523 | 0.211 | 0.016 |
+    /// | живых страйпов | 8/8 | 8/8 | 8/8 | 0/8 | 0/8 | 0/8 | 0/8 |
+    ///
+    /// Строго монотонно, полный размах 1.03 -> 0.02. Для сравнения, `score`
+    /// рамки v1 на живом A22 гулял лишь 0.897…0.943 при мёртвом payload — размах
+    /// 5 % против 100 %. Обрыв читаемости лежит между 0.97 и 0.85, поэтому
+    /// целиться свипу следует в `cell_mtf ≳ 0.95`.
+    ///
+    /// Считается по ЗЧ-кольцу, референсной строке и строке счётчика, то есть
+    /// определён на кадре, который не декодируется вовсе. `NaN` -> в JSON 0.
+    pub cell_mtf: f64,
+    /// [ДИАГНОСТИКА, ISI] Откуда взято ядро на ЭТОМ кадре:
+    /// `"off"` — выравнивание выключено;
+    /// `"frame"` — оценка по решениям этого кадра, пул ещё не набран;
+    /// `"refresh"` — плановая переоценка (каждый 16-й кадр), результат идёт в пул;
+    /// `"pool"` — медиана пула, рабочий режим (на ~2.9 мс дешевле переоценки);
+    /// `"reject"` — оценка выполнена, но ядро отбраковано (сила выше 0.5:
+    /// съехавшая геометрия либо расфокус за пределом обратимости). Отличать это
+    /// от «помехи нет» обязательно: и там, и там `isi_strength` равна нулю.
+    /// Различает их `cell_mtf` — при расфокусе он просажен.
+    pub isi_src: &'static str,
+    /// [ДИАГНОСТИКА, ISI] Сила применённого ядра `Σ|h_k≠0|` по каналу G.
+    /// Живые замеры: яркостный канал 0.053, цветные 0.23…0.27. Больше 0.5 —
+    /// признак съехавшей геометрии, такое ядро отбраковывается.
+    pub isi_strength: f64,
+    /// [ДИАГНОСТИКА, ISI] Сколько клеток payload изменило решение против
+    /// демодуляции БЕЗ выравнивателя.
+    pub isi_changed: u32,
+    /// [ДИАГНОСТИКА, ISI] Оценок ядра в пуле (0..9).
+    pub isi_pool: u8,
+    /// [ДИАГНОСТИКА, ISI] Качество кадра — разделение оси Re в единицах σ по
+    /// СОБСТВЕННЫМ решениям. Ловит временнУю СМЕСЬ (экспозиция накрыла границу
+    /// двух кадров передатчика), которую `cell_mtf` не видит: рамка у соседних
+    /// кадров одинакова. Резкая рамка при просевшем `isi_q` = смесь; просели
+    /// оба = расфокус.
+    ///
+    /// ВНИМАНИЕ: метрика САМОРЕФЕРЕНТНА (классы берутся из собственных решений),
+    /// поэтому у неё есть пол ~1.3 на чистом шуме — целевой функцией свипа она
+    /// НЕ годится, для этого есть `cell_mtf`.
+    pub isi_q: f64,
 }
 
 impl FrameStatus {
@@ -187,6 +355,12 @@ impl FrameStatus {
             calib_stale: true,
             side_min: 0.0,
             strip_ratio: 0.0,
+            cell_mtf: f64::NAN,
+            isi_src: "off",
+            isi_strength: 0.0,
+            isi_changed: 0,
+            isi_pool: 0,
+            isi_q: f64::NAN,
         }
     }
 
@@ -195,7 +369,10 @@ impl FrameStatus {
         format!(
             "{{\"detected\":{},\"score\":{:.4},\"rotation\":{},\"px_per_cell\":{:.2},\
              \"stripes_ok\":{},\"symbols_new\":{},\"k\":{},\"symbols_have\":{},\
-             \"done\":{},\"crc_ok\":{},\"calibration\":{},\"calib_age\":{},\"calib_stale\":{},             \"side_min\":{:.4},\"strip_ratio\":{:.2}}}",
+             \"done\":{},\"crc_ok\":{},\"calibration\":{},\"calib_age\":{},\"calib_stale\":{},\
+             \"side_min\":{:.4},\"strip_ratio\":{:.2},\"cell_mtf\":{:.4},\
+             \"isi_src\":\"{}\",\"isi_strength\":{:.4},\"isi_changed\":{},\
+             \"isi_pool\":{},\"isi_q\":{:.2}}}",
             self.detected,
             self.score,
             self.rotation,
@@ -211,7 +388,24 @@ impl FrameStatus {
             self.calib_stale,
             self.side_min,
             self.strip_ratio,
+            fin(self.cell_mtf),
+            self.isi_src,
+            self.isi_strength,
+            self.isi_changed,
+            self.isi_pool,
+            fin(self.isi_q),
         )
+    }
+}
+
+/// `NaN`/бесконечность -> 0.0: JSON не имеет представления для них, а Kotlin на
+/// той стороне разбирает поле как число.
+#[inline]
+fn fin(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
     }
 }
 
@@ -229,6 +423,13 @@ pub struct RxSession {
     last_detection: Option<Detection>,
     /// [ДИАГНОСТИКА] (минимальная сторона, отношение полосы) последнего захвата.
     last_diag: (f64, f64),
+    /// Режим выравнивателя ISI (по умолчанию выключен — тракт прежний).
+    isi_mode: IsiMode,
+    /// Пул оценок ядра ISI (медиана по кадрам).
+    isi_pool: KernelPool,
+    /// Счётчик кадров, прошедших через выравниватель — задаёт период
+    /// переоценки ядра ([`KERNEL_REFRESH`]).
+    isi_frames: u64,
     /// То же для рамки v1: раскладка прошлого кадра — вход дешёвого
     /// [`acquire::track`]. Своё поле, а не `last_detection`, потому что
     /// `track_symbol` умеет только рамку v0 (щупы кольца и штраф тихой зоны).
@@ -268,6 +469,9 @@ impl RxSession {
             gammas: None,
             last_detection: None,
             last_diag: (0.0, 0.0),
+            isi_mode: IsiMode::Off,
+            isi_pool: KernelPool::default(),
+            isi_frames: 0,
             last_place: None,
             session_id: None,
             decoder: None,
@@ -319,6 +523,38 @@ impl RxSession {
     /// --v1`): у v1 нет тихой зоны и другая рамка, и захват для неё идёт
     /// корреляционным трактом. Ошибиться здесь — значит просто не найти символ,
     /// поэтому параметр явный, а не угадываемый.
+    /// Как [`RxSession::with_cell_border`], плюс режим выравнивателя ISI.
+    ///
+    /// Отдельный конструктор, а не изменение старого: существующие точки входа
+    /// обязаны сохранить своё значение (`with_cell`, `with_cell_mode`,
+    /// `with_cell_border` — все дают [`IsiMode::Off`], то есть прежний тракт
+    /// байт-в-байт).
+    pub fn with_cell_border_isi(
+        cell_px: u8,
+        chromatic: bool,
+        border: BorderMode,
+        isi: IsiMode,
+    ) -> Self {
+        let mut s = Self::with_cell_border(cell_px, chromatic, border);
+        s.isi_mode = isi;
+        s
+    }
+
+    /// Включить/выключить выравниватель ISI на живой сессии.
+    pub fn set_isi_mode(&mut self, mode: IsiMode) {
+        self.isi_mode = mode;
+    }
+
+    /// Текущий режим выравнивателя.
+    pub fn isi_mode(&self) -> IsiMode {
+        self.isi_mode
+    }
+
+    /// Рабочее ядро пула (диагностика/тесты).
+    pub fn isi_kernel(&self) -> Option<[IsiKernel; 3]> {
+        self.isi_pool.working()
+    }
+
     pub fn with_cell_border(cell_px: u8, chromatic: bool, border: BorderMode) -> Self {
         let mut p = if chromatic {
             tx_chromatic_profile()
@@ -534,8 +770,17 @@ impl RxSession {
                 // плиток против 8 односкеточных клеток референсной строки.
                 self.gammas = Some(est.gammas);
             }
+            // ядро из калибровочного кадра — в тот же пул: оно не
+            // решение-направленное и потому устойчиво к любой SER payload.
+            if let Some(k) = est.isi {
+                if self.isi_mode == IsiMode::On {
+                    self.isi_pool.push(k);
+                }
+            }
             self.calib.accept(est);
             self.last_detection = Some(det);
+            let mtf = cell_scale_mtf(&self.profile, &map, &raw_sample);
+            let pool_n = self.isi_pool.len() as u8;
             let (k, have) = self.progress();
             return FrameStatus {
                 detected: true,
@@ -553,6 +798,12 @@ impl RxSession {
                 calib_stale: self.calib.stale(),
                 side_min: self.last_diag.0,
                 strip_ratio: self.last_diag.1,
+                cell_mtf: mtf,
+                isi_src: if self.isi_mode == IsiMode::On { "pool" } else { "off" },
+                isi_strength: 0.0,
+                isi_changed: 0,
+                isi_pool: pool_n,
+                isi_q: f64::NAN,
             };
         }
 
@@ -588,7 +839,69 @@ impl RxSession {
         // строку снимка вовсе. Устарел — молча падаем на путь v0 и ждём
         // следующего запланированного калибровочного кадра (обратного канала
         // нет, запрашивать нечего).
-        let cells_rx = if self.profile.luma_bits == 1 && self.profile.chroma_bits() == 0 {
+        // ПОКАЗАТЕЛЬ ФОКУСА считается ВСЕГДА и ДО демодуляции: он нужен именно
+        // тогда, когда payload не читается, — свип фокуса стартует не в фокусе.
+        let mtf = cell_scale_mtf(&self.profile, &map, &raw_sample);
+
+        let mut isi_src = "off";
+        let mut isi_strength = 0.0f64;
+        let mut isi_changed = 0u32;
+        let mut isi_q = f64::NAN;
+        let cells_rx = if self.isi_mode == IsiMode::On {
+            // Ядро: медиана пула, пока она есть (дешевле на ~2 мс и точнее
+            // покадровой оценки), иначе покадровая оценка по решениям. Пул
+            // набирается с ПЕРВОГО кадра, поэтому докалибровочного окна как
+            // отдельного режима не существует — ждать калибровочного кадра
+            // (в худшем случае 127 кадров) не требуется.
+            let mut cfg = IsiConfig::default();
+            let pooled = self.isi_pool.working();
+            // Периодическая ПЕРЕОЦЕНКА: иначе пул замёрз бы на первых трёх
+            // кадрах и перестал следовать за фокусом и экспозицией.
+            let refresh = self.isi_frames % KERNEL_REFRESH == 0;
+            self.isi_frames = self.isi_frames.wrapping_add(1);
+            let use_cached = pooled.is_some() && !refresh;
+            if use_cached {
+                cfg.kernel = pooled;
+                isi_src = "pool";
+            } else if pooled.is_some() {
+                isi_src = "refresh";
+            } else {
+                isi_src = "frame";
+            }
+            let r: IsiDemod = if self.profile.luma_bits == 1 && self.profile.chroma_bits() == 0 {
+                demod_symbol_local_isi(&self.profile, &map, &raw_sample, &cfg)
+            } else {
+                let m = self.calib.get().map(|e| e.matrix);
+                demod_symbol_isi(&self.profile, &map, &lin_sample, m.as_ref(), &cfg)
+            };
+            isi_strength = r.kernels[1].strength();
+            // Отбраковка (сила выше порога — обычно съехавшая геометрия или
+            // расфокус за пределом обратимости) оставляет дельту, и «сила 0»
+            // стала бы неотличима от «помехи нет». Помечаем явно.
+            if !use_cached && r.applied && r.kernels.iter().all(|k| k.strength() == 0.0) {
+                isi_src = "reject";
+            }
+            isi_changed = r.changed.min(u32::MAX as usize) as u32;
+            isi_q = r.quality[0];
+            // В пул попадает кадр, удовлетворяющий ТРЁМ условиям:
+            //
+            // 1. ядро на нём оценивалось ЗАНОВО — при заданном `cfg.kernel`
+            //    демодулятор вернул бы его же, и запись была бы самоподтверждением;
+            // 2. оценка не отбракована — иначе в медиану пошли бы дельты и
+            //    разбавили бы рабочее ядро;
+            // 3. ГЕЙТ КАЧЕСТВА пройден. Кадр, чья экспозиция накрыла границу
+            //    двух кадров передатчика, несёт смесь ДВУХ нагрузок, и
+            //    подогнанное по нему ядро описывает не тот сигнал. Замер на
+            //    шести снимках A22: 1.55 и 1.70 у смешанных против 2.19…2.57 у
+            //    чистых, порог 1.8 разделяет их с запасом. Декодировать такой
+            //    кадр это не мешает — запрещено только УЧИТЬСЯ по нему.
+            let learn = !use_cached && r.applied && isi_src != "reject";
+            let quality_ok = !isi_q.is_finite() || isi_q >= ISI_QUALITY_MIN;
+            if learn && quality_ok {
+                self.isi_pool.push(r.kernels);
+            }
+            r.cells
+        } else if self.profile.luma_bits == 1 && self.profile.chroma_bits() == 0 {
             demod_symbol_local(&self.profile, &map, &raw_sample)
         } else if let Some(est) = self.calib.get() {
             demod_symbol_matrix(&self.profile, &map, &lin_sample, &est.matrix)
@@ -645,6 +958,12 @@ impl RxSession {
             calib_stale: self.calib.stale(),
             side_min: self.last_diag.0,
             strip_ratio: self.last_diag.1,
+            cell_mtf: mtf,
+            isi_src,
+            isi_strength,
+            isi_changed,
+            isi_pool: self.isi_pool.len() as u8,
+            isi_q,
         }
     }
 

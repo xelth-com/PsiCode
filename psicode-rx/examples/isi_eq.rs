@@ -23,6 +23,7 @@
 //!
 //! Каталог содержит `dump0.meta` и `dump{N}.y` (+ `.u`/`.v` для цвета).
 
+use psicode_core::calframe;
 use psicode_core::detect::{self, Detection};
 use psicode_core::fountain::{crc32c, FountainEncoder};
 use psicode_core::isi::{self, Grid, IsiKernel, JointRule, KernelShape};
@@ -365,10 +366,12 @@ fn main() {
         Some("synth") => synth(),
         Some("sweep") => sweep(),
         Some("axes") => axes(&args),
+        Some("sources") => sources(),
+        Some("focus") => focus(),
         _ => {
             eprintln!(
-                "usage: isi_eq mono <dir> [crop] [max] [cell] | \
-                 isi_eq chroma <dir> [crop] [truth-file] [seq-max] | isi_eq synth"
+                "usage: isi_eq <mono|chroma|axes> <dir> [crop] [...] | \
+                 isi_eq <synth|sweep|sources>"
             );
             std::process::exit(2);
         }
@@ -1112,6 +1115,274 @@ fn axes(args: &[String]) {
     }
 }
 
+
+// ===========================================================================
+// ТРИ ИСТОЧНИКА ЯДРА: калибровочный кадр / известное окружение / решения
+// ===========================================================================
+
+/// [ИЗМЕРЕНИЕ] Откуда брать ядро ISI и что каждый источник стоит по точности.
+///
+/// Сравниваются на ОДНОМ И ТОМ ЖЕ синтетическом канале (известное ядро +
+/// освещённость 0.62→0.86 + гауссов шум), потому что на реальных снимках нет
+/// ни одного захваченного калибровочного кадра: набор A22 — кадры 691…697, а
+/// расписание §4-IB ставит калибровочные на 0,1,2,4,…,128 и далее каждые 128.
+///
+/// | источник | откликов | решение-направленный |
+/// |---|---|---|
+/// | калибровочный кадр (§4-IB) | 3721 | нет |
+/// | известное окружение (кольцо + реф. строка + счётчик) | ~110 | нет |
+/// | пробные решения payload | 3721 | ДА (есть область сходимости) |
+///
+/// Развёртка идёт по SER первого прохода: именно она ломает решение-направленный
+/// бутстрап, и именно относительно неё надо знать, где он перестаёт годиться.
+fn sources() {
+    let p = tx_chromatic_profile();
+    let k_true = measured_axis_kernel();
+    println!(
+        "=== ИСТОЧНИКИ ЯДРА: впрыснуто ядро силы {:.3} ===",
+        k_true.strength()
+    );
+    print_kernel("истинное ядро", &k_true);
+    let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    let cell = p.cell_size_px as f64;
+    let quiet = p.quiet_zone_cells() as f64;
+
+    // канал: идеальные драйвы -> светолинейно -> свёртка -> поле -> шум
+    let channel = |ideal: &[[u8; 3]], sigma: f64, seed: u64| -> Vec<[f64; 3]> {
+        let mut planes: [Vec<f64>; 3] = [
+            vec![0.0; NGRID],
+            vec![0.0; NGRID],
+            vec![0.0; NGRID],
+        ];
+        for c in 0..3 {
+            let lin: Vec<f64> = ideal
+                .iter()
+                .map(|d| (d[c] as f64 / 255.0).powf(gam[c]))
+                .collect();
+            let g = Grid {
+                v: &lin,
+                rows: GRID,
+                cols: GRID,
+            };
+            let r = k_true.radius as i32;
+            for rr in 0..GRID as i32 {
+                for cc in 0..GRID as i32 {
+                    let mut a = 0.0;
+                    for dr in -r..=r {
+                        for dc in -r..=r {
+                            a += k_true.tap(dr, dc) * g.at(rr - dr, cc - dc);
+                        }
+                    }
+                    planes[c][rr as usize * GRID + cc as usize] = a;
+                }
+            }
+        }
+        let mut st = seed;
+        (0..NGRID)
+            .map(|i| {
+                // поле освещённости 0.62 -> 0.86 по диагонали кадра
+                let (r, c) = ((i / GRID) as f64, (i % GRID) as f64);
+                let f = 0.62 + 0.24 * (r + c) / (2.0 * (GRID - 1) as f64);
+                let mut o = [0.0f64; 3];
+                for ch in 0..3 {
+                    o[ch] = planes[ch][i] * f + sigma * gauss(&mut st);
+                }
+                o
+            })
+            .collect()
+    };
+    // сэмплер: клетка, в которую попала точка
+    fn sampler<'a>(
+        obs: &'a [[f64; 3]],
+        cell: f64,
+        quiet: f64,
+    ) -> impl Fn(f64, f64) -> [f32; 3] + 'a {
+        move |x: f64, y: f64| -> [f32; 3] {
+            let cx = ((x / cell) as isize - quiet as isize).clamp(0, GRID as isize - 1) as usize;
+            let cy = ((y / cell) as isize - quiet as isize).clamp(0, GRID as isize - 1) as usize;
+            let i = cy * GRID + cx;
+            [obs[i][0] as f32, obs[i][1] as f32, obs[i][2] as f32]
+        }
+    }
+    let map = |u: f64, v: f64| (u, v);
+    let cfg = IsiConfig::default();
+
+    println!(
+        "\n{:<7} {:>9} {:>13} {:>13} {:>13}",
+        "σ шума", "SER базы", "калибр.кадр", "окружение", "по решениям"
+    );
+    for &sigma in &[0.0f64, 0.004, 0.010, 0.020, 0.035, 0.050, 0.070] {
+        // --- payload-кадр для окружения и решений ---
+        let cells = splitmix_payload(symbol::bits_per_cell(&p));
+        let ideal_pay = symbol::ideal_symbol_drives(&p, &cells, 0);
+        let obs_pay = channel(&ideal_pay, sigma, 0xA11CE_u64 ^ (sigma * 1e6) as u64);
+        let samp_pay = sampler(&obs_pay, cell, quiet);
+        let base = symbol::demod_symbol(&p, &map, &samp_pay);
+        let ser = base.iter().zip(&cells).filter(|(a, b)| a != b).count() as f64 / NCELL as f64;
+
+        // --- калибровочный кадр ---
+        let ideal_cal = calframe::calib_ideal_drives(&p, 0);
+        let obs_cal = channel(&ideal_cal, sigma, 0xCA11B_u64 ^ (sigma * 1e6) as u64);
+        let samp_cal = sampler(&obs_cal, cell, quiet);
+
+        let dev = |k: Option<[IsiKernel; 3]>| -> String {
+            match k {
+                Some(kk) => format!("{:.4}", kk[1].max_tap_diff(&k_true)),
+                None => "—".into(),
+            }
+        };
+        let k_cal =
+            symbol::estimate_isi_known_frame(&p, &map, &samp_cal, None, &ideal_cal, Some(&calframe::calib_kernel_mask()), &cfg);
+        let k_sur = symbol::estimate_isi_known_surround(&p, &map, &samp_pay, None, &cfg);
+        let k_dd = {
+            let r = symbol::demod_symbol_isi(&p, &map, &samp_pay, None, &cfg);
+            if r.applied {
+                Some(r.kernels)
+            } else {
+                None
+            }
+        };
+        println!(
+            "{sigma:<7.3} {ser:>9.4} {:>13} {:>13} {:>13}",
+            dev(k_cal),
+            dev(k_sur),
+            dev(k_dd)
+        );
+    }
+    println!(
+        "\n(числа — максимальное отклонение отсчёта восстановленного ядра канала G \n\
+         от впрыснутого; чем меньше, тем точнее источник)"
+    );
+}
+
+
+// ===========================================================================
+// ПОКАЗАТЕЛЬ ФОКУСА: монотонность и динамический диапазон
+// ===========================================================================
+
+/// [ИЗМЕРЕНИЕ] Годится ли `symbol::cell_scale_mtf` объективной функцией свипа
+/// фокуса — и насколько он лучше score ЗЧ-рамки.
+///
+/// Проверяются ровно те свойства, на которых свип держится:
+/// 1. **монотонность** по блюру (иначе свип застрянет в локальном максимуме);
+/// 2. **динамический диапазон** от резкого до 2 клеток блюра (иначе, как со
+///    score рамки, шум перекроет сигнал);
+/// 3. **вычислимость на кадре, который НЕ декодируется** — потому и считается
+///    по известному содержимому, а не по payload.
+///
+/// Заодно печатаются SER payload и качество по решениям, чтобы было видно,
+/// ГДЕ payload умирает относительно показателя.
+fn focus() {
+    let p = tx_chromatic_profile();
+    let bpc = symbol::bits_per_cell(&p);
+    // НАСТОЯЩИЙ кадр L3, иначе колонка выживших страйпов бессмысленна
+    let mut hd = FrameHeader::new(0x0138_c764, 17, SYMBOLS_PER_FRAME as u8);
+    hd.flags = 0;
+    let bytes: Vec<u8> = (0..8192u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let cells = l3::build_frame(&hd, None, &bytes, bpc);
+    let ideal = symbol::ideal_symbol_drives(&p, &cells, 0);
+    let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    // Шум СУЩЕСТВЕННЫЙ: на A22 ISO 2766 против 100..250 у Note 10 Lite, то есть
+    // поклеточный шум там заведомо много выше 1.79 кодов/255 из FINDINGS §2.
+    // Берём вчетверо больший, иначе развёртка меряет идеализированный канал.
+    const NOISE: f64 = 0.012;
+    let cell = p.cell_size_px as f64;
+    let quiet = p.quiet_zone_cells() as f64;
+    println!("=== ПОКАЗАТЕЛЬ ФОКУСА: развёртка по блюру ===");
+    println!(
+        "профиль: §5.1-CL, {bpc} бит/клетку, cell {} px; блюр задан в КЛЕТКАХ",
+        p.cell_size_px
+    );
+    println!(
+        "\n{:>7} {:>10} {:>10} {:>10} {:>10} {:>12}",
+        "σ, клеток", "cell_mtf", "сила ядра", "quality", "SER", "живых страйп."
+    );
+    let mut prev = f64::INFINITY;
+    let mut monotone = true;
+    for &sig_cells in &[0.0f64, 0.10, 0.20, 0.30, 0.40, 0.50, 0.70, 1.00, 1.50, 2.00] {
+        // гауссово размытие НА СЕТКЕ КЛЕТОК: свёртка идеальных светолинейных
+        // драйвов ядром exp(−d²/2σ²), носитель ±3 клетки
+        let rad = 3usize;
+        let mut w = vec![0.0f64; (2 * rad + 1) * (2 * rad + 1)];
+        let mut wsum = 0.0;
+        for dr in 0..2 * rad + 1 {
+            for dc in 0..2 * rad + 1 {
+                let (a, b) = (dr as f64 - rad as f64, dc as f64 - rad as f64);
+                let v = if sig_cells <= 1e-9 {
+                    if a == 0.0 && b == 0.0 { 1.0 } else { 0.0 }
+                } else {
+                    (-(a * a + b * b) / (2.0 * sig_cells * sig_cells)).exp()
+                };
+                w[dr * (2 * rad + 1) + dc] = v;
+                wsum += v;
+            }
+        }
+        for v in w.iter_mut() {
+            *v /= wsum;
+        }
+        let mut obs = vec![[0.0f64; 3]; NGRID];
+        for c in 0..3 {
+            let lin: Vec<f64> = ideal
+                .iter()
+                .map(|d| (d[c] as f64 / 255.0).powf(gam[c]))
+                .collect();
+            let g = Grid { v: &lin, rows: GRID, cols: GRID };
+            for rr in 0..GRID as i32 {
+                for cc in 0..GRID as i32 {
+                    let mut a = 0.0;
+                    for dr in 0..2 * rad + 1 {
+                        for dc in 0..2 * rad + 1 {
+                            a += w[dr * (2 * rad + 1) + dc]
+                                * g.at(rr + dr as i32 - rad as i32, cc + dc as i32 - rad as i32);
+                        }
+                    }
+                    obs[rr as usize * GRID + cc as usize][c] = a;
+                }
+            }
+        }
+        let mut st = 0xF0C05_u64;
+        for o in obs.iter_mut() {
+            for c in 0..3 {
+                o[c] += NOISE * gauss(&mut st);
+            }
+        }
+        let samp = |x: f64, y: f64| -> [f32; 3] {
+            let cx = ((x / cell) as isize - quiet as isize).clamp(0, GRID as isize - 1) as usize;
+            let cy = ((y / cell) as isize - quiet as isize).clamp(0, GRID as isize - 1) as usize;
+            let i = cy * GRID + cx;
+            [obs[i][0] as f32, obs[i][1] as f32, obs[i][2] as f32]
+        };
+        let map = |u: f64, v: f64| (u, v);
+        let mtf = symbol::cell_scale_mtf(&p, &map, &samp);
+        let eq = symbol::demod_symbol_isi(&p, &map, &samp, None, &IsiConfig::default());
+        let ser = eq.base_cells.iter().zip(&cells).filter(|(a, b)| a != b).count() as f64
+            / NCELL as f64;
+        let alive = stripes_ok(&eq.base_cells, bpc).iter().filter(|&&b| b).count();
+        println!(
+            "{sig_cells:>9.2} {mtf:>10.4} {:>10.4} {:>10.2} {ser:>10.4} {:>10}/8",
+            eq.kernels[1].strength(),
+            eq.quality[0],
+            alive
+        );
+        if mtf.is_finite() {
+            if mtf > prev + 1e-6 {
+                monotone = false;
+            }
+            prev = mtf;
+        }
+    }
+    println!(
+        "\ncell_mtf монотонно убывает по блюру: {}",
+        if monotone { "ДА" } else { "НЕТ" }
+    );
+    println!(
+        "ключевое отличие от score рамки: он считается по ИЗВЕСТНОМУ содержимому,\n\
+         поэтому определён и там, где payload не декодируется вовсе."
+    );
+}
+
 // ===========================================================================
 // МОНО
 // ===========================================================================
@@ -1715,7 +1986,17 @@ fn chroma(args: &[String]) {
                     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     v[v.len() / 2]
                 };
+                let mut tm = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let t = Instant::now();
+                    let _ = symbol::cell_scale_mtf(&p, &map, &raw);
+                    tm.push(t.elapsed().as_secs_f64() * 1e3);
+                }
                 let (a, b, c) = (med(&mut ta), med(&mut tcc), med(&mut tee));
+                println!(
+                    "цена показателя фокуса cell_scale_mtf: {:.2} мс/кадр (считается ВСЕГДА)",
+                    med(&mut tm)
+                );
                 println!(
                     "МЕДИАНА по {reps} повторам одного кадра: demod_symbol {a:.2} мс, \
                      +ISI(кэш) {b:.2} мс (+{:.2}), +ISI(оценка каждый кадр) {c:.2} мс (+{:.2})",
@@ -1744,6 +2025,53 @@ fn chroma(args: &[String]) {
         );
         print_kernel("ОБЩЕЕ ядро на все каналы", &shared);
         println!("{:<8} {:>6} {:>10} {:>16}", "форма", "итер", "SER", "живых страйпов");
+        // ИСТОЧНИК ЯДРА: известное окружение (кольцо + реф.строка + счётчик).
+        // Оно доступно на ПЕРВОМ же кадре, не решение-направленное и не ждёт
+        // калибровочного кадра — кандидат на работу в докалибровочном окне.
+        {
+            let (mut e, mut al, mut nn, mut got_k) = (0usize, 0usize, 0usize, 0usize);
+            let mut devs: Vec<f64> = Vec::new();
+            for (fi, dp) in dumps.iter().enumerate() {
+                if !clean.contains(&fi) {
+                    continue;
+                }
+                let Some(d) = dets[fi].as_ref() else { continue };
+                let Some(cx) = ctxs[fi].as_ref() else { continue };
+                let Some(tr) = cx.truth.as_ref() else { continue };
+                let map = detect::frame_map(&p, d);
+                let raw = |x: f64, y: f64| dp.raw(x, y);
+                let g = tone::estimate_channel_gammas(&p, &map, &raw);
+                let lin = |x: f64, y: f64| -> [f32; 3] {
+                    let s = raw(x, y);
+                    [
+                        (s[0] as f64).max(0.0).powf(g[0]) as f32,
+                        (s[1] as f64).max(0.0).powf(g[1]) as f32,
+                        (s[2] as f64).max(0.0).powf(g[2]) as f32,
+                    ]
+                };
+                let ks = symbol::estimate_isi_known_surround(&p, &map, &lin, None, &cfg);
+                let mut c2 = cfg;
+                if let Some(k) = ks {
+                    got_k += 1;
+                    devs.push(k[1].max_tap_diff(&med[1]));
+                    c2.kernel = Some(k);
+                }
+                let got = symbol::demod_symbol_isi(&p, &map, &lin, None, &c2).cells;
+                let skip = l3::STRIPE_ROWS[0] * PAYLOAD_COLS;
+                e += (skip..NCELL).filter(|&i| got[i] != tr[i]).count();
+                al += stripes_ok(&got, bpc).iter().filter(|&&b| b).count();
+                nn += 1;
+            }
+            if nn > 0 {
+                let n = nn as f64 * (NCELL - l3::STRIPE_ROWS[0] * PAYLOAD_COLS) as f64;
+                let dmax = devs.iter().cloned().fold(0.0f64, f64::max);
+                println!(
+                    "источник «известное окружение»: ядро получено на {got_k}/{nn} кадрах,                      макс. отклонение от медианного {dmax:.4}, SER {:.5}, живых страйпов {al}/{}",
+                    e as f64 / n,
+                    nn * 8
+                );
+            }
+        }
         for (sname, shape) in [("крест", KernelShape::Cross), ("квадрат", KernelShape::Full)] {
             for iters in [1usize, 2, 3, 4] {
                 let mut c = cfg;

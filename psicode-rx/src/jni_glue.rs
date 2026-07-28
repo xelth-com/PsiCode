@@ -15,7 +15,7 @@ use jni::objects::{JByteArray, JClass};
 use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
-use crate::session::RxSession;
+use crate::session::{IsiMode, RxSession};
 use psicode_core::profile::BorderMode;
 
 /// Безопасный JSON-статус на случай паники/битого хэндла (совпадает по схеме с
@@ -72,6 +72,43 @@ pub extern "system" fn Java_com_xelth_psicode_PsiCodeCore_rxInitBorder<'local>(
             _ => BorderMode::LegacyInverted,
         };
         Box::into_raw(Box::new(RxSession::with_cell_border(cell, chromatic != 0, b))) as jlong
+    })
+    .unwrap_or(0)
+}
+
+/// `PsiCodeCore.rxInitBorderIsi(profileCellPx: Int, chromatic: Int, border: Int,
+/// isi: Int): Long` — то же, что [`Java_com_xelth_psicode_PsiCodeCore_rxInitBorder`],
+/// плюс ВЫРАВНИВАТЕЛЬ МЕЖКЛЕТОЧНОЙ ИНТЕРФЕРЕНЦИИ ([`psicode_core::isi`]):
+/// 0 = выключен (в точности прежний тракт), иначе включён.
+///
+/// Снова ОТДЕЛЬНАЯ точка входа: подписи `rxInit` и `rxInitBorder` зафиксированы
+/// в приложении, и существующие вызовы обязаны сохранить своё значение.
+#[no_mangle]
+pub extern "system" fn Java_com_xelth_psicode_PsiCodeCore_rxInitBorderIsi<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    profile_cell_px: jint,
+    chromatic: jint,
+    border: jint,
+    isi: jint,
+) -> jlong {
+    catch_unwind(|| {
+        let cell = if (8..256).contains(&profile_cell_px) {
+            profile_cell_px as u8
+        } else {
+            12
+        };
+        let b = match border {
+            1 => BorderMode::ExtrudedStrips,
+            2 => BorderMode::ExtrudedStripsChroma,
+            _ => BorderMode::LegacyInverted,
+        };
+        Box::into_raw(Box::new(RxSession::with_cell_border_isi(
+            cell,
+            chromatic != 0,
+            b,
+            IsiMode::from_i32(isi),
+        ))) as jlong
     })
     .unwrap_or(0)
 }

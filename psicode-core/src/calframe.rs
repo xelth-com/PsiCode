@@ -143,9 +143,10 @@
 //! приёмник ждёт не дольше ~удвоенного текущего интервала, а установившиеся
 //! накладные расходы — 1/128 = 0.781 %.
 
+use crate::isi::IsiKernel;
 use crate::profile::CalibProfile;
 use crate::symbol::{
-    self, zc_binary, ChannelMatrix, Frame, PAYLOAD_COLS, PAYLOAD_ROWS, RING,
+    self, zc_binary, ChannelMatrix, Frame, IsiConfig, GRID, PAYLOAD_COLS, PAYLOAD_ROWS, RING,
 };
 use crate::tone;
 use alloc::vec;
@@ -449,6 +450,92 @@ pub fn render_calibration_frame(p: &CalibProfile, counter: u8) -> Frame {
     fr
 }
 
+/// ИДЕАЛЬНАЯ сетка драйвов калибровочного кадра `GRID×GRID`, снятая ровно тем
+/// же сэмплированием, что применяет демодулятор (§5.2: среднее 2×2 субсэмплов
+/// в центр ± cell/4).
+///
+/// Нужна для оценки ядра ISI: калибровочный кадр известен ЦЕЛИКОМ, поэтому
+/// откликами регрессии годятся все 3721 клетка, а не ~110 клеток известного
+/// окружения payload-кадра.
+///
+/// Реализовано через настоящий рендер, а не через повторение раскладки:
+/// зонд блюра рисуется НА УРОВНЕ ПИКСЕЛЕЙ (шаг решётки не кратен клетке), и
+/// любое «упрощённое» воспроизведение его клеточных средних разошлось бы с
+/// передатчиком. Цена — один рендер кадра; калибровочные кадры составляют
+/// 0.8 % потока, так что она платится редко.
+pub fn calib_ideal_drives(p: &CalibProfile, counter: u8) -> Vec<[u8; 3]> {
+    let fr = render_calibration_frame(p, counter);
+    let cell = p.cell_size_px as f64;
+    let quiet = p.quiet_zone_cells() as f64;
+    let side = fr.size_px;
+    let at = |x: f64, y: f64| -> [f64; 3] {
+        let xi = (x.max(0.0) as usize).min(side - 1);
+        let yi = (y.max(0.0) as usize).min(side - 1);
+        let px = fr.rgb[yi * side + xi];
+        [px[0] as f64, px[1] as f64, px[2] as f64]
+    };
+    let mut out = vec![[0u8; 3]; GRID * GRID];
+    for cy in 0..GRID {
+        for cx in 0..GRID {
+            let u = (quiet + cx as f64) * cell + cell / 2.0;
+            let v = (quiet + cy as f64) * cell + cell / 2.0;
+            let mut acc = [0.0f64; 3];
+            if p.cell_size_px >= 8 {
+                let d = cell / 4.0;
+                for &(sx, sy) in &[(-d, -d), (-d, d), (d, -d), (d, d)] {
+                    let q = at(u + sx, v + sy);
+                    for c in 0..3 {
+                        acc[c] += q[c] / 4.0;
+                    }
+                }
+            } else {
+                acc = at(u, v);
+            }
+            for c in 0..3 {
+                out[cy * GRID + cx][c] = acc[c].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Маска клеток калибровочного кадра, ГОДНЫХ для оценки ядра ISI.
+///
+/// # Почему нельзя брать кадр целиком
+///
+/// Калибровочный кадр §4-IB спроектирован ПРОТИВ клеточного масштаба: вся его
+/// идея в том, что матрицу 3×3 надо мерить на крупных плитках (120 px), потому
+/// что на клетке (12 px) её портит НЧ-фильтр хромы. 24 сплошные плитки — это
+/// ~3000 клеток, внутри которых `y = DC(h)·x` при ЛЮБОЙ форме ядра. Они
+/// ограничивают только сумму отсчётов, зато численно топят информативные
+/// клетки, и регрессия возвращает почти дельту.
+///
+/// # Что годится
+///
+/// * **маркерная полоса** (payload-строки 0..2, `m, ¬m, m` по корню ЗЧ 5) —
+///   171 клетка, бинарная, РОВНО клеточного масштаба, со структурой и по
+///   горизонтали (последовательность ЗЧ), и по вертикали (инверсия средней
+///   строки). Это лучший источник в кадре;
+/// * **ЗЧ-кольцо, референсная строка и строка счётчика** —
+///   [`symbol::known_cell_mask`], те же ~118 клеток, что доступны на ЛЮБОМ
+///   кадре.
+///
+/// Итого ~290 откликов клеточного масштаба на 15 параметров.
+///
+/// Зонды блюра сюда НЕ входят: их решётка рисуется на уровне пикселей с шагом
+/// `cell/2`, то есть за Найквистом клеточной сетки, и «идеальное» клеточное
+/// значение там зависит от субпиксельной фазы сэмплирования.
+pub fn calib_kernel_mask() -> Vec<bool> {
+    let mut m = symbol::known_cell_mask();
+    for pr in 0..MARKER_ROWS {
+        let r = RING + 1 + pr; // payload-строка pr в координатах сетки символа
+        for pc in 0..PAYLOAD_COLS {
+            m[r * GRID + RING + pc] = true;
+        }
+    }
+    m
+}
+
 // ---------------------------------------------------------------------------
 // Расписание (§4-IB.3)
 // ---------------------------------------------------------------------------
@@ -683,6 +770,18 @@ pub struct CalibEstimate {
     pub marker_rho: f64,
     /// Однородность плиток.
     pub uniformity: f64,
+    /// Ядро МЕЖКЛЕТОЧНОЙ ИНТЕРФЕРЕНЦИИ на канал ([`crate::isi`]), снятое с
+    /// этого же кадра.
+    ///
+    /// Место здесь ровно то же, что у матрицы 3×3: ядро — свойство связки
+    /// «дисплей + оптика + ISP», а не кадра. Замер: по 23 снимкам СТАТИЧНОГО
+    /// символа медианное отклонение отсчёта равно 0.0006 при силе ядра 0.053, а
+    /// на цветном наборе КЭШИРОВАННОЕ медианное ядро обгоняет покадровую оценку
+    /// (30/32 против 28/32 выживших страйпов, SER 0.00018 против 0.00046) и
+    /// стоит +1.05 мс вместо +3.0 мс на кадр.
+    ///
+    /// `None` — на этом кадре ядро оценить не удалось.
+    pub isi: Option<[IsiKernel; 3]>,
     /// Оценка получилась (система не вырождена).
     pub ok: bool,
 }
@@ -702,6 +801,7 @@ impl CalibEstimate {
             field_hi: 1.0,
             marker_rho: 0.0,
             uniformity: 0.0,
+            isi: None,
             ok: false,
         }
     }
@@ -1212,7 +1312,39 @@ pub fn estimate_from_frame(
     est.sigma_x_px = sigma_from_points(&blur_points(p, sx, &est.gammas, map, sample)).unwrap_or(0.0);
     est.sigma_y_px = sigma_from_points(&blur_points(p, sy, &est.gammas, map, sample)).unwrap_or(0.0);
     est.sigma_px = (0.5 * (est.sigma_x_px * est.sigma_x_px + est.sigma_y_px * est.sigma_y_px)).sqrt();
+
+    // --- 5. ядро межклеточной интерференции ---
+    // Кадр известен ЦЕЛИКОМ, поэтому фит не решение-направленный: у него нет
+    // области сходимости, и он одинаково работает при любой SER полезной
+    // нагрузки. Матрица развязки берётся ТОЛЬКО ЧТО оценённая — ядро живёт в
+    // светолинейной величине `t = N·s + q` и без развязки было бы смешано с
+    // перекрёстными наводками каналов.
+    if est.ok {
+        let ideal = calib_ideal_drives(p, counter_of(p, map, sample));
+        est.isi = symbol::estimate_isi_known_frame(
+            p,
+            map,
+            sample,
+            Some(&est.matrix),
+            &ideal,
+            Some(&calib_kernel_mask()),
+            &IsiConfig::default(),
+        );
+    }
     est
+}
+
+/// Младшие 8 бит номера кадра из строки счётчика §3.3 (первая копия).
+///
+/// Калибровочный кадр несёт счётчик наравне с payload-кадром, а строка счётчика
+/// входит в сетку идеальных драйвов — без верного счётчика 16 её клеток были бы
+/// заданы неверно и слегка испортили бы фит.
+fn counter_of(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+) -> u8 {
+    symbol::read_counters(p, map, sample).0
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,5 +2204,141 @@ mod tests {
         }
         assert!(c2.stale(), "здоровье {} должно было уронить кэш", c2.health());
         assert!(c2.last().is_some(), "последняя оценка сохраняется для диагностики");
+    }
+
+    // -----------------------------------------------------------------------
+    // Ядро межклеточной интерференции из калибровочного кадра
+    // -----------------------------------------------------------------------
+
+    /// Калибровочный кадр отдаёт ядро ISI — но ТОЛЬКО с маской.
+    ///
+    /// Проверяется главное, что выяснилось при реализации: без
+    /// [`calib_kernel_mask`] регрессия тонет в 24 сплошных плитках (внутри
+    /// однородного пятна `y = DC(h)·x` при ЛЮБОЙ форме `h`, то есть такие клетки
+    /// ограничивают лишь сумму отсчётов) и возвращает почти дельту. Маска
+    /// оставляет маркерную полосу, кольцо, референсную строку и строку
+    /// счётчика — ~290 клеток РОВНО клеточного масштаба.
+    #[test]
+    fn calibration_frame_yields_isi_kernel_only_with_the_mask() {
+        let p = prof(12);
+        let map = |u: f64, v: f64| (u, v);
+        let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        // впрыснутое ядро в масштабе ИЗМЕРЕННОГО на живом цветном канале
+        let mut k = IsiKernel::identity(1);
+        k.set_neighbour(0, -1, 0.104);
+        k.set_neighbour(0, 1, 0.104);
+        k.set_neighbour(-1, 0, 0.056);
+        k.set_neighbour(1, 0, 0.126);
+        for &(a, b) in &[(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+            k.set_neighbour(a, b, 0.018);
+        }
+        let ideal = calib_ideal_drives(&p, 0);
+        // канал: свёртка идеальных светолинейных драйвов на СЕТКЕ КЛЕТОК
+        let mut planes = [vec![0.0f64; GRID * GRID], vec![0.0f64; GRID * GRID], vec![
+            0.0f64;
+            GRID * GRID
+        ]];
+        for c in 0..3 {
+            let lin: Vec<f64> = ideal
+                .iter()
+                .map(|d| (d[c] as f64 / 255.0).powf(gam[c]))
+                .collect();
+            let g = crate::isi::Grid {
+                v: &lin,
+                rows: GRID,
+                cols: GRID,
+            };
+            for rr in 0..GRID as i32 {
+                for cc in 0..GRID as i32 {
+                    let mut a = 0.0;
+                    for dr in -1..=1 {
+                        for dc in -1..=1 {
+                            a += k.tap(dr, dc) * g.at(rr - dr, cc - dc);
+                        }
+                    }
+                    planes[c][rr as usize * GRID + cc as usize] = a;
+                }
+            }
+        }
+        let cell = p.cell_size_px as f64;
+        let quiet = p.quiet_zone_cells() as isize;
+        let samp = |x: f64, y: f64| -> [f32; 3] {
+            let cx = ((x / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+            let cy = ((y / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+            let i = cy * GRID + cx;
+            [
+                planes[0][i] as f32,
+                planes[1][i] as f32,
+                planes[2][i] as f32,
+            ]
+        };
+        let cfg = IsiConfig::default();
+
+        let masked = symbol::estimate_isi_known_frame(
+            &p,
+            &map,
+            &samp,
+            None,
+            &ideal,
+            Some(&calib_kernel_mask()),
+            &cfg,
+        )
+        .expect("с маской ядро обязано оцениться");
+        let dev_masked = masked[1].max_tap_diff(&k);
+
+        let whole = symbol::estimate_isi_known_frame(&p, &map, &samp, None, &ideal, None, &cfg);
+        let dev_whole = whole.map(|w| w[1].max_tap_diff(&k)).unwrap_or(f64::INFINITY);
+
+        println!(
+            "ядро из калибровочного кадра: с маской Δ={dev_masked:.4}, без маски Δ={dev_whole:.4}"
+        );
+        assert!(
+            dev_masked < 0.05,
+            "с маской ядро восстановлено плохо: Δ={dev_masked:.4}"
+        );
+        assert!(
+            dev_whole > dev_masked,
+            "маска обязана помогать: без неё Δ={dev_whole:.4}, с ней Δ={dev_masked:.4}"
+        );
+    }
+
+    /// [`estimate_from_frame`] кладёт ядро в [`CalibEstimate::isi`].
+    #[test]
+    fn estimate_from_frame_populates_isi_kernel() {
+        let p = prof(12);
+        let map = |u: f64, v: f64| (u, v);
+        // блюр 6 px при клетке 12 = половина клетки: ISI заведомо есть
+        // σ 2 px по яркости и 3.2 px по хроме — ИЗМЕРЕННЫЙ канал (FINDINGS §2)
+        let ch = measured_channel(2.0, 3.2, 1.79);
+        let fr = render_calibration_frame(&p, 0);
+        let size = fr.size_px;
+        let s = sampler(apply_channel(&fr.rgb, size, &ch), size);
+        let est = estimate_from_frame(&p, &map, &s);
+        assert!(est.ok, "оценка канала не получилась");
+        let isi = est.isi.expect("ядро ISI не заполнено");
+        let g = [isi[0].strength(), isi[1].strength(), isi[2].strength()];
+        println!(
+            "ядро из estimate_from_frame при замеренном σ: сила R/G/B {:.3}/{:.3}/{:.3}",
+            g[0], g[1], g[2]
+        );
+        // На ЖИВЫХ цветных кадрах A22 медианные силы вышли 0.266/0.234/0.231 —
+        // синтетика на замеренном σ обязана попасть в ту же область, иначе
+        // модель канала и живой канал говорят о разном.
+        for (c, &v) in g.iter().enumerate() {
+            assert!(
+                (0.10..0.45).contains(&v),
+                "канал {c}: сила {v:.3} вне полосы живых замеров 0.23…0.27"
+            );
+        }
+
+        // За порогом отбраковки (сильный расфокус) ядро НЕ выдаётся: обращать
+        // такую свёртку нечем, а payload там всё равно мёртв.
+        let ch2 = measured_channel(6.0, 8.0, 1.79);
+        let s2 = sampler(apply_channel(&fr.rgb, size, &ch2), size);
+        let est2 = estimate_from_frame(&p, &map, &s2);
+        assert!(
+            est2.isi.is_none(),
+            "при блюре в половину клетки ядро обязано быть отбраковано"
+        );
     }
 }

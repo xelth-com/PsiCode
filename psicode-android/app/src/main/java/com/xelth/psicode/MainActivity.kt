@@ -149,8 +149,9 @@ class MainActivity : AppCompatActivity() {
                 // Редакция рамки:     --ei border 1   (0 = v0, 1 = v1 полосы, 2 = v1 хрома)
                 val chroma = if (intent?.getBooleanExtra("chroma", false) == true) 1 else 0
                 val border = intent?.getIntExtra("border", 0) ?: 0
-                android.util.Log.d("PsiCodeRX", "rxInit chromatic=$chroma border=$border")
-                PsiCodeCore.rxInitBorder(PROFILE_CELL_PX, chroma, border)
+                val isi = intent?.getIntExtra("isi", 0) ?: 0
+                android.util.Log.d("PsiCodeRX", "rxInit chromatic=$chroma border=$border isi=$isi")
+                PsiCodeCore.rxInitBorderIsi(PROFILE_CELL_PX, chroma, border, isi)
             } catch (t: Throwable) {
                 0L
             }
@@ -652,6 +653,9 @@ class MainActivity : AppCompatActivity() {
         val rotation = o.optInt("rotation")
         val pxCell = o.optDouble("px_per_cell", 0.0)
         val stripesOk = o.optInt("stripes_ok")
+        // Модуляция на масштабе КЛЕТКИ относительно низкочастотной. Считается до
+        // демодуляции и на кадре, который не читается, поэтому годится в цель свипа.
+        val cellMtf = o.optDouble("cell_mtf", 0.0)
         val symbolsNew = o.optInt("symbols_new")
         val k = o.optInt("k")
         val symbolsHave = o.optInt("symbols_have")
@@ -664,9 +668,25 @@ class MainActivity : AppCompatActivity() {
         // его ОБРАБОТКА НАЧАЛАСЬ после установки линзы (lastProcMs — момент
         // старта обработки, тот же proc-поток). detected со score выше порога —
         // ранний выход: фокус найден, свип дальше не нужен. ---
+        // ВАЖНО: критерий шага — ЧИСЛО ПРОШЕДШИХ CRC ПОЛОС, а не оценка рамки.
+        // Рамка v1 держит корреляцию 0.702 при размытии в клетку (v0 давала 0.350),
+        // поэтому по фокусу она почти не различает: живьём на A22 оценка гуляла
+        // лишь 0.897..0.943, ранний выход срабатывал на 2-м шаге из 7, а нагрузка
+        // при этом была нечитаема на 693 кадрах из 694. Рамка — крупный контрастный
+        // узор, нагрузка — мелкая текстура; они деградируют на разных масштабах,
+        // и мерить фокус по одной, читая другую, неверно по построению.
         if (sweepActive && lastProcMs >= sweepObserveFrom) {
-            if (detected && score > curStepBestScore) curStepBestScore = score
-            if (detected && score > SWEEP_EARLY_SCORE) {
+            // score шага = полосы (0..8) + cell_mtf как НЕПРЕРЫВНЫЙ градиент внутри
+            // единицы. Полосы — конечная цель, но они равны нулю на всём протяжении
+            // расфокуса и вести по ним поиск нельзя: плато без наклона. cell_mtf
+            // (отношение модуляции на масштабе клетки к низкочастотной) монотонен
+            // по расфокусу, диапазон 1.03 -> 0.016 (64x), и остаётся 0.21 там, где
+            // SER уже 0.64 — то есть даёт направление на кадре, который не читается.
+            // Оценка рамки для этого негодна: у v1 она гуляет лишь 0.897..0.943.
+            val stepScore = stripesOk.toDouble() + cellMtf.coerceIn(0.0, 0.999)
+            if (detected && stepScore > curStepBestScore) curStepBestScore = stepScore
+            // Ранний выход ТОЛЬКО когда нагрузка реально читается целиком.
+            if (detected && stripesOk >= SWEEP_EARLY_STRIPES) {
                 camHandler?.post { earlySweepLock() }
             } else {
                 sweepStepResults++
@@ -820,6 +840,12 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_FOCUS = "focus_diopter"
         private const val SWEEP_SETTLE_MS = 400L          // устаканивание линзы
         private const val SWEEP_RESULTS_PER_STEP = 2      // кадров-результатов на шаг (не таймер!)
+        // Ранний выход из свипа — только когда ВСЕ 8 полос прошли CRC, то есть
+        // нагрузка читается целиком. Оценка рамки для этого больше не годится
+        // (см. комментарий на месте использования): у v1 она почти не зависит
+        // от фокуса. Если ни на одном шаге 8 полос не набралось, свип проходит
+        // таблицу до конца и выбирает шаг с максимумом (полосы + оценка).
+        private const val SWEEP_EARLY_STRIPES = 8
         private const val SWEEP_EARLY_SCORE = 0.90        // ранний лок ТОЛЬКО на резком кольце:
                                                           // score 0.6-0.7 детектирует, но payload
                                                           // при таком фокусе уже нечитаем (DOF на

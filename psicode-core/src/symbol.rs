@@ -887,6 +887,15 @@ pub struct IsiDemod {
     pub changed: usize,
     /// Применялось ли выравнивание (оценка могла выродиться или быть отбракована).
     pub applied: bool,
+    /// КАЧЕСТВО КАДРА: разделение осей созвездия в единицах σ, `[Re, Im]`,
+    /// посчитанное ДО выравнивания по СОБСТВЕННЫМ решениям кадра (эталон не
+    /// нужен). `NaN` — метрика для этого режима не определена.
+    ///
+    /// Зачем: снимок, чья экспозиция накрыла границу двух кадров передатчика,
+    /// содержит смесь двух РАЗНЫХ нагрузок, и подгонка ядра по такому кадру
+    /// подгоняет не ту величину. Замер на живом наборе A22 разделяет их с
+    /// запасом: чистые кадры 2.04…2.40σ, смешанные 1.32…1.38σ.
+    pub quality: [f64; 2],
 }
 
 /// Сенсорный RGB ВСЕЙ клеточной сетки символа `GRID×GRID` в растровом порядке.
@@ -929,6 +938,415 @@ fn plane_var(v: &[f64]) -> f64 {
     let n = v.len() as f64;
     let m = v.iter().sum::<f64>() / n;
     v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n
+}
+
+
+
+
+/// [LIVE] МОДУЛЯЦИЯ НА КЛЕТОЧНОМ МАСШТАБЕ по ИЗВЕСТНОМУ содержимому кадра —
+/// показатель фокуса, пригодный для кадра, который НЕ ДЕКОДИРУЕТСЯ.
+///
+/// # Зачем понадобилось
+///
+/// Свип фокуса вёлся по score ЗЧ-рамки. С рамкой v1 это перестало работать
+/// структурно: экструдированная полоса держит корреляцию 0.702 при блюре в одну
+/// клетку (FINDINGS §4), тогда как v0-кольцо на том же блюре разваливалось до
+/// 0.350 — и именно этот развал раньше служил сигналом фокуса. На живом A22
+/// score рамки гуляет всего в диапазоне 0.897…0.943, пока payload мёртв на
+/// 693 кадрах из 694. Рамка — КРУПНЫЙ высококонтрастный узор, payload — тонкая
+/// низкоконтрастная текстура; они деградируют на разных пространственных
+/// масштабах, и мерить фокус по одному, читая другое, неверно по построению.
+///
+/// # Что меряется
+///
+/// Отношение модуляции на ЧАСТОТЕ КЛЕТКИ к модуляции на НИЗКОЙ частоте, по тем
+/// клеткам, содержимое которых известно без декодирования ([`known_cell_mask`]:
+/// ЗЧ-кольцо, референсная строка, строка счётчика).
+///
+/// Для ОДИНОЧНОЙ клетки (её идеальный уровень отличается от обоих соседей)
+/// берётся вторая разность `L(n) − ½·(L(n−1) + L(n+1))`. При ядре `[h₁, h₀, h₁]`
+/// с сохранением энергии `h₀ + 2h₁ = 1` она равна `(h₀ − h₁)·(W − B)`, а
+/// низкочастотная опора `W − B` берётся как разность средних по известным белым
+/// и чёрным клеткам. Отношение равно `(3h₀ − 1)/2`: **1 при идеальной резкости,
+/// 0 когда клеточная информация уничтожена полностью**, строго монотонно по
+/// блюру (МПФ гауссиана `exp(−2π²σ²f²)` монотонно убывает по σ).
+///
+/// Вторая разность тождественно снимает ЛИНЕЙНОЕ поле освещённости, а деление
+/// на низкочастотную опору снимает общий множитель и усиление — ровно тот же
+/// приём, что у зонда блюра калибровочного кадра (§4-IB), только на уже
+/// имеющемся содержимом и без калибровочного кадра.
+///
+/// # Чего этот показатель НЕ ловит
+///
+/// ВременнУю СМЕСЬ (экспозиция накрыла границу двух кадров передатчика): рамка
+/// и референсная строка у соседних кадров ОДИНАКОВЫ, поэтому здесь смесь
+/// невидима, а payload при этом мёртв. Для неё есть отдельная метрика —
+/// [`IsiDemod::quality`]. Расхождение двух показателей само по себе
+/// диагностично: резкая рамка при просевшем `quality` — смесь, просевшие оба —
+/// расфокус.
+pub fn cell_scale_mtf(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+) -> f64 {
+    let quiet = p.quiet_zone_cells() as usize;
+    let cell = p.cell_size_px as usize;
+    let known = known_cell_mask();
+    // идеальные драйвы: payload не нужен, счётчик тоже (строка счётчика даёт
+    // лишь 16 клеток, и ошибка в них метрику не сдвинет).
+    let filler = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+    let ideal = build_symbol_cells(p, &filler, 0);
+    let (black_255, white_255) = levels(p);
+    let mid = 0.5 * (black_255 as f64 + white_255 as f64);
+
+    // сэмплируем ТОЛЬКО известные клетки: их ~530 из 3721, то есть седьмая
+    // часть стоимости полной сетки.
+    let mut lum = vec![f64::NAN; GRID * GRID];
+    for i in 0..GRID * GRID {
+        if known[i] {
+            let (cy, cx) = (i / GRID, i % GRID);
+            lum[i] = sample_cell(quiet, cell, cx, cy, map, sample)[1];
+        }
+    }
+    let is_white = |i: usize| ideal[i][1] as f64 > mid;
+
+    // низкочастотная опора: разность средних по известным белым и чёрным
+    let (mut sw, mut nw, mut sb, mut nb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for i in 0..GRID * GRID {
+        if !known[i] || !lum[i].is_finite() {
+            continue;
+        }
+        if is_white(i) {
+            sw += lum[i];
+            nw += 1.0;
+        } else {
+            sb += lum[i];
+            nb += 1.0;
+        }
+    }
+    if nw < 8.0 || nb < 8.0 {
+        return f64::NAN;
+    }
+    let base = sw / nw - sb / nb;
+    if !(base.abs() > 1e-9) {
+        return f64::NAN;
+    }
+
+    // клеточная модуляция по ОДИНОЧНЫМ клеткам, обе ориентации
+    let mut acc = 0.0f64;
+    let mut cnt = 0.0f64;
+    for r in 0..GRID as i32 {
+        for c in 0..GRID as i32 {
+            let i = r as usize * GRID + c as usize;
+            if !known[i] || !lum[i].is_finite() {
+                continue;
+            }
+            for &(dr, dc) in &[(0i32, 1i32), (1, 0)] {
+                let (ra, ca) = (r - dr, c - dc);
+                let (rb, cb) = (r + dr, c + dc);
+                if ra < 0 || ca < 0 || rb >= GRID as i32 || cb >= GRID as i32 {
+                    continue;
+                }
+                let (ia, ib) = (ra as usize * GRID + ca as usize, rb as usize * GRID + cb as usize);
+                if !known[ia] || !known[ib] || !lum[ia].is_finite() || !lum[ib].is_finite() {
+                    continue;
+                }
+                // ОДИНОЧНАЯ клетка: идеальный уровень отличается от обоих соседей
+                let (wi, wa, wb) = (is_white(i), is_white(ia), is_white(ib));
+                if wi == wa || wi == wb {
+                    continue;
+                }
+                let d = lum[i] - 0.5 * (lum[ia] + lum[ib]);
+                // знак приводим к знаку идеального перепада
+                acc += if wi { d } else { -d };
+                cnt += 1.0;
+            }
+        }
+    }
+    if cnt < 8.0 {
+        return f64::NAN;
+    }
+    (acc / cnt / base).clamp(0.0, 1.5)
+}
+
+/// Порог качества кадра: ниже этого разделения по оси Re созвездие уже
+/// схлопнуто смешением двух кадров передатчика, и оценку ядра по такому кадру
+/// брать нельзя.
+///
+/// 1.8 — середина измеренного разрыва: чистые кадры дают 2.04…2.40σ, смешанные
+/// 1.32…1.38σ. Порог НЕ отключает демодуляцию такого кадра — он лишь запрещает
+/// учить по нему ядро.
+pub const ISI_QUALITY_MIN: f64 = 1.8;
+
+/// Разделение осей созвездия в единицах σ по СОБСТВЕННЫМ решениям кадра.
+///
+/// Определено только для семейства постоянной яркости (§5.1-CL): там оси
+/// наблюдаемы явно. Для остальных режимов возвращает `NaN` — гейт тогда
+/// пропускает всё.
+fn frame_quality(
+    p: &CalibProfile,
+    t: &[Vec<f64>; 3],
+    gammas: &[f64; 3],
+    cells: &[u8],
+) -> [f64; 2] {
+    if !p.chroma_mode.is_const_luma() {
+        return [f64::NAN; 2];
+    }
+    let cl = const_luma_map(p);
+    let chroma_bits = p.chroma_bits() as u32;
+    // накопители «по знаку решения» на каждую ось
+    let mut sum = [[0.0f64; 2]; 2];
+    let mut sq = [[0.0f64; 2]; 2];
+    let mut cnt = [[0.0f64; 2]; 2];
+    for pr in 0..PAYLOAD_ROWS {
+        for pc in 0..PAYLOAD_COLS {
+            let gi = (RING + 1 + pr) * GRID + (RING + pc);
+            let tv = [t[0][gi], t[1][gi], t[2][gi]];
+            let (x, y) = cl.z_from_drive(drive_from_linear(&tv, gammas));
+            let sym = cells[pr * PAYLOAD_COLS + pc] as u32;
+            // старший бит оси Re, младший — оси Im (Грей при 1 бите = двоичный)
+            let lre = ((sym >> chroma_bits) & 1) as usize;
+            let lim = (sym & 1) as usize;
+            for (ax, (v, l)) in [(x, lre), (y, lim)].iter().enumerate() {
+                sum[ax][*l] += *v;
+                sq[ax][*l] += *v * *v;
+                cnt[ax][*l] += 1.0;
+            }
+        }
+    }
+    let mut q = [f64::NAN; 2];
+    for ax in 0..2 {
+        if cnt[ax][0] < 2.0 || cnt[ax][1] < 2.0 {
+            continue;
+        }
+        let mut pooled = 0.0;
+        for l in 0..2 {
+            let m = sum[ax][l] / cnt[ax][l];
+            pooled += (sq[ax][l] - cnt[ax][l] * m * m).max(0.0);
+        }
+        let dof = cnt[ax][0] + cnt[ax][1] - 2.0;
+        let sd = (pooled / dof).sqrt();
+        let sep = sum[ax][1] / cnt[ax][1] - sum[ax][0] / cnt[ax][0];
+        // Потолок: на бесшумном синтетическом канале sd -> 0 и отношение
+        // улетает в миллионы, что бесполезно и в JSON, и в гейте.
+        q[ax] = if sd > 0.0 {
+            (sep / (2.0 * sd)).clamp(0.0, 99.0)
+        } else {
+            99.0
+        };
+    }
+    q
+}
+
+/// Маска клеток сетки символа, содержимое которых приёмник знает ТОЧНО ещё до
+/// декодирования payload: ЗЧ-кольцо (§3.2), референсная строка (§3.4) и строка
+/// счётчика (§3.3).
+///
+/// Это ~530 клеток из 3721 — и, что важнее, они известны на КАЖДОМ кадре, а не
+/// только на калибровочном. По ним ядро ISI оценивается БЕЗ обратной связи по
+/// решениям, то есть без области сходимости: способ работает и там, где
+/// бутстрап по пробным решениям разваливается.
+pub fn known_cell_mask() -> Vec<bool> {
+    let mut m = vec![false; GRID * GRID];
+    for r in 0..GRID {
+        for c in 0..GRID {
+            let ring = r < RING || r >= GRID - RING || c < RING || c >= GRID - RING;
+            let refrow = r == RING; // референсная строка §3.4
+            let counter = r == RING + INTERIOR - 1; // строка счётчика §3.3
+            m[r * GRID + c] = ring || refrow || counter;
+        }
+    }
+    m
+}
+
+/// Эрозия маски: клетка годится ОТКЛИКОМ регрессии, только если известна она
+/// сама и все её соседи в носителе ядра (края сетки исключаются — там сосед
+/// был бы зажатым повтором, а повтор завышает близкие отсчёты).
+fn erode_mask(known: &[bool], radius: usize) -> Vec<bool> {
+    let r = radius as i32;
+    let g = GRID as i32;
+    let mut out = vec![false; GRID * GRID];
+    for rr in 0..g {
+        for cc in 0..g {
+            let mut ok = true;
+            for dr in -r..=r {
+                for dc in -r..=r {
+                    let (a, b) = (rr + dr, cc + dc);
+                    if a < 0 || a >= g || b < 0 || b >= g {
+                        ok = false;
+                    } else if !known[a as usize * GRID + b as usize] {
+                        ok = false;
+                    }
+                }
+            }
+            out[rr as usize * GRID + cc as usize] = ok;
+        }
+    }
+    out
+}
+
+/// Подгонка ядра ISI на канал по паре «светолинейная сетка измерений / сетка
+/// ИДЕАЛЬНЫХ драйвов», с необязательной маской пригодных откликов.
+///
+/// Общее тело для всех трёх источников ядра: пробные решения payload,
+/// известное окружение (кольцо + референсная строка + счётчик) и целиком
+/// известный калибровочный кадр (§4-IB).
+fn fit_kernels(
+    t: &[Vec<f64>; 3],
+    ideal_d: &[[u8; 3]],
+    gammas: &[f64; 3],
+    cfg: &IsiConfig,
+    valid: Option<&[bool]>,
+) -> [IsiKernel; 3] {
+    // Отступ от края нужен ТОЛЬКО когда откликами идут все клетки подряд: он
+    // выбрасывает те, чья окрестность частично зажата. При явной маске эту
+    // работу уже сделала эрозия, а отступ 3 вырезал бы ровно кольцо,
+    // референсную строку и строку счётчика — то есть всё, что маска и выделяет.
+    let margin = if valid.is_some() { 0 } else { ISI_FIT_MARGIN };
+    let mut out = [IsiKernel::identity(cfg.radius); 3];
+    for c in 0..3 {
+        let ideal: Vec<f64> = ideal_d
+            .iter()
+            .map(|d| (d[c] as f64 / 255.0).powf(gammas[c]))
+            .collect();
+        if plane_var(&ideal) < ISI_MIN_IDEAL_VAR {
+            continue; // постоянный канал — ядро не определено
+        }
+        let est = isi::estimate_kernel_masked(
+            &Grid {
+                v: &t[c],
+                rows: GRID,
+                cols: GRID,
+            },
+            &Grid {
+                v: &ideal,
+                rows: GRID,
+                cols: GRID,
+            },
+            cfg.radius,
+            margin,
+            cfg.shape,
+            valid,
+        );
+        if let Some(k) = est {
+            if k.strength() <= ISI_MAX_STRENGTH {
+                out[c] = k;
+            }
+        }
+    }
+    out
+}
+
+/// Развязка каналов §3.4 из внешней матрицы либо из референсной строки.
+fn solve_for(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    m: Option<&ChannelMatrix>,
+    gammas: &[f64; 3],
+) -> ChannelSolve {
+    let (black_255, white_255) = levels(p);
+    match m {
+        Some(mm) => ChannelSolve::Matrix { n: mm.n, q: mm.q },
+        None => ChannelSolve::from_reference_row(
+            p,
+            black_255,
+            white_255,
+            gammas,
+            map,
+            sample,
+            p.chroma_mode.is_const_luma(),
+        ),
+    }
+}
+
+/// Светолинейные плоскости `t = N·s + q` всей сетки символа плюс счётчик кадра.
+fn symbol_linear_planes(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    solve: &ChannelSolve,
+) -> ([Vec<f64>; 3], u8) {
+    let s_grid = sample_symbol_grid(p, map, sample);
+    let n = GRID * GRID;
+    let mut t: [Vec<f64>; 3] = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    for (i, s) in s_grid.iter().enumerate() {
+        let l = solve.linear(*s);
+        for c in 0..3 {
+            t[c][i] = l[c];
+        }
+    }
+    let counter = counter_from_grid(&s_grid);
+    (t, counter)
+}
+
+/// Оценка ядра ISI ПО ИЗВЕСТНОМУ ОКРУЖЕНИЮ payload-кадра — ЗЧ-кольцу §3.2,
+/// референсной строке §3.4 и строке счётчика §3.3.
+///
+/// Зачем существует: калибровочный кадр (§4-IB) приходит по расписанию с
+/// удвоением, и в худшем случае приёмник ждёт его 127 кадров. Всё это время
+/// ядро нужно откуда-то брать. Здесь оно берётся из содержимого, известного
+/// ТОЧНО на каждом кадре, поэтому оценка НЕ решение-направленная и не имеет
+/// области сходимости — она одинаково работает и при SER 0.01, и при SER 0.3.
+///
+/// `None`, если известных клеток с полной окрестностью не хватило на
+/// обусловленную систему.
+pub fn estimate_isi_known_surround(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    m: Option<&ChannelMatrix>,
+    cfg: &IsiConfig,
+) -> Option<[IsiKernel; 3]> {
+    let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    let solve = solve_for(p, map, sample, m, &gammas);
+    let (t, counter) = symbol_linear_planes(p, map, sample, &solve);
+    // payload заполняем чем угодно: маска исключает его и из откликов, и из
+    // окрестностей откликов.
+    let filler = vec![0u8; PAYLOAD_COLS * PAYLOAD_ROWS];
+    let ideal_d = build_symbol_cells(p, &filler, counter);
+    let valid = erode_mask(&known_cell_mask(), cfg.radius);
+    if !valid.iter().any(|&v| v) {
+        return None;
+    }
+    let k = fit_kernels(&t, &ideal_d, &gammas, cfg, Some(&valid));
+    if k.iter().all(|x| x.strength() == 0.0) {
+        None
+    } else {
+        Some(k)
+    }
+}
+
+/// Оценка ядра ISI по ЦЕЛИКОМ ИЗВЕСТНОМУ кадру (калибровочному, §4-IB).
+///
+/// `ideal_d` — сетка `GRID×GRID` идеальных драйвов этого кадра, `known` —
+/// маска клеток, годных В ОТКЛИКИ (эрозия по радиусу ядра делается здесь).
+///
+/// **Маску передавать обязательно, если кадр содержит крупные однородные
+/// области.** Внутри однородного пятна `y = DC(h)·x` при ЛЮБОЙ форме `h`:
+/// такие клетки ограничивают только сумму отсчётов и ничего не говорят о
+/// форме, зато численно перевешивают информативные. На калибровочном кадре
+/// §4-IB это решает всё: 24 сплошные плитки против 171 клетки маркерной полосы.
+pub fn estimate_isi_known_frame(
+    p: &CalibProfile,
+    map: &dyn Fn(f64, f64) -> (f64, f64),
+    sample: &dyn Fn(f64, f64) -> [f32; 3],
+    m: Option<&ChannelMatrix>,
+    ideal_d: &[[u8; 3]],
+    known: Option<&[bool]>,
+    cfg: &IsiConfig,
+) -> Option<[IsiKernel; 3]> {
+    assert_eq!(ideal_d.len(), GRID * GRID);
+    let gammas = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+    let solve = solve_for(p, map, sample, m, &gammas);
+    let (t, _) = symbol_linear_planes(p, map, sample, &solve);
+    let eroded = known.map(|k| erode_mask(k, cfg.radius));
+    let k = fit_kernels(&t, ideal_d, &gammas, cfg, eroded.as_deref());
+    if k.iter().all(|x| x.strength() == 0.0) {
+        None
+    } else {
+        Some(k)
+    }
 }
 
 /// Демодуляция Mode A с ЛИНЕЙНЫМ выравниванием межклеточной интерференции.
@@ -1016,43 +1434,14 @@ pub fn demod_symbol_isi(
     let mut cells = base_cells.clone();
     let mut applied = false;
     for _ in 0..cfg.passes.max(1) {
-        let mut k_new = [IsiKernel::identity(cfg.radius); 3];
-        match cfg.kernel {
-            Some(kk) => k_new = kk,
+        let k_new = match cfg.kernel {
+            Some(kk) => kk,
             None => {
                 // идеальная светолинейная сетка при ТЕКУЩИХ решениях
                 let ideal_d = build_symbol_cells(p, &cells, counter);
-                for c in 0..3 {
-                    let ideal: Vec<f64> = ideal_d
-                        .iter()
-                        .map(|d| (d[c] as f64 / 255.0).powf(gammas[c]))
-                        .collect();
-                    if plane_var(&ideal) < ISI_MIN_IDEAL_VAR {
-                        continue; // постоянный канал — ядро не определено
-                    }
-                    let est = isi::estimate_kernel(
-                        &Grid {
-                            v: &t[c],
-                            rows: GRID,
-                            cols: GRID,
-                        },
-                        &Grid {
-                            v: &ideal,
-                            rows: GRID,
-                            cols: GRID,
-                        },
-                        cfg.radius,
-                        ISI_FIT_MARGIN,
-                        cfg.shape,
-                    );
-                    if let Some(k) = est {
-                        if k.strength() <= ISI_MAX_STRENGTH {
-                            k_new[c] = k;
-                        }
-                    }
-                }
+                fit_kernels(&t, &ideal_d, &gammas, cfg, None)
             }
-        }
+        };
         kernels = k_new;
         let mut planes = t.clone();
         for c in 0..3 {
@@ -1067,6 +1456,7 @@ pub fn demod_symbol_isi(
         .filter(|(a, b)| a != b)
         .count();
     IsiDemod {
+        quality: frame_quality(p, &t, &gammas, &base_cells),
         cells,
         base_cells,
         kernels,
@@ -1173,6 +1563,8 @@ pub fn demod_symbol_local_isi(
         .filter(|(a, b)| a != b)
         .count();
     IsiDemod {
+        // 1-битный яркостный путь не имеет осей созвездия; гейт его пропускает
+        quality: [f64::NAN; 2],
         cells,
         base_cells,
         kernels,
@@ -2535,5 +2927,222 @@ mod tests {
             err(&loc)
         );
         assert_eq!(err(&eq.cells), 0, "яркостный путь не снял впрыснутое ISI");
+    }
+
+    /// Гауссово размытие НА СЕТКЕ КЛЕТОК, σ в клетках.
+    fn blur_grid(ideal: &[[u8; 3]], gam: &[f64; 3], sigma: f64) -> [Vec<f64>; 3] {
+        let rad = 3i32;
+        let mut w = vec![0.0f64; ((2 * rad + 1) * (2 * rad + 1)) as usize];
+        let mut wsum = 0.0;
+        for dr in -rad..=rad {
+            for dc in -rad..=rad {
+                let v = if sigma <= 1e-9 {
+                    if dr == 0 && dc == 0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (-((dr * dr + dc * dc) as f64) / (2.0 * sigma * sigma)).exp()
+                };
+                w[((dr + rad) * (2 * rad + 1) + dc + rad) as usize] = v;
+                wsum += v;
+            }
+        }
+        for v in w.iter_mut() {
+            *v /= wsum;
+        }
+        let mut out = [vec![], vec![], vec![]];
+        for c in 0..3 {
+            let lin: Vec<f64> = ideal
+                .iter()
+                .map(|d| (d[c] as f64 / 255.0).powf(gam[c]))
+                .collect();
+            let g = Grid {
+                v: &lin,
+                rows: GRID,
+                cols: GRID,
+            };
+            let mut o = vec![0.0f64; GRID * GRID];
+            for rr in 0..GRID as i32 {
+                for cc in 0..GRID as i32 {
+                    let mut a = 0.0;
+                    for dr in -rad..=rad {
+                        for dc in -rad..=rad {
+                            a += w[((dr + rad) * (2 * rad + 1) + dc + rad) as usize]
+                                * g.at(rr + dr, cc + dc);
+                        }
+                    }
+                    o[rr as usize * GRID + cc as usize] = a;
+                }
+            }
+            out[c] = o;
+        }
+        out
+    }
+
+    /// РЕГРЕССИЯ: показатель фокуса СТРОГО МОНОТОНЕН по расфокусу и имеет
+    /// полный динамический диапазон.
+    ///
+    /// Именно эти два свойства решают судьбу свипа фокуса. Score ЗЧ-рамки v1 их
+    /// не имеет: на живом A22 он гулял 0.897…0.943 при полностью нечитаемом
+    /// payload — 5 % размаха, внутри которого свип и застрял на втором шаге из
+    /// семи. Здесь проверяется, что замена ведёт себя иначе.
+    #[test]
+    fn cell_scale_mtf_is_monotone_in_defocus_with_full_range() {
+        let p = prof(1, ChromaMode::ConstLuma1, 12, 0);
+        let cells = payload_for(&p, 0xF0C05);
+        let ideal = ideal_symbol_drives(&p, &cells, 0);
+        let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        let map = |u: f64, v: f64| (u, v);
+        let mut prev = f64::INFINITY;
+        let mut sharp = 0.0f64;
+        let mut blurred = 1.0f64;
+        for (i, &sigma) in [0.0f64, 0.2, 0.4, 0.6, 0.8, 1.2, 2.0].iter().enumerate() {
+            let pl = blur_grid(&ideal, &gam, sigma);
+            let samp = |x: f64, y: f64| -> [f32; 3] {
+                let quiet = p.quiet_zone_cells() as isize;
+                let cell = p.cell_size_px as f64;
+                let cx = ((x / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+                let cy = ((y / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+                let k = cy * GRID + cx;
+                [pl[0][k] as f32, pl[1][k] as f32, pl[2][k] as f32]
+            };
+            let m = cell_scale_mtf(&p, &map, &samp);
+            assert!(m.is_finite(), "σ={sigma}: показатель не определён");
+            assert!(
+                m <= prev + 1e-9,
+                "σ={sigma}: показатель вырос ({m:.4} после {prev:.4})"
+            );
+            prev = m;
+            if i == 0 {
+                sharp = m;
+            }
+            blurred = m;
+        }
+        assert!(sharp > 0.9, "резкий кадр должен давать ~1, а даёт {sharp:.3}");
+        assert!(
+            blurred < 0.1,
+            "при блюре 2 клетки показатель обязан упасть почти в ноль, а он {blurred:.3}"
+        );
+        assert!(
+            sharp / blurred.max(1e-6) > 10.0,
+            "динамический диапазон меньше десятикратного: {sharp:.3} против {blurred:.3}"
+        );
+    }
+
+    /// Показатель фокуса монотонен и по СЫРОМУ (гамма-кодированному) сигналу.
+    ///
+    /// Приёмник считает его по `raw_sample`, а не по линеаризованному: гаммы
+    /// оцениваются на локе, а показатель обязан работать ДО того — свип фокуса
+    /// стартует вне фокуса. Вторая разность в гамма-домене уже не пропорциональна
+    /// второй разности по свету, поэтому монотонность надо проверить отдельно, а
+    /// не вывести из линейного случая.
+    #[test]
+    fn cell_scale_mtf_is_monotone_on_raw_gamma_encoded_signal() {
+        let p = prof(1, ChromaMode::ConstLuma1, 12, 0);
+        let cells = payload_for(&p, 0x6A33A);
+        let ideal = ideal_symbol_drives(&p, &cells, 0);
+        let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        let map = |u: f64, v: f64| (u, v);
+        let mut prev = f64::INFINITY;
+        let mut vals = Vec::new();
+        for &sigma in &[0.0f64, 0.2, 0.4, 0.6, 0.8, 1.2, 2.0] {
+            let pl = blur_grid(&ideal, &gam, sigma);
+            // ОБРАТНАЯ гамма: то, что реально отдаёт камера до линеаризации
+            let samp = |x: f64, y: f64| -> [f32; 3] {
+                let quiet = p.quiet_zone_cells() as isize;
+                let cell = p.cell_size_px as f64;
+                let cx = ((x / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+                let cy = ((y / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+                let k = cy * GRID + cx;
+                let mut o = [0.0f32; 3];
+                for c in 0..3 {
+                    o[c] = pl[c][k].max(0.0).powf(1.0 / gam[c]) as f32;
+                }
+                o
+            };
+            let m = cell_scale_mtf(&p, &map, &samp);
+            assert!(m.is_finite(), "сырой сигнал, σ={sigma}: не определён");
+            assert!(
+                m <= prev + 1e-9,
+                "сырой сигнал, σ={sigma}: показатель вырос ({m:.4} после {prev:.4})"
+            );
+            prev = m;
+            vals.push(m);
+        }
+        eprintln!("[mtf raw] {vals:?}");
+        assert!(
+            vals[0] > 0.9 && *vals.last().unwrap() < 0.15,
+            "динамический диапазон по сырому сигналу мал: {vals:?}"
+        );
+    }
+
+    /// Показатель фокуса работает и с рамкой v1.
+    ///
+    /// Проверка не формальная: у v1 полоса ЭКСТРУДИРОВАНА (оба ряда одинаковы),
+    /// поэтому вертикальных одиночных клеток в ней меньше, чем у v0 с его
+    /// инвертированным внутренним кольцом, и метрика опирается в основном на
+    /// горизонтальные. Живой аппарат работает именно на v1.
+    #[test]
+    fn cell_scale_mtf_works_with_v1_border() {
+        let mut p = prof(1, ChromaMode::ConstLuma1, 12, 0);
+        p.border = crate::profile::BorderMode::ExtrudedStrips;
+        let cells = payload_for(&p, 0x1B0);
+        let ideal = ideal_symbol_drives(&p, &cells, 0);
+        let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        let map = |u: f64, v: f64| (u, v);
+        let mut prev = f64::INFINITY;
+        let mut vals = Vec::new();
+        for &sigma in &[0.0f64, 0.4, 0.8, 1.6] {
+            let pl = blur_grid(&ideal, &gam, sigma);
+            let samp = |x: f64, y: f64| -> [f32; 3] {
+                let quiet = p.quiet_zone_cells() as isize;
+                let cell = p.cell_size_px as f64;
+                let cx = ((x / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+                let cy = ((y / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+                let k = cy * GRID + cx;
+                [pl[0][k] as f32, pl[1][k] as f32, pl[2][k] as f32]
+            };
+            let m = cell_scale_mtf(&p, &map, &samp);
+            assert!(m.is_finite(), "v1, σ={sigma}: показатель не определён");
+            assert!(m <= prev + 1e-9, "v1, σ={sigma}: показатель вырос");
+            prev = m;
+            vals.push(m);
+        }
+        eprintln!("[mtf v1] {vals:?}");
+        assert!(vals[0] > 0.9 && *vals.last().unwrap() < 0.15, "v1: {vals:?}");
+    }
+
+    /// Показатель фокуса определён на кадре, который НЕ ДЕКОДИРУЕТСЯ.
+    ///
+    /// Ради этого он и считается по ЗЧ-кольцу, референсной строке и строке
+    /// счётчика: свип фокуса стартует ВНЕ фокуса, где payload — шум, и метрика,
+    /// требующая декодирования, там бесполезна.
+    #[test]
+    fn cell_scale_mtf_defined_when_payload_is_unreadable() {
+        let p = prof(1, ChromaMode::ConstLuma1, 12, 0);
+        let cells = payload_for(&p, 0xDEAD);
+        let ideal = ideal_symbol_drives(&p, &cells, 0);
+        let gam = [p.gamma_r() as f64, p.gamma_g() as f64, p.gamma_b() as f64];
+        let map = |u: f64, v: f64| (u, v);
+        let pl = blur_grid(&ideal, &gam, 1.0);
+        let samp = |x: f64, y: f64| -> [f32; 3] {
+            let quiet = p.quiet_zone_cells() as isize;
+            let cell = p.cell_size_px as f64;
+            let cx = ((x / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+            let cy = ((y / cell) as isize - quiet).clamp(0, GRID as isize - 1) as usize;
+            let k = cy * GRID + cx;
+            [pl[0][k] as f32, pl[1][k] as f32, pl[2][k] as f32]
+        };
+        let got = demod_symbol(&p, &map, &samp);
+        let ser = got.iter().zip(&cells).filter(|(a, b)| a != b).count() as f64
+            / (PAYLOAD_COLS * PAYLOAD_ROWS) as f64;
+        assert!(ser > 0.3, "кадр обязан быть нечитаемым, SER {ser:.3}");
+        let m = cell_scale_mtf(&p, &map, &samp);
+        assert!(
+            m.is_finite() && m > 0.02 && m < 0.6,
+            "на нечитаемом кадре показатель обязан быть определён и мал: {m:?}"
+        );
     }
 }

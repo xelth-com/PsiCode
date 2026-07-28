@@ -12,7 +12,7 @@ use std::time::Instant;
 use psicode_core::fountain::{crc32c, FountainEncoder};
 use psicode_core::l3::{self, FrameHeader, TransferInfo};
 use psicode_core::symbol::{self, render_symbol_counter};
-use psicode_rx::{tx_default_profile, RxSession, RxState};
+use psicode_rx::{tx_default_profile, IsiMode, RxSession, RxState};
 
 // ---------------------------------------------------------------------------
 // YUV_420_888 хелперы (прямое BT.601 limited-range; rx делает обратное)
@@ -474,4 +474,115 @@ fn inband_calibration_frames_are_recognised_and_transfer_still_completes() {
         est.sigma_px,
         est.spatial_spread,
     );
+}
+
+// ---------------------------------------------------------------------------
+// (f) ВЫРАВНИВАТЕЛЬ ISI: аддитивность флага и наполнение диагностики
+// ---------------------------------------------------------------------------
+
+/// Флаг ISI АДДИТИВЕН: прежние точки входа сохраняют своё значение, а на
+/// чистом канале включённый выравниватель ничего не портит.
+///
+/// Это страховка ровно того свойства, которое требовалось от правки: умолчание
+/// не меняется, а `with_cell_border_isi` — единственный способ включить новое
+/// поведение.
+#[test]
+fn isi_flag_is_additive_and_harmless_on_a_clean_channel() {
+    let mut p = tx_default_profile();
+    p.cell_size_px = 16;
+    let bpc = symbol::bits_per_cell(&p);
+    let hdr = FrameHeader::new(0x0138_C764, 0, SYMBOLS_PER_FRAME as u8);
+    let ti = TransferInfo {
+        transfer_length: 1000,
+        symbol_size: SYMBOL_SIZE as u16,
+        k: SYMBOLS_PER_FRAME as u32,
+        checksum: 0,
+    };
+    let sym_bytes: Vec<u8> = (0..SYMBOLS_PER_FRAME * SYMBOL_SIZE)
+        .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+        .collect();
+    let cells = l3::build_frame(&hdr, Some(&ti), &sym_bytes, bpc);
+    let frame = render_symbol_counter(&p, &cells, 0);
+    let sz = frame.size_px;
+    let pl = to_yuv420(&frame.rgb, sz, sz, false);
+
+    // умолчания ВСЕХ прежних конструкторов = выравниватель выключен
+    for mut rx in [
+        RxSession::new(p),
+        RxSession::with_cell(p.cell_size_px),
+        RxSession::with_cell_mode(p.cell_size_px, false),
+    ] {
+        assert_eq!(rx.isi_mode(), IsiMode::Off, "умолчание обязано быть Off");
+        let st = rx.process_frame_yuv(
+            &pl.y, &pl.u, &pl.v, sz, sz, pl.y_stride, pl.uv_stride, pl.uv_pixel_stride,
+        );
+        assert_eq!(st.stripes_ok, 8);
+        assert_eq!(st.isi_src, "off");
+        assert_eq!(st.isi_strength, 0.0);
+    }
+
+    // явно включённый выравниватель: тот же результат на чистом канале
+    let mut rx = RxSession::with_cell_border_isi(
+        p.cell_size_px,
+        false,
+        psicode_core::profile::BorderMode::LegacyInverted,
+        IsiMode::On,
+    );
+    assert_eq!(rx.isi_mode(), IsiMode::On);
+    let st = rx.process_frame_yuv(
+        &pl.y, &pl.u, &pl.v, sz, sz, pl.y_stride, pl.uv_stride, pl.uv_pixel_stride,
+    );
+    assert_eq!(
+        st.stripes_ok, 8,
+        "выравниватель испортил чистый канал (страйпов {}/8)",
+        st.stripes_ok
+    );
+    assert_eq!(st.isi_src, "frame", "первый кадр: пул ещё пуст");
+    assert!(
+        st.isi_strength < 0.02,
+        "на чистом канале ядро обязано быть почти дельтой, а сила {}",
+        st.isi_strength
+    );
+}
+
+/// ПОКАЗАТЕЛЬ ФОКУСА присутствует в статусе и в JSON — и он определён даже
+/// тогда, когда payload не декодируется.
+///
+/// Ради этого свойства он и введён: свип фокуса стартует ВНЕ фокуса, а прежняя
+/// целевая функция (score рамки) на живом A22 меняется лишь в пределах
+/// 0.897…0.943 при полностью мёртвом payload.
+#[test]
+fn focus_metric_is_present_in_status_and_json() {
+    let mut p = tx_default_profile();
+    p.cell_size_px = 16;
+    let bpc = symbol::bits_per_cell(&p);
+    let hdr = FrameHeader::new(1, 0, SYMBOLS_PER_FRAME as u8);
+    let sym_bytes: Vec<u8> = (0..SYMBOLS_PER_FRAME * SYMBOL_SIZE).map(|i| i as u8).collect();
+    let cells = l3::build_frame(&hdr, None, &sym_bytes, bpc);
+    let frame = render_symbol_counter(&p, &cells, 0);
+    let sz = frame.size_px;
+    let pl = to_yuv420(&frame.rgb, sz, sz, false);
+    let mut rx = RxSession::new(p);
+    let st = rx.process_frame_yuv(
+        &pl.y, &pl.u, &pl.v, sz, sz, pl.y_stride, pl.uv_stride, pl.uv_pixel_stride,
+    );
+    assert!(
+        st.cell_mtf > 0.9,
+        "на резком синтетическом кадре показатель фокуса обязан быть ~1, а он {}",
+        st.cell_mtf
+    );
+    let js = st.to_json();
+    println!("[json] {js}");
+    for key in [
+        "\"cell_mtf\"",
+        "\"isi_src\"",
+        "\"isi_strength\"",
+        "\"isi_changed\"",
+        "\"isi_pool\"",
+        "\"isi_q\"",
+    ] {
+        assert!(js.contains(key), "в JSON нет поля {key}: {js}");
+    }
+    // JSON обязан оставаться разбираемым: ни NaN, ни inf
+    assert!(!js.contains("NaN") && !js.contains("inf"), "нечисло в JSON: {js}");
 }

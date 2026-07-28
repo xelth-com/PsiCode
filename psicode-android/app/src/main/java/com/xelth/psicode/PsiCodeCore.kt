@@ -37,6 +37,9 @@ object PsiCodeCore {
      */
     external fun rxInitBorder(profileCellPx: Int, chromatic: Int, border: Int): Long
 
+    /** То же плюс выравниватель межсимвольной помехи: 0 = выкл, 1 = вкл. */
+    external fun rxInitBorderIsi(profileCellPx: Int, chromatic: Int, border: Int, isi: Int): Long
+
     /**
      * Скормить один YUV_420_888 кадр. Плоскости передаются как есть (с row padding);
      * strides из [android.media.Image.Plane]. Возвращает JSON-статус (см. MainActivity).

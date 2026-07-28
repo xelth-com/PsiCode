@@ -20,5 +20,6 @@ pub mod yuv;
 mod jni_glue;
 
 pub use session::{
-    tx_chromatic_profile, tx_default_profile, FrameStatus, RxSession, RxState,
+    tx_chromatic_profile, tx_default_profile, FrameStatus, IsiMode, KernelPool, RxSession,
+    RxState,
 };
