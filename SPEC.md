@@ -1,6 +1,6 @@
 # PsiCode Specification
 
-**Version 0.1.1-draft · 2026-07-22**
+**Version 0.2.0-draft · 2026-07-28**
 
 PsiCode (ΨCode) is an open, royalty-free visual code and one-way optical data
 link. It transmits data from any display to any camera with **no feedback
@@ -118,26 +118,101 @@ Base sequence, length `N` (odd), root `q`, gcd(q, N) = 1:
 z[n] = exp(−j·π·q·n·(n+1)/N),   n = 0 … N−1
 ```
 
-Frame construction v0:
+Two border editions are defined. **v1 is the recommended edition**; v0 is
+retained for compatibility with deployed v0 symbols and is not recommended for
+new implementations.
 
-* `N = 61`, `q = 1` (prime N; 61 cells per side is the v0 symbol size).
-* Top border, left→right: cells `n = 0…N−1` colored by binarized phase of
-  `z[n]`: white if `arg(z[n]) > 0`, black otherwise.
-* Right border, top→bottom: same sequence with root `q = 2` (distinct root ⇒
-  bounded cross-correlation ⇒ side identification).
-* Bottom border, right→left: root `q = 3`. Left border, bottom→top: root
-  `q = 4`. Traversal order gives unambiguous orientation.
-* Border thickness: 2 cells (inner ring repeats the outer ring inverted,
-  improving edge gradient under blur).
+#### v0 — double inverted ring **[DEPRECATED]**
+
+* `N = 61`, roots `q = 1…4` on top / right / bottom / left in traversal order.
+* Quiet zone of 4 cells on every side; symbol side 69 cells.
+* Border thickness 2 cells, the **inner ring inverting the outer**.
+
+The inversion is the defect that motivated v1. Under defocus the two rings sum
+towards mid-grey, so the correlation collapses: measured retention at 1-cell
+blur is **0.350**, below the 0.45 acceptance used in practice. On real captures
+v0 true positives score 0.386–0.455 against a clutter band reaching 0.338 —
+i.e. they lie *inside* it, so v0 cannot support a tight acceptance gate at all.
+
+#### v1 — extruded strips, no quiet zone **[DRAFT]**
+
+* `N = 61`, symbol side **61 cells — there is no quiet zone**.
+* Four strips of `N × 2`. The sequence runs **along** each side and every
+  element is painted **2 cells deep, perpendicular to that side**, so both rows
+  of a strip are identical index for index.
+* Roots by side: **top 3, right 1, bottom 4, left 2** — the horizontal pair
+  {3,4} and the vertical pair {1,2}, the two groups differing by one. The pair
+  identifies the axis; which member of the pair identifies the 180° case.
+* Corner rule: each side owns the corner it walks into and carries indices
+  `2…N`, yielding indices 0 and 1 to the preceding side. This is an exact
+  partition — `4·(N−2)·2 = 8N−16` equals the cell count of a thickness-2 ring,
+  with no overlap and no gap — and every side gets exactly `N−2` samples.
+  At a corner the sides cross at 90°, so a yielded cell at position `i`,
+  depth `d`, carries the neighbour's index `N−1−d`, **not** `N−2+i`.
+
+Why extrusion rather than a second concentric ring: two concentric rings have
+sides of `N` and `N−2` cells and cannot be aligned index for index, so blur
+would mix a sequence with a shifted copy of itself. Extruded strips make blur
+*perpendicular to a side* average two identical values — pure gain. Measured
+retention at 1-cell blur is **0.702 against v0's 0.350**.
+
+Why no quiet zone: a quiet zone serves detectors that key on contrast against
+the background. A ZC border localises its own boundary by correlation, which is
+why Aztec Code needs none either. Measured: with the border's outer row directly
+adjacent to real captured screen content, scale recovers with **0.0 % error**;
+the surround does not enter the fit. Dropping it takes the symbol from 69 to 61
+cells, i.e. **+13.1 % linear cell size and +27.9 % area at a fixed footprint**.
+
+**Structural property implementers must know: the ZC sequence is its own
+reverse.** For odd `N`, `(N−1−n)(N−n) ≡ n(n+1) (mod 2N)`, hence
+`z[N−1−n] = z[n]`. Verified for N ∈ {31, 37, 61}, all roots, complex and
+binarised. Three consequences:
+
+* correlating against a reversed template is the *same* test, so a reversal
+  dimension in a correlation search is vacuous;
+* **a single side cannot determine which way it runs, so 180° rotation is
+  unresolvable from one side.** It is resolved *only* by the per-side root
+  assignment above, which is therefore load-bearing rather than decorative;
+* every acquisition seed must spawn two interior-direction hypotheses.
+
+Binarisation costs measurable margin: cross-root correlation is **0.3524**
+against the ideal `1/√N = 0.128`, i.e. 8.8 dB discarded. Adjacent roots are not
+worse than distant ones — (3,4) = 0.2470, (2,3) = 0.2618, (1,2) = 0.3524, while
+(1,5) = 0.4071. A complex carrier recovers that 8.8 dB in simulation, but see
+§6.5 for why it is not used.
 
 Rationale (informative): ZC autocorrelation is used exactly for what it is
-good at — 1-D shift estimation along each detected border after coarse
-detection, which is a cyclic-shift problem, not a 2-D data-coding problem.
-The four corners fix the homography; per-side correlation refines it.
+good at — 1-D shift estimation along each detected border, which is a
+cyclic-shift problem, not a 2-D data-coding problem. The four corners fix the
+homography; per-side correlation refines it.
 
-Receiver procedure (normative sketch): coarse quadrilateral detection →
-per-side 1-D resampling → correlation against the four root sequences →
-side/orientation assignment → homography → iterative refinement.
+Receiver procedure (normative sketch): correlation search over a scale ladder →
+candidate quadrilateral → **joint** four-side refinement → root assignment and
+orientation → homography → sub-cell descent.
+
+**Two traps, both consequences of the extrusion, both already encountered:**
+
+* A uniform 2-cell strip is deliberately insensitive to displacement
+  perpendicular to itself. Combined with keystone, any geometry error yields
+  "two sides at 0.93, two at 0.20". This is fixed **only** by fitting all four
+  sides jointly, because one pair's along-axis is the other pair's
+  perpendicular. Implementations that fit sides independently will reproduce the
+  failure. Read "two good sides" as a symptom, never as partial success.
+* Local uniformity is exactly the absence of localisation information. Probing
+  only the strip's midline leaves scale under-determined by ~0.3 % — 0.2 cells
+  over 61 — and on sharp captures the objective has a flat plateau unless
+  tangential probes at ±0.3 cell are used. Those probes must be gated to the
+  2-cell strip; they degrade a 1-cell v0 ring.
+
+**Sampling MUST follow the homography, not the side.** Under a homography,
+equal steps along a segment are not the image of a uniform cell grid, and the
+along-side foreshortening of a side is governed by the perspective coefficient
+of the *other* axis. A keystone invisible on one pair of sides is therefore
+fatal on the perpendicular pair: measured on a live quad with `h = −0.0762`,
+`g = +0.0015`, mid-side lands at 0.480 instead of 0.500 — **1.2 cells of lag**
+on the left and right sides against 0.012 on top and bottom, against a
+correlation peak one cell wide. Border and payload MUST use the same geometric
+model; a border score is not evidence of payload alignment otherwise.
 
 ### 3.3 Interior layout
 
@@ -169,6 +244,59 @@ One cell-row directly below the top ZC ring, repeated every frame:
 The receiver MUST derive per-frame from this strip: black/white levels,
 a 3×3 color correction matrix, and per-channel gain. No frame is decoded
 against stale color state.
+
+**The strip is one cell tall, which is the most fragile spatial scale in the
+symbol**, and that is a real limitation rather than a detail. The ISP's chroma
+low-pass smears adjacent colour patches into one another before it touches
+anything else, so a channel matrix estimated from a one-cell strip is corrupted
+in exactly the regime where it matters. Measured, by estimating the same matrix
+from patches of different sizes: residual after applying the fitted matrix is
+0.170 at cell scale, **0.020 at 120 px**, and 0.173 again at 600 px where the
+illumination field takes over. The strip therefore SHOULD be demoted to
+bootstrap and fallback, with the primary estimate coming from §4-IB.
+
+#### §4-IB In-band calibration frames **[DRAFT — recommended]**
+
+Whole frames interleaved into the stream, carrying colour patches at a scale
+that survives the ISP, on a **doubling schedule** — frames 0, 1, 2, 4, … 128,
+then every 128. Overhead is **0.79–1.5 %**, and a receiver joining at frame `t`
+waits at most until `2t`, worst case 127 frames.
+
+Patch size **120 px** is not "large enough" but the measured optimum of the table
+above. Each patch class MUST appear at multiple **point-symmetric** positions, so
+that any linear illumination field cancels exactly in the mean; note this cancels
+only the *odd* part of the field, and because a symmetric pair sits at one
+radius, colour and radius become perfectly correlated — a field polynomial fitted
+from the patches' own residuals is then **not identifiable**. Probe the field
+with a neutral moat co-located with each patch instead.
+
+A calibration frame MUST be identifiable **without calibration**, since a CRC'd
+header cannot be parsed on an uncalibrated channel. The marker SHOULD be large,
+binary and luma-only. The construction used here places `m, ¬m, m` on three rows
+and takes the **vertical second difference** `½(L₀+L₂) − L₁` on green, which
+cancels any y-linear field identically and turns curvature into a constant
+removed by mean subtraction: calibration frames score 0.960–0.9997, payload
+frames ≤ 0.31, with zero false positives across a full transfer.
+
+Measured accuracy of the recovered channel matrix, against the one-cell strip:
+
+| σ luma | σ chroma | reference strip | calibration frame |
+|---|---|---|---|
+| 1 | 1 | 0.0040 | 0.0054 |
+| 1 | **3 (measured)** | 0.1952 | **0.0054** — ×36 |
+| 2 | 3 | 0.1296 | 0.0067 — ×19 |
+| 3 | 10 | 0.2948 | 0.0349 — ×8.4 |
+
+The calibration frame is flat across the whole sweep (0.005–0.035) where the
+strip ranges over 0.004–0.476.
+
+**A calibration frame is the wrong instrument for a cell-scale quantity**, and
+implementations MUST NOT use it whole to estimate one. Its uniform tiles are the
+majority of its cells, and inside a uniform patch the response is `DC(h)·x` for
+*any* kernel shape — those cells constrain only the tap sum while numerically
+outvoting the informative ones. Measured: estimating an interference kernel from
+the unmasked frame collapses to identity (max tap deviation 0.1260, exactly the
+largest true tap); masked to the marker band and known surround, 0.0143.
 
 ---
 
@@ -257,6 +385,58 @@ Properties (informative):
 | 0 | Mono | A_C = 0; Im axis unused |
 | 1–3 | Chroma1..3 | 1..3 bits of Im resolution |
 | 4 | GreenOnly | R = B = M always; luma only, aberration-proof |
+| 5–7 | ConstLuma1..3 | §5.1-CL below; 1..3 bits on the Im axis |
+
+#### §5.1-CL Constant-luminance mapping **[DRAFT — recommended]**
+
+The mapping above places `Re` on **absolute luminance**, which is the one axis a
+receiver's illumination field destroys. Measured live, luma drifts **0.62 → 0.86
+across a single frame**. The constant-luminance form places the complex value
+entirely in chromaticity and holds total drive constant:
+
+```
+transmit:  R = u·(1 − b·x + c·y)     G = u·(1 + 2b·x)     B = u·(1 − b·x − c·y)
+           so R + G + B = 3u = S, identically, for every z = x + jy
+receive:   S_meas = R + G + B                    (MEASURED, per cell)
+           x = (2G − R − B) / (2·S_meas·b)       Re rides green ↔ magenta
+           y = 3·(R − B)    / (2·S_meas·c)       Im rides red ↔ blue
+```
+
+**Dividing by the measured per-cell channel sum is the whole mechanism.** Any
+multiplicative field λ(x, y) scales all three channels alike and cancels
+*identically* in the ratio — per cell, for a field of any spatial complexity, with
+no fitting and no pilots. Using the nominal `S` instead of the measured one
+destroys the invariance completely; implementations MUST use the measured sum.
+
+Constants derived from the profile's black and white levels; for the reference
+profile `u = 130`, `S = 390`, `b = 0.4808`, `c = √3·b = 0.8327`.
+
+`c = √3·b` is not a tuning choice. Under iid channel noise
+`Var(2G−R−B) = 6σ²` and `Var(R−B) = 2σ²`, a ratio of `√3`, and the signal swings
+`6ub` and `2uc` are in the same ratio at that value — so the two axes carry equal
+SNR by construction. It also makes the gamut constraint a single radius: the
+feasible region is a regular hexagon whose inscribed circle is the unit disk.
+
+A square Gray lattice must be scaled by **`2/(1+√3) ≈ 0.732`** so its corners sit
+exactly on that hexagon; this is exact, not padding.
+
+Measured gain over §5.1: **+5 to +6 bits per patch** under the measured field,
+nothing lost on a clean channel, and no crossover up to 12 % per-channel
+chromatic tilt in either orthogonal mode.
+
+**The 3×3 channel matrix of §3.4 is mandatory for this mapping.** `2G−R−B` gets
+no cancellation from a neutral-preserving channel mix, whereas `R−B` cancels one
+identically. A device measured at `B→G = −0.26` therefore reads Im correctly and
+Re not at all: BER 0.19–0.25 on Re against 0.004–0.03 on Im, restored to
+0.007–0.09 once the matrix is applied.
+
+**Implementation note on axis balance.** An apparent axis imbalance is a symptom
+of inter-cell interference (§5.2), not of the channel. Before equalisation the
+measured per-channel σ ratio is 2.18 and the SNR-optimal `c/b` is 1.27 — the
+*opposite* direction from what the raw margins suggest; after equalisation the
+ratio falls to 1.82 and the optimum returns to 1.85, within 7 % of `√3`.
+Implementations SHOULD NOT retune `c` to compensate for interference; equalise
+instead.
 
 ### 5.2 Mode A — cell grid **[DRAFT]**
 
@@ -268,6 +448,55 @@ cell carries one symbol:
 
 Cells are sampled at their centers after homography; a 2×2 subsample average
 MUST be used when `cell_size_px ≥ 8` camera pixels.
+
+#### Inter-cell interference
+
+Adjacent cells bleed into one another, and at cell scale this — not colour
+fidelity, not calibration — is what limits a dense payload. Measured on real
+captures by rendering uniform blocks of decreasing size and fitting the residual
+after removing the linear channel distortion:
+
+| block | residual | within-block noise |
+|---|---|---|
+| 636 px | 0.025 / 0.067 | 0.026 / 0.041 |
+| 120 px | 0.013 / 0.027 | 0.005 / 0.007 |
+| ~2 cells | **0.078 / 0.080** | 0.007 / 0.011 |
+
+At block sizes well above a cell the residual sits at the noise floor; at cell
+scale it is **ten times** the noise floor. The axis gains meanwhile barely move
+with scale, so the distortion itself is scale-independent — it is the
+*separability* of neighbours that fails.
+
+**The interference is deterministic and therefore invertible.** A linear model
+over the 5×5 neighbour pattern explains R² = 0.516 of the fixed-pattern spread;
+sub-pixel phase and moiré contribute nothing (R² 0.516 → 0.522). Measured kernel
+strength — the fraction of a cell's light arriving from its neighbours — is
+**0.23–0.27 for a chromatic payload against 0.053 for 1-bit luma**. That fivefold
+difference is why a 1-bit mono payload has always worked while a two-axis
+chromatic one at the same geometry fails: interference eats *margin*, and noise
+converts margin into errors.
+
+Equalisation SHOULD be performed **between channel decoupling and the gamma
+inverse**, on the light-linear quantity, because that is where the convolution is
+actually linear. Measured on a device where it binds: stripes passing CRC
+**10/32 → 30/32**, Re-axis SER 0.0159 → 0.00018. Live, at the cell size where
+margin is thin, full-stripe frames go from 55.6 % to 69.9 %; at a comfortable
+cell size the difference vanishes, which is the correct behaviour — the
+equaliser's own noise gain is ×1.01–1.05 and is wasted where interference does
+not bind.
+
+The kernel is a property of the display, optics and ISP, and is **fixed and
+cacheable**: across 23 static captures the median per-tap deviation is 0.0006,
+and a pooled median kernel outperforms per-frame estimation. Implementations
+SHOULD cache it rather than re-estimate it per frame.
+
+Two notes for implementers. Interference is anisotropic — edge-to-diagonal ratio
+2–15×, median ≈5×, channel-dependent — but a cross-shaped kernel measures
+slightly *worse* than a full one, because with thousands of cells against fifteen
+parameters the diagonal taps are estimated stably. And the inverse is
+well-conditioned: |H(ω)| ∈ [0.75, 1.25] with no near-zeros and a noise-variance
+gain of ×1.008–1.051, so no regularisation is required. This is a weak low-pass,
+not a channel with spectral nulls.
 
 ### 5.3 Mode B — Hermite–Gauss modes **[EXPERIMENTAL]**
 
@@ -380,6 +609,85 @@ hard slicing is a lossy compatibility shim. Receivers SHOULD log per frame
 the diagnostic vector `FrameQuality {detection, geometry, color,
 modulation, integrity}`, each component in [0, 1].
 
+The requirements below were derived from live operation against real phone
+cameras, not from theory. Each one cost a debugging session.
+
+#### Exposure and the ISP
+
+* Exposure MUST be pinned to approximately **one display refresh period**
+  (16.7–20 ms at 60 Hz). Shorter produces rolling-shutter banding; longer blends
+  adjacent transmitter frames.
+* The ISP's temporal filters (noise reduction, edge enhancement, video
+  stabilisation) MUST be disabled. Even so, residual frame mixing exists; its
+  coefficient was back-solved as **α ≈ 0.07**, small enough that it is *not* what
+  forces a long frame hold — the exposure window landing on frame boundaries is.
+* Rolling shutter **helps** and MUST NOT be designed away: row-time diversity
+  gives more chances to catch a clean band. A global shutter measured *more*
+  errors, and shortening the symbol makes tearing worse, not better, because
+  monitor and camera both scan top to bottom and a short symbol lets the two
+  scans track each other.
+
+#### Focus
+
+* Contrast autofocus is **unusable** on a time-varying code: it hunts to infinity
+  and sticks. Receivers MUST drive the lens manually and SHOULD cache the working
+  position across sessions.
+* The sweep range MUST be bounded below. Infinity and one metre are pure lens
+  travel; a screen sits at roughly 11–65 cm.
+* Sweep steps MUST be counted in **frames, not wall-clock time** — a time-based
+  window closes before a failed acquisition returns.
+* **The focus objective MUST be measured at cell scale on the payload, never on
+  the border.** This is the requirement most easily got wrong. A blur-tolerant
+  border is by design insensitive to the defocus that destroys the payload:
+  measured live, the v1 border score spans only **0.897–0.943** across a focus
+  range over which payload stripes go from 8 to 0. A sweep driven by it
+  early-exits into an unreadable lock.
+
+  The recommended objective is a **cell-scale modulation ratio**: over known cells
+  whose ideal level differs from both neighbours, take the second difference
+  `L(n) − ½(L(n−1) + L(n+1))` and divide by the known white-to-black spread. The
+  second difference cancels any linear field identically; the division cancels
+  gain and veil. Measured behaviour:
+
+  | σ (cells) | 0.0 | 0.3 | 0.4 | 0.5 | 0.7 | 1.0 | 2.0 |
+  |---|---|---|---|---|---|---|---|
+  | metric | 1.031 | 1.026 | 0.972 | 0.845 | 0.523 | 0.211 | 0.016 |
+  | stripes | 8/8 | 8/8 | 8/8 | 0/8 | 0/8 | 0/8 | 0/8 |
+
+  Strictly monotone, dynamic range ~64×, and **still 0.211 where SER is 0.64** —
+  a usable gradient deep inside the unreadable region, which is what a sweep
+  starting out of focus needs. The readability cliff sits between 0.97 and 0.85;
+  target ≥ 0.95.
+
+  Two plausible alternatives were measured and MUST NOT be used alone: kernel
+  strength rises then collapses to zero past the cliff, so a sweep driven by it
+  hunts into defocus and sees the objective improve; and a self-referential
+  decision-margin metric turns back up past σ ≈ 1.0.
+
+* A **temporal-blend detector is a separate instrument** and cannot be the focus
+  metric: border and reference row are identical in adjacent transmitter frames,
+  so a blend leaves the cell-scale metric untouched while destroying the payload.
+  A decision-margin statistic separates them (1.55 and 1.70 on blended frames
+  against 2.19–2.57 on clean ones). The pair is the diagnostic — both low means
+  defocus; cell-scale metric high with low margin means a blend.
+
+#### Timing and rate
+
+* The camera MUST be polled at least as fast as the transmitter changes frames.
+  A receiver polling every 120 ms against a 100 ms frame never samples some
+  frames at all; live decode costs 25–36 ms, so a slower poll is pure loss.
+
+#### Carrier choice for the border
+
+The border SHOULD be carried in **luma**, not chromaticity, despite the 8.8 dB of
+root separation a complex carrier recovers in simulation. On real hardware a
+chroma-carried border produced **0 detections in 30 frames** with focus verified
+correct, while the luma carrier gave 100 % on the same rig. Chroma is subsampled
+4:2:0 and additionally low-passed by the ISP at σ ≈ 3.2 px against ~2 for luma,
+and the border needs sub-cell accuracy. The margin the complex carrier buys is
+one the luma carrier does not need: measured orientation margin is 0.87 against
+a 0.10 threshold.
+
 ---
 
 ## 7. Calibration profile code **[STABLE]**
@@ -491,7 +799,9 @@ code, including two adjacent fully garbled 4-symbol groups.
 | `psicode-tx` | Windows 11 transmitter (winit 0.30 + softbuffer 0.4): `calibrate` (§4 pattern + animated counter, console profile-code entry), `stream` (fountain §6.1–6.3), `single` | done (workspace: 107 tests) |
 | `psicode-sim` `live` | offline decode of phone photos: full uncropped frames, tilt-robust (rotating-calipers corners), SER 0.057–0.105 (BENCHMARKS §5) | first light 2026-07-26 |
 | `psicode-rx` + `psicode-android` | Android receiver: Camera2 (pinned exposure ≈ 1 refresh, decoder-guided focus sweep, ISP filters off), acquire/track detection, local-threshold demod, live L3+fountain | **first live file transfer 2026-07-26 (byte-exact, CRC-32C + SHA256)** |
-| next | RaptorQ per RFC 6330; §3.2 border v0.2 (drop inner-ring inversion + Gaussian corner beacons — sim-validated); telemetry to xelth.com; live device matrix §9.3 | — |
+| `psicode-core::{zcborder, acquire}` | §3.2 border v1 (extruded strips, no quiet zone) + ZC-correlation acquisition | detection on full uncropped frames **18 % → 100 %**; live byte-exact transfers on two devices |
+| `psicode-core::{isi, calframe}` | §5.2 inter-cell equalisation; §4-IB in-band calibration frames | stripes **10/32 → 30/32** on a device that had never decoded; channel matrix **×36** more accurate |
+| next | RaptorQ per RFC 6330; telemetry to xelth.com; hexagonal payload lattice (sim-validated at +12.8…16.6 % in d′, blocked on L3 cell ordering); live device matrix §9.3 | — |
 | `psicode-rx` | Rust core for Android (JNI): detect → homography → demod → RaptorQ | — |
 | `psicode-android` | thin Kotlin shell: Camera2 (locked AWB/AE/AF, YUV420 direct) | — |
 
