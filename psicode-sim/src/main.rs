@@ -15,6 +15,7 @@
 //!                  mixing (SER/выживаемость vs α) и детектируемость рамки/маяков
 //!                  под блюром (matched-filter SNR)
 
+mod cellfloor;
 mod channel;
 mod exp;
 mod finder;
@@ -764,9 +765,10 @@ fn main() {
         Some("tprobe") => tprobe::cmd_tprobe(),
         Some("finder") => finder::cmd_finder(),
         Some("shape") => shape::cmd_shape(),
+        Some("cellfloor") => cellfloor::cmd(&args[2..]),
         _ => {
             eprintln!(
-                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | l3live | modeb | transfer | exp | probe | tprobe | finder | shape>"
+                "usage: psicode-sim <sweep | dump [dir] | readback [dir] | goodput | framed | l3live | modeb | transfer | exp | probe | tprobe | finder | shape | cellfloor>"
             );
             std::process::exit(2);
         }

@@ -1656,6 +1656,19 @@ fn chroma(args: &[String]) {
     let mut kern_ch: Vec<[IsiKernel; 3]> = Vec::new();
     let (mut tb, mut te, mut nt) = (0.0f64, 0.0f64, 0.0f64);
 
+    // [ЗАМЕР] ФОРМА АПЕРТУРЫ отсчёта клетки, на ЭТИХ ЖЕ снимках.
+    //
+    // `symbol::sample_cell` берёт четыре тапа в ±клетка/4 и усредняет. Смещение
+    // тапов меняется БЕЗ правки ядра: карта защёлкивается на центр клетки, а
+    // остаток координаты домножается на `k`, так что ±клетка/4 в символьном
+    // пространстве превращается в ±`f`·клетка. `f = 0.25` даёт ТОЖДЕСТВЕННО ту
+    // же карту, что продакшн, `f = 0` — один билинейный отсчёт в центре.
+    const AP_F: [f64; 5] = [0.25, 0.1875, 0.1443, 0.10, 0.0];
+    let mut ap_base = [0usize; AP_F.len()];
+    let mut ap_isi = [0usize; AP_F.len()];
+    let mut ap_full_base = [0usize; AP_F.len()];
+    let mut ap_full_isi = [0usize; AP_F.len()];
+
     println!(
         "\n{:<5} {:>6} {:>9} {:>9} {:>7} {:>7} {:>7}  {}",
         "кадр", "seq", "счётчик", "score", "Q Re", "Q Im", "торн", "решатели ниже"
@@ -1691,6 +1704,27 @@ fn chroma(args: &[String]) {
         let eq2 = symbol::demod_symbol_isi(&p, &map, &lin, None, &cfg2p);
         if eq.applied {
             kern_ch.push(eq.kernels);
+        }
+
+        // --- [ЗАМЕР] апертура отсчёта клетки ---
+        {
+            let cs = p.cell_size_px as f64;
+            for (ai, &f) in AP_F.iter().enumerate() {
+                let k = f / 0.25;
+                let mapf = |u: f64, v: f64| {
+                    let cu = (u / cs).floor() * cs + cs * 0.5;
+                    let cv = (v / cs).floor() * cs + cs * 0.5;
+                    map(cu + (u - cu) * k, cv + (v - cv) * k)
+                };
+                let b = symbol::demod_symbol(&p, &mapf, &lin);
+                let e = symbol::demod_symbol_isi(&p, &mapf, &lin, None, &cfg).cells;
+                let nb = l3::parse_frame(&b, bpc).stripes_ok.iter().filter(|&&x| x).count();
+                let ne = l3::parse_frame(&e, bpc).stripes_ok.iter().filter(|&&x| x).count();
+                ap_base[ai] += nb;
+                ap_isi[ai] += ne;
+                ap_full_base[ai] += (nb == 8) as usize;
+                ap_full_isi[ai] += (ne == 8) as usize;
+            }
         }
 
         // --- светолинейные плоскости канала (та же величина, что внутри демода) ---
@@ -1882,6 +1916,30 @@ fn chroma(args: &[String]) {
         te / nt,
         (te - tb) / nt
     );
+
+    // =====================================================================
+    // ФОРМА АПЕРТУРЫ ОТСЧЁТА КЛЕТКИ (§symbol::sample_cell)
+    // =====================================================================
+    {
+        let nf = dumps.len();
+        println!("
+=== АПЕРТУРА ОТСЧЁТА КЛЕТКИ: смещение тапов 2x2 ===");
+        println!("страйпов из {} возможных ({nf} кадров x 8)", nf * 8);
+        println!(
+            "{:>10} {:>14} {:>10} {:>14} {:>10}",
+            "+-доля кл", "страйпов база", "8/8 база", "страйпов ISI", "8/8 ISI"
+        );
+        for (ai, &f) in AP_F.iter().enumerate() {
+            println!(
+                "{f:>10.4} {:>14} {:>10} {:>14} {:>10}{}",
+                ap_base[ai],
+                ap_full_base[ai],
+                ap_isi[ai],
+                ap_full_isi[ai],
+                if (f - 0.25).abs() < 1e-9 { "   <- продакшн" } else { "" }
+            );
+        }
+    }
 
     // =====================================================================
     // ФИКСИРОВАННОЕ ЯДРО: свойство связки «дисплей+оптика+ISP» или кадра?

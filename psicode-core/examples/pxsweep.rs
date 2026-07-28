@@ -6,7 +6,13 @@
 //! σ камерных px, поле освещённости и шум сенсора с замеренного телефона), а
 //! клетка гоняется по лестнице. Печатает четыре гейтовые метрики и промах углов.
 //!
-//! запуск: cargo run --release -p psicode-core --example pxsweep -- [сигма_px]
+//! Второй режим — СТОИМОСТЬ ЛЕСТНИЦЫ: `pxsweep <сигма> cost` меряет время
+//! холодного захвата при разных нижних границах диапазона `px_per_cell`.
+//! Лестница масштабов геометрическая (`SCALE_RATIO` = 1.12), поэтому число
+//! ступеней растёт как `log(верх/низ)`, а стоимость затравочного скана линейна
+//! по ступеням.
+//!
+//! запуск: cargo run --release -p psicode-core --example pxsweep -- [сигма_px] [cost]
 
 use psicode_core::acquire::{
     accepted, acquire_best_unfiltered, AcquireOpts, Field, Quad, PROBE_DEPTH_STRIP,
@@ -178,6 +184,10 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(2.0);
+    if std::env::args().nth(2).as_deref() == Some("cost") {
+        cost(sigma);
+        return;
+    }
     let spec = v1_spec();
     println!("расфокус σ = {sigma:.1} камерных px, трапеция живого кадра (низ/верх 1.083)");
     println!(
@@ -223,5 +233,52 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+/// Стоимость лестницы масштабов: холодный захват на ОДНОЙ и той же сцене при
+/// разных нижних границах диапазона. Верх диапазона держим на 20 (как в
+/// приёмнике), сцену — на 10.5 камерных px/клетку (рабочая точка A22).
+fn cost(sigma: f64) {
+    let spec = v1_spec();
+    let cell = 10.5f64;
+    let side = (cell * 61.0).ceil() as usize;
+    let (w, h) = (side + 200, side + 160);
+    let q = keystone_quad(cell, (100.0, 80.0));
+    let img = render(&spec, w, h, &q, sigma, 0xBEEF_0001);
+    let f = Field { w, h, re: &img, im: None };
+    println!("стоимость лестницы масштабов, сцена {cell:.1} камерных px/клетку, σ = {sigma:.1}");
+    println!("{:>8} {:>9} {:>8} {:>9} {:>9}", "низ", "ступеней", "мс", "× к 7.0", "итог");
+    println!("{}", "-".repeat(50));
+    let mut base = None;
+    for &lo in &[7.0f64, 6.0, 5.0, 4.5, 4.0, 3.5] {
+        let opts = AcquireOpts {
+            px_per_cell: (lo, 20.0),
+            probe_depth: PROBE_DEPTH_STRIP,
+            threads: Some(1),
+            ..Default::default()
+        };
+        // число ступеней геометрической лестницы
+        let mut rungs = 0usize;
+        let mut s = lo;
+        while s <= 20.0 * 1.0001 {
+            rungs += 1;
+            s *= opts.scale_ratio;
+        }
+        let t0 = std::time::Instant::now();
+        let reps = 6;
+        let mut ok = false;
+        for _ in 0..reps {
+            ok = acquire_best_unfiltered(&spec, &f, &opts)
+                .map(|a| accepted(&a, opts.gate))
+                .unwrap_or(false);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+        let b = *base.get_or_insert(ms);
+        println!(
+            "{lo:>8.1} {rungs:>9} {ms:>8.0} {:>9.2} {:>9}",
+            ms / b,
+            if ok { "ПРИНЯТ" } else { "отвергнут" }
+        );
     }
 }

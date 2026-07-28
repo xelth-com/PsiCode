@@ -633,7 +633,9 @@ mod tests {
         let quiet = prof.quiet_zone_cells() as usize;
         let file = make_file(2048);
         let s = Streamer::new(&file, prof, 1);
-        for cell in [8usize, 16] {
+        // 4 — новый пол клетки показа (`main::MIN_DISPLAY_CELL`): растеризация
+        // клетки ТОЧНАЯ при любом размере, и рендер обязан это подтверждать.
+        for cell in [4usize, 8, 16] {
             let f = s.render(0, Some(cell));
             let expect = (symbol::GRID + 2 * quiet) * cell;
             assert_eq!(f.w, expect, "ширина при cell={cell}");
